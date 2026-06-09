@@ -1,0 +1,7 @@
+# REQUIRED — pick any password. You'll type this into the app to unlock creator mode.
+ADMIN_TOKEN=
+
+# OPTIONAL — Cloudflare Realtime (Calls) app, only needed to go live.
+# Leave blank to skip; posting, likes, comments and everything else still work.
+CALLS_APP_ID=
+CALLS_APP_SECRET=
