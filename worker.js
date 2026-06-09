@@ -25,7 +25,11 @@ const NETWORK_ROOT_PUBKEY = '4HAg90xqd7T8TfhXC3sYjEYIQlCGa7RPQod0x9L8oXk=';
 
 export default {
   async fetch(request, env) {
-    const storage = makeStorage(env);
+    // Multi-tenant: each hostname is its own creator. State is keyed by hostname,
+    // so one deploy hosts many creators (alex.host.com, bob.host.com, …).
+    const tenant = new URL(request.url).hostname;
+    if (tenant === NETWORK_ROOT_HOST) await migrateLegacyToRoot(env);
+    const storage = makeStorage(env, tenant);
     return await handleRequest(request, storage, env);
   },
 };
@@ -300,27 +304,48 @@ export class LiveRoom extends DurableObject {
   }
 }
 
-// Single live room per node.
-function liveStub(env) { return env.LIVE_ROOM.getByName('live'); }
-function liveDO(env, path, init) { return liveStub(env).fetch('https://live.do' + path, init); }
+// One live room per creator (keyed by hostname), so likes/comments/live are isolated per tenant.
+function liveStub(env, tenant) { return env.LIVE_ROOM.getByName(tenant); }
+function liveDO(env, tenant, path, init) { return liveStub(env, tenant).fetch('https://live.do' + path, init); }
 
 // ============================================================
-// STORAGE
+// STORAGE  (multi-tenant: keys are namespaced per hostname)
 // ============================================================
 
-function makeStorage(env) {
+function makeStorage(env, tenant) {
+  // tenant falsy → global namespace (used for the network-wide registry).
+  const prefix = tenant ? 't:' + tenant + ':' : '';
   return {
     async get(key) {
-      const raw = await env.NODE_STATE.get(key);
+      const raw = await env.NODE_STATE.get(prefix + key);
       return raw ? JSON.parse(raw) : null;
     },
     async set(key, value) {
-      await env.NODE_STATE.put(key, JSON.stringify(value));
+      await env.NODE_STATE.put(prefix + key, JSON.stringify(value));
     },
     async delete(key) {
-      await env.NODE_STATE.delete(key);
+      await env.NODE_STATE.delete(prefix + key);
     },
   };
+}
+
+// The original single-tenant deploy stored these under bare keys. Copy them once into
+// the root host's tenant slot WITHOUT regenerating anything (identity must be preserved,
+// or the baked NETWORK_ROOT_PUBKEY breaks). Copy-only + guarded → idempotent + rollback-safe.
+const TENANT_KEYS = ['identity', 'feed', 'peers', 'ancestors', 'profile', 'inbox:notifications', 'preroll'];
+
+async function migrateLegacyToRoot(env) {
+  const guard = 't:' + NETWORK_ROOT_HOST + ':_migrated';
+  if (await env.NODE_STATE.get(guard)) return;
+  const legacyIdentity = await env.NODE_STATE.get('identity');
+  if (legacyIdentity == null) { await env.NODE_STATE.put(guard, '1'); return; } // fresh deploy, nothing to migrate
+  for (const k of TENANT_KEYS) {
+    const raw = await env.NODE_STATE.get(k); // raw string — copied verbatim, no re-encode
+    if (raw == null) continue;
+    const tk = 't:' + NETWORK_ROOT_HOST + ':' + k;
+    if ((await env.NODE_STATE.get(tk)) == null) await env.NODE_STATE.put(tk, raw);
+  }
+  await env.NODE_STATE.put(guard, '1');
 }
 
 // ============================================================
@@ -392,19 +417,22 @@ async function addPeer(storage, peer) {
 // ---- network registry (root of trust) ----
 function isRoot(identity) { return identity.publicKey === NETWORK_ROOT_PUBKEY; }
 
-async function getRegistryMembers(storage, identity) {
-  let members = (await storage.get('registry:members')) || [];
+// The registry is network-wide, not per-creator, so it always uses the GLOBAL namespace.
+async function getRegistryMembers(env, identity) {
+  const g = makeStorage(env);
+  let members = (await g.get('registry:members')) || [];
   // the root always counts itself as the first member
   if (isRoot(identity) && !members.find(m => m.pubkey === identity.publicKey)) {
     members = [{ subdomain: NETWORK_ROOT_HOST, pubkey: identity.publicKey, addedAt: new Date().toISOString() }, ...members];
-    await storage.set('registry:members', members);
+    await g.set('registry:members', members);
   }
   return members;
 }
 
-async function registrySigned(storage, identity, subdomain) {
-  const members = await getRegistryMembers(storage, identity);
-  const updatedAt = (await storage.get('registry:updatedAt')) || new Date().toISOString();
+async function registrySigned(env, identity, subdomain) {
+  const g = makeStorage(env);
+  const members = await getRegistryMembers(env, identity);
+  const updatedAt = (await g.get('registry:updatedAt')) || new Date().toISOString();
   const payload = updatedAt + '.' + JSON.stringify(members);
   const signature = await sign(identity.privateKey, payload);
   return { root: { subdomain, pubkey: identity.publicKey }, members, updatedAt, signature };
@@ -418,6 +446,7 @@ async function handleRequest(request, storage, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const subdomain = url.hostname;
+  const gstore = makeStorage(env); // global namespace — for the network-wide registry only
 
   // CORS preflight
   if (request.method === 'OPTIONS') {
@@ -477,7 +506,7 @@ async function handleRequest(request, storage, env) {
   }
   // signed member registry — the canonical network is whatever the root signs here
   if (path === '/.well-known/registry.json') {
-    return jsonCors(await registrySigned(storage, identity, subdomain));
+    return jsonCors(await registrySigned(env, identity, subdomain));
   }
   if (path === '/.well-known/source.json') {
     return json({
@@ -525,12 +554,12 @@ async function handleRequest(request, storage, env) {
     let msg; try { msg = JSON.parse(body.message); } catch { return jsonCors({ error: 'bad request' }, 400); }
     const valid = await verify(msg.pubkey, body.signature, body.message);
     if (!valid) return jsonCors({ error: 'invalid signature' }, 400);
-    const members = await getRegistryMembers(storage, identity);
+    const members = await getRegistryMembers(env, identity);
     if (members.find(m => m.pubkey === msg.pubkey)) return jsonCors({ ok: true, alreadyMember: true });
-    const pending = (await storage.get('registry:pending')) || [];
+    const pending = (await gstore.get('registry:pending')) || [];
     if (!pending.find(p => p.pubkey === msg.pubkey)) {
       pending.unshift({ subdomain: msg.subdomain, pubkey: msg.pubkey, at: new Date().toISOString() });
-      await storage.set('registry:pending', pending);
+      await gstore.set('registry:pending', pending);
       const notifs = (await storage.get('inbox:notifications')) || [];
       notifs.unshift({ id: crypto.randomUUID(), type: 'join_request', subdomain: msg.subdomain, publicKey: msg.pubkey, at: new Date().toISOString(), read: false });
       if (notifs.length > 100) notifs.splice(100);
@@ -673,23 +702,23 @@ async function handleRequest(request, storage, env) {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
-    return liveStub(env).fetch(request);
+    return liveStub(env, subdomain).fetch(request);
   }
 
   // ---- live: public status (DO-backed; includes viewer count) ----
   if (path === '/live/status.json') {
-    const r = await liveDO(env, '/status');
+    const r = await liveDO(env, subdomain, '/status');
     return jsonCors(await r.json());
   }
 
   // ---- live: public chat (DO-backed; WS is preferred, these are fallbacks) ----
   if (path === '/live/chat.json') {
-    const r = await liveDO(env, '/chat');
+    const r = await liveDO(env, subdomain, '/chat');
     return jsonCors(await r.json());
   }
   if (path === '/live/chat' && request.method === 'POST') {
     const body = await request.text();
-    const r = await liveDO(env, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const r = await liveDO(env, subdomain, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
@@ -698,7 +727,7 @@ async function handleRequest(request, storage, env) {
     const cfg = await storage.get('preroll');
     if (!cfg || !cfg.enabled || !cfg.mediaUrl) return jsonCors({ show: false });
     const vid = url.searchParams.get('vid') || '';
-    const r = await liveDO(env, '/ad-allowed?vid=' + encodeURIComponent(vid));
+    const r = await liveDO(env, subdomain, '/ad-allowed?vid=' + encodeURIComponent(vid));
     const { allowed } = await r.json();
     if (!allowed) return jsonCors({ show: false });
     return jsonCors({ show: true, ad: {
@@ -710,31 +739,31 @@ async function handleRequest(request, storage, env) {
   }
   if (path === '/live/preroll/seen' && request.method === 'POST') {
     const { vid } = await request.json().catch(() => ({}));
-    await liveDO(env, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }) });
+    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }) });
     return jsonCors({ ok: true });
   }
   if (path === '/live/preroll/click' && request.method === 'POST') {
-    await liveDO(env, '/ad-click', { method: 'POST' });
+    await liveDO(env, subdomain, '/ad-click', { method: 'POST' });
     return jsonCors({ ok: true });
   }
 
   // ---- post interactions: likes + comments (public) ----
   if (path === '/post/likes' && request.method === 'GET') {
-    const r = await liveDO(env, '/likes?postId=' + encodeURIComponent(url.searchParams.get('postId') || '') + '&vid=' + encodeURIComponent(url.searchParams.get('vid') || ''));
+    const r = await liveDO(env, subdomain, '/likes?postId=' + encodeURIComponent(url.searchParams.get('postId') || '') + '&vid=' + encodeURIComponent(url.searchParams.get('vid') || ''));
     return jsonCors(await r.json());
   }
   if (path === '/post/like' && request.method === 'POST') {
     const body = await request.text();
-    const r = await liveDO(env, '/like', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const r = await liveDO(env, subdomain, '/like', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return jsonCors(await r.json(), r.status);
   }
   if (path === '/post/comments' && request.method === 'GET') {
-    const r = await liveDO(env, '/comments?postId=' + encodeURIComponent(url.searchParams.get('postId') || ''));
+    const r = await liveDO(env, subdomain, '/comments?postId=' + encodeURIComponent(url.searchParams.get('postId') || ''));
     return jsonCors(await r.json());
   }
   if (path === '/post/comment' && request.method === 'POST') {
     const body = await request.text();
-    const r = await liveDO(env, '/comment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const r = await liveDO(env, subdomain, '/comment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
@@ -800,7 +829,7 @@ async function handleRequest(request, storage, env) {
 
       // Store in the live room DO — same structure as browser broadcast
       if (sessionId) {
-        await liveDO(env, '/publish', {
+        await liveDO(env, subdomain, '/publish', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ publisherSessionId: sessionId, trackNames, via: 'whip' }),
@@ -819,7 +848,7 @@ async function handleRequest(request, storage, env) {
 
     // WHIP DELETE — Larix ended the stream
     if (request.method === 'DELETE') {
-      await liveDO(env, '/end', { method: 'POST' });
+      await liveDO(env, subdomain, '/end', { method: 'POST' });
       // Forward DELETE to Cloudflare Realtime
       const sessionId = path.split('/live/whip/')[1];
       if (sessionId) {
@@ -870,7 +899,7 @@ async function handleRequest(request, storage, env) {
   if (path === '/admin/live/publish' && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     const { sessionId, trackNames } = await request.json();
-    await liveDO(env, '/publish', {
+    await liveDO(env, subdomain, '/publish', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ publisherSessionId: sessionId, trackNames, via: 'browser' }),
@@ -881,14 +910,14 @@ async function handleRequest(request, storage, env) {
   // ---- live: admin — heartbeat (keeps a browser stream from going stale) ----
   if (path === '/admin/live/heartbeat' && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
-    await liveDO(env, '/heartbeat', { method: 'POST' });
+    await liveDO(env, subdomain, '/heartbeat', { method: 'POST' });
     return json({ ok: true });
   }
 
   // ---- live: admin — end ----
   if (path === '/admin/live/end' && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
-    await liveDO(env, '/end', { method: 'POST' });
+    await liveDO(env, subdomain, '/end', { method: 'POST' });
     return json({ ok: true });
   }
 
@@ -912,7 +941,7 @@ async function handleRequest(request, storage, env) {
   if (path === '/admin/comment/delete' && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     const body = await request.text();
-    const r = await liveDO(env, '/comment-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const r = await liveDO(env, subdomain, '/comment-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return json(await r.json());
   }
 
@@ -938,7 +967,7 @@ async function handleRequest(request, storage, env) {
   if (path === '/admin/preroll.json') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     const cfg = (await storage.get('preroll')) || { enabled: false };
-    const r = await liveDO(env, '/ad-stats');
+    const r = await liveDO(env, subdomain, '/ad-stats');
     const stats = await r.json();
     const earnings = +(((stats.impressions || 0) / 1000) * (cfg.cpm || 0)).toFixed(2);
     return json({ preroll: cfg, stats: { ...stats, earnings } });
@@ -978,30 +1007,30 @@ async function handleRequest(request, storage, env) {
   if (path === '/admin/registry.json') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
-    return json({ members: await getRegistryMembers(storage, identity), pending: (await storage.get('registry:pending')) || [] });
+    return json({ members: await getRegistryMembers(env, identity), pending: (await gstore.get('registry:pending')) || [] });
   }
   if ((path === '/admin/registry/add' || path === '/admin/registry/approve') && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const b = await request.json().catch(() => ({}));
     if (!b.pubkey) return json({ error: 'pubkey required' }, 400);
-    const pending = (await storage.get('registry:pending')) || [];
+    const pending = (await gstore.get('registry:pending')) || [];
     const pIdx = pending.findIndex(p => p.pubkey === b.pubkey);
     const sd = b.subdomain || (pIdx !== -1 ? pending[pIdx].subdomain : '');
     if (!sd) return json({ error: 'subdomain required' }, 400);
-    if (pIdx !== -1) { pending.splice(pIdx, 1); await storage.set('registry:pending', pending); }
-    const members = await getRegistryMembers(storage, identity);
+    if (pIdx !== -1) { pending.splice(pIdx, 1); await gstore.set('registry:pending', pending); }
+    const members = await getRegistryMembers(env, identity);
     if (!members.find(m => m.pubkey === b.pubkey)) members.push({ subdomain: sd, pubkey: b.pubkey, addedAt: new Date().toISOString() });
-    await storage.set('registry:members', members);
-    await storage.set('registry:updatedAt', new Date().toISOString());
+    await gstore.set('registry:members', members);
+    await gstore.set('registry:updatedAt', new Date().toISOString());
     return json({ ok: true, members });
   }
   if (path === '/admin/registry/deny' && request.method === 'POST') {
     if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const { pubkey } = await request.json().catch(() => ({}));
-    const pending = ((await storage.get('registry:pending')) || []).filter(p => p.pubkey !== pubkey);
-    await storage.set('registry:pending', pending);
+    const pending = ((await gstore.get('registry:pending')) || []).filter(p => p.pubkey !== pubkey);
+    await gstore.set('registry:pending', pending);
     return json({ ok: true });
   }
   if (path === '/admin/registry/remove' && request.method === 'POST') {
@@ -1009,9 +1038,9 @@ async function handleRequest(request, storage, env) {
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const { pubkey } = await request.json().catch(() => ({}));
     if (pubkey === NETWORK_ROOT_PUBKEY) return json({ error: 'cannot remove the root' }, 400);
-    const members = (await getRegistryMembers(storage, identity)).filter(m => m.pubkey !== pubkey);
-    await storage.set('registry:members', members);
-    await storage.set('registry:updatedAt', new Date().toISOString());
+    const members = (await getRegistryMembers(env, identity)).filter(m => m.pubkey !== pubkey);
+    await gstore.set('registry:members', members);
+    await gstore.set('registry:updatedAt', new Date().toISOString());
     return json({ ok: true, members });
   }
 
