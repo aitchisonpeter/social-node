@@ -117,9 +117,9 @@ export class LiveRoom extends DurableObject {
     // txt/img are placement objects {x,y,s} (screen-fraction coords + scale), sanitized
     // at the worker route. Auth happens there too; the DO trusts its caller.
     if (seg === 'overlay' && request.method === 'POST') {
-      const { text, imageUrl, txt, img } = await request.json().catch(() => ({}));
+      const { text, imageUrl, linkUrl, txt, img } = await request.json().catch(() => ({}));
       const overlay = (text || imageUrl)
-        ? { text: text || '', imageUrl: imageUrl || '', txt: txt || null, img: img || null }
+        ? { text: text || '', imageUrl: imageUrl || '', linkUrl: linkUrl || '', txt: txt || null, img: img || null }
         : null;
       if (overlay) await this.ctx.storage.put('overlay', overlay);
       else await this.ctx.storage.delete('overlay');
@@ -1636,7 +1636,12 @@ async function handleRequest(request, storage, env, ctx) {
     } : null;
     const r = await liveDO(env, subdomain, '/overlay', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, imageUrl, txt: place(b.txt), img: place(b.img) }),
+      body: JSON.stringify({
+        text, imageUrl,
+        // https only — this becomes a tap target on every viewer's screen
+        linkUrl: String(b.linkUrl || '').startsWith('https://') ? String(b.linkUrl).slice(0, 300) : '',
+        txt: place(b.txt), img: place(b.img),
+      }),
     });
     return json(await r.json().catch(() => ({})), r.status);
   }
@@ -2984,6 +2989,8 @@ ${s.noscript || ''}
   </div>
   <div class="field"><label>Text (shows above chat)</label>
     <input type="text" id="ovText" maxlength="120" placeholder="e.g. Merch drops Friday — link in bio" autocomplete="off"></div>
+  <div class="field"><label>Link (makes the text a tappable button)</label>
+    <input type="url" id="ovLink" maxlength="300" placeholder="https://…" autocomplete="off"></div>
   <div class="field"><label>Image (corner badge)</label>
     <input type="file" id="ovFile" accept="image/*" style="display:none" onchange="onOverlayPick(this)">
     <div style="display:flex;gap:10px;align-items:center">
@@ -3659,6 +3666,18 @@ function renderLiveOverlay(ov, base) {
     txt.style.left = (p.x * 100) + '%';
     txt.style.top  = (p.y * 100) + '%';
     txt.style.fontSize = (19 * p.s) + 'px';
+    // a link turns the text into a button viewers can tap (broadcaster keeps drag instead)
+    if (ov.linkUrl) {
+      txt.style.background = '#FE2C55'; txt.style.padding = '10px 20px'; txt.style.borderRadius = '24px';
+      txt.style.textShadow = 'none'; txt.style.boxShadow = '0 2px 12px rgba(0,0,0,0.45)';
+      if (!txt.classList.contains('ov-edit')) txt.style.pointerEvents = 'auto';
+      txt.onclick = () => { if (!txt.classList.contains('ov-edit')) window.open(ov.linkUrl, '_blank', 'noopener'); };
+    } else {
+      txt.style.background = 'none'; txt.style.padding = '0'; txt.style.borderRadius = '0';
+      txt.style.textShadow = '0 1px 5px rgba(0,0,0,0.85)'; txt.style.boxShadow = 'none';
+      if (!txt.classList.contains('ov-edit')) txt.style.pointerEvents = 'none';
+      txt.onclick = null;
+    }
     txt.style.display = 'block';
   } else { txt.style.display = 'none'; }
 }
@@ -3740,6 +3759,7 @@ function openOverlaySheet() {
   // editing a live overlay: seed the sheet from current state so re-applying keeps the image
   if (_ovCurrent) {
     document.getElementById('ovText').value = _ovCurrent.text || '';
+    document.getElementById('ovLink').value = _ovCurrent.linkUrl || '';
     if (_ovCurrent.imageUrl && !_ovImageUrl) {
       _ovImageUrl = _ovCurrent.imageUrl;
       const u = _ovCurrent.imageUrl.startsWith('http') ? _ovCurrent.imageUrl : _ovBase + _ovCurrent.imageUrl;
@@ -3768,7 +3788,7 @@ async function onOverlayPick(input) {
 async function setOverlayOnServer(ov) {
   const r = await fetch('/admin/live/overlay', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-    body: JSON.stringify({ text: ov.text || '', imageUrl: ov.imageUrl || '', txt: ov.txt || null, img: ov.img || null }),
+    body: JSON.stringify({ text: ov.text || '', imageUrl: ov.imageUrl || '', linkUrl: ov.linkUrl || '', txt: ov.txt || null, img: ov.img || null }),
   });
   if (!r.ok) throw new Error(r.status);
 }
@@ -3776,7 +3796,9 @@ async function applyOverlay() {
   const text = document.getElementById('ovText').value.trim();
   if (!text && !_ovImageUrl) { toast('Add text or an image first'); return; }
   // keep existing placements when re-applying (editing text mid-stream shouldn't reset layout)
-  const ov = { text, imageUrl: _ovImageUrl, txt: _ovCurrent?.txt || null, img: _ovCurrent?.img || null };
+  const link = document.getElementById('ovLink').value.trim();
+  if (link && !link.startsWith('https://')) { toast('Link must start with https://'); return; }
+  const ov = { text, imageUrl: _ovImageUrl, linkUrl: link, txt: _ovCurrent?.txt || null, img: _ovCurrent?.img || null };
   try {
     await setOverlayOnServer(ov);
     toast('Overlay is live — drag to move, pinch to resize');
@@ -3786,6 +3808,7 @@ async function applyOverlay() {
 async function clearOverlay() {
   _ovImageUrl = '';
   document.getElementById('ovText').value = '';
+  document.getElementById('ovLink').value = '';
   document.getElementById('ovPreview').innerHTML = '';
   try { await setOverlayOnServer({ text: '', imageUrl: '' }); toast('Overlay cleared'); } catch(e) {}
   closeOverlaySheet();
