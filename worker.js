@@ -20,17 +20,17 @@ const PROTOCOL_VERSION = '0.5.0';
 // code can be forked but the *network* (the member set) cannot — a
 // fork can't mint members that verify against this root.
 // ============================================================
-const NETWORK_ROOT_HOST   = 'social-node.aitchisonpeter.workers.dev';
-const NETWORK_ROOT_PUBKEY = '4HAg90xqd7T8TfhXC3sYjEYIQlCGa7RPQod0x9L8oXk=';
+const NETWORK_ROOT_HOST   = 'social.tuliptown.ca';
+const NETWORK_ROOT_PUBKEY = 'YAdBZsfg9vrufnqe3JEFgQpUARoYdYNRR7yiKsusY6E=';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     // Multi-tenant: each hostname is its own creator. State is keyed by hostname,
     // so one deploy hosts many creators (alex.host.com, bob.host.com, …).
     const tenant = new URL(request.url).hostname;
     if (tenant === NETWORK_ROOT_HOST) await migrateLegacyToRoot(env);
     const storage = makeStorage(env, tenant);
-    return await handleRequest(request, storage, env);
+    return await handleRequest(request, storage, env, ctx);
   },
 };
 
@@ -61,18 +61,23 @@ export class LiveRoom extends DurableObject {
       }
       const role = url.searchParams.get('role') === 'broadcaster' ? 'broadcaster' : 'viewer';
       const name = (url.searchParams.get('name') || 'viewer').slice(0, 30);
+      // sid = short hash of the client's viewer id — stable mute target that doesn't expose the raw vid
+      const sid = await this.sidOf(url.searchParams.get('vid') || '');
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ role, name });
+      server.serializeAttachment({ role, name, sid });
       this.ctx.acceptWebSocket(server);
       try {
+        const status = await this.statusObj();
         server.send(JSON.stringify({
           t: 'init',
-          status: await this.statusObj(),
-          chat: await this.recentChat(),
+          status,
+          // chat belongs to the live stream — joiners after it ended get a clean slate
+          chat: status.active ? await this.recentChat() : [],
           viewers: this.viewerCount(),
         }));
       } catch {}
+      await this.sampleViewers();
       this.broadcastViewers();
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -83,13 +88,21 @@ export class LiveRoom extends DurableObject {
 
     if (seg === 'publish' && request.method === 'POST') {
       const { publisherSessionId, trackNames, via } = await request.json().catch(() => ({}));
+      // a re-publish over a still-active session (e.g. browser crashed mid-stream) closes out the old log entry
+      const prev = await this.ctx.storage.get('session');
+      if (prev && prev.active) await this.finalizeSession(prev, prev.heartbeatAt || Date.now());
+      const now = Date.now();
       await this.ctx.storage.put('session', {
         active: true,
         publisherSessionId: publisherSessionId || null,
         trackNames: trackNames || [],
         startedAt: new Date().toISOString(),
-        heartbeatAt: Date.now(),
+        heartbeatAt: now,
         via: via || 'browser',
+        peakViewers: this.viewerCount(),
+        viewerSec: 0,
+        lastSampleAt: now,
+        lastViewers: this.viewerCount(),
       });
       await this.ctx.storage.put('chat', []); // fresh chat per stream
       this.broadcast({ t: 'live', status: await this.statusObj() });
@@ -98,25 +111,83 @@ export class LiveRoom extends DurableObject {
 
     if (seg === 'heartbeat' && request.method === 'POST') {
       const s = await this.ctx.storage.get('session');
-      if (s && s.active) { s.heartbeatAt = Date.now(); await this.ctx.storage.put('session', s); }
+      if (s && s.active) {
+        s.heartbeatAt = Date.now();
+        this.sampleInto(s);
+        await this.ctx.storage.put('session', s);
+      }
       return Response.json({ ok: true });
     }
 
     if (seg === 'end' && request.method === 'POST') {
       const s = await this.ctx.storage.get('session');
-      if (s) { s.active = false; s.endedAt = new Date().toISOString(); await this.ctx.storage.put('session', s); }
+      if (s) {
+        const wasActive = s.active;
+        s.active = false; s.endedAt = new Date().toISOString();
+        await this.ctx.storage.put('session', s);
+        if (wasActive) await this.finalizeSession(s, Date.now());
+      }
       this.broadcast({ t: 'ended' });
       return Response.json({ ok: true });
     }
 
+    if (seg === 'history') {
+      const log = (await this.ctx.storage.get('streamLog')) || [];
+      return Response.json({ streams: log.slice().reverse() });
+    }
+
+    // ---- who's connected (viewer list) + chat moderation ----
+    if (seg === 'who') {
+      const muted = (await this.ctx.storage.get('muted')) || {};
+      const people = [];
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          const a = ws.deserializeAttachment() || {};
+          people.push({ name: a.name || 'viewer', sid: a.sid || '', role: a.role || 'viewer', muted: !!(a.sid && muted[a.sid]) });
+        } catch {}
+      }
+      return Response.json({
+        viewers: people,
+        mutedList: Object.entries(muted).map(([sid, m]) => ({ sid, name: m.name || 'viewer' })),
+      });
+    }
+    if (seg === 'mute' && request.method === 'POST') {
+      const { sid, name, muted: wantMuted } = await request.json().catch(() => ({}));
+      if (!sid) return Response.json({ error: 'sid required' }, { status: 400 });
+      const muted = (await this.ctx.storage.get('muted')) || {};
+      if (wantMuted === false) {
+        delete muted[sid];
+      } else {
+        muted[sid] = { name: String(name || 'viewer').slice(0, 30), at: new Date().toISOString() };
+        const keys = Object.keys(muted);
+        if (keys.length > 200) { keys.sort((a, b) => (muted[a].at < muted[b].at ? -1 : 1)); delete muted[keys[0]]; }
+      }
+      await this.ctx.storage.put('muted', muted);
+      return Response.json({ ok: true });
+    }
+
     if (seg === 'chat' && request.method === 'POST') {
-      const { text, name } = await request.json().catch(() => ({}));
-      const msg = await this.addChat(text, name);
+      // HTTP chat (the no-WS fallback) gets the same per-sender throttle as the WS path —
+      // unauthenticated and previously unlimited, it was the cheapest spam vector.
+      const ip = request.headers.get('X-Chat-Ip') || 'unknown';
+      const now = Date.now();
+      if (!this._httpRate) this._httpRate = new Map();
+      if (this._httpRate.size > 500) this._httpRate.clear();
+      if (now - (this._httpRate.get(ip) || 0) < CHAT_MIN_GAP_MS) {
+        return Response.json({ error: 'slow down' }, { status: 429 });
+      }
+      this._httpRate.set(ip, now);
+      const { text, name, vid } = await request.json().catch(() => ({}));
+      const sid = await this.sidOf(vid || '');
+      const muted = (await this.ctx.storage.get('muted')) || {};
+      if (sid && muted[sid]) return Response.json({ ok: true }); // shadow-mute: silently dropped
+      const msg = await this.addChat(text, name, sid);
       return Response.json(msg ? { ok: true } : { error: 'empty' }, { status: msg ? 200 : 400 });
     }
 
     if (seg === 'chat') {
-      return Response.json({ messages: await this.recentChat() });
+      const status = await this.statusObj();
+      return Response.json({ messages: status.active ? await this.recentChat() : [] });
     }
 
     // ---- pre-roll ad frequency cap + counters ----
@@ -125,7 +196,7 @@ export class LiveRoom extends DurableObject {
     }
     if (seg === 'ad-seen' && request.method === 'POST') {
       const { vid } = await request.json().catch(() => ({}));
-      await this.adSeen(vid);
+      await this.adSeen(vid, request.headers.get('X-Real-Ip') || '');
       return Response.json({ ok: true });
     }
     if (seg === 'ad-click' && request.method === 'POST') {
@@ -138,6 +209,54 @@ export class LiveRoom extends DurableObject {
         impressions: (await this.ctx.storage.get('adImpressions')) || 0,
         clicks: (await this.ctx.storage.get('adClicks')) || 0,
       });
+    }
+
+    // ---- verified impression measurement (root-side; DO named 'measure:<host>') ----
+    // The viewed node's own meter pays creators; THESE deduped counts face advertisers.
+    if (seg === 'm-imp' && request.method === 'POST') {
+      const { vid } = await request.json().catch(() => ({}));
+      if (!vid) return Response.json({ error: 'vid required' }, { status: 400 });
+      const ip = request.headers.get('X-Real-Ip') || 'unknown';
+      const now = Date.now();
+      const seen = (await this.ctx.storage.get('m:seen')) || {};
+      // one verified impression per viewer AND per IP per grace window
+      if (now - (seen['v:' + vid] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
+      if (now - (seen['i:' + ip] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
+      seen['v:' + vid] = now; seen['i:' + ip] = now;
+      for (const k of Object.keys(seen)) if (now - seen[k] > PREROLL_GRACE_MS * 4) delete seen[k];
+      await this.ctx.storage.put('m:seen', seen);
+      const day = new Date().toISOString().slice(0, 10);
+      const days = (await this.ctx.storage.get('m:days')) || {};
+      days[day] = (days[day] || 0) + 1;
+      const dayKeys = Object.keys(days).sort();
+      while (dayKeys.length > 30) delete days[dayKeys.shift()];
+      await this.ctx.storage.put('m:days', days);
+      await this.ctx.storage.put('m:total', ((await this.ctx.storage.get('m:total')) || 0) + 1);
+      return Response.json({ ok: true });
+    }
+    if (seg === 'm-stats') {
+      return Response.json({
+        total: (await this.ctx.storage.get('m:total')) || 0,
+        days: (await this.ctx.storage.get('m:days')) || {},
+      });
+    }
+
+    // ---- generic sliding-window rate limit (auth brute-force guard) ----
+    if (seg === 'rl' && request.method === 'POST') {
+      const { key, max, windowMs } = await request.json().catch(() => ({}));
+      if (!key) return Response.json({ allowed: false });
+      const now = Date.now();
+      const win = windowMs || 600000;
+      const rl = (await this.ctx.storage.get('rl')) || {};
+      const list = (rl[key] || []).filter(t => now - t < win);
+      if (list.length >= (max || 10)) {
+        rl[key] = list; await this.ctx.storage.put('rl', rl);
+        return Response.json({ allowed: false });
+      }
+      list.push(now); rl[key] = list;
+      for (const k of Object.keys(rl)) if (!rl[k].length || now - rl[k][rl[k].length - 1] > 3600000) delete rl[k];
+      await this.ctx.storage.put('rl', rl);
+      return Response.json({ allowed: true });
     }
 
     // ---- likes (deduped by viewer id) ----
@@ -213,11 +332,15 @@ export class LiveRoom extends DurableObject {
     return (Date.now() - (seen[vid] || 0)) > PREROLL_GRACE_MS;
   }
 
-  async adSeen(vid) {
+  async adSeen(vid, ip) {
     if (!vid) return;
     const now = Date.now();
     const seen = (await this.ctx.storage.get('adseen')) || {};
+    // per-IP floor (30s, softer than the per-vid window — NAT'd venues share IPs):
+    // blunts curl-loop inflation of the local meter without starving real viewers
+    if (ip && now - (seen['ip:' + ip] || 0) < 30000) return;
     seen[vid] = now;
+    if (ip) seen['ip:' + ip] = now;
     // bound the map: drop entries well past the grace window
     for (const k of Object.keys(seen)) if (now - seen[k] > PREROLL_GRACE_MS * 4) delete seen[k];
     await this.ctx.storage.put('adseen', seen);
@@ -230,14 +353,62 @@ export class LiveRoom extends DurableObject {
     // Browser broadcasters send heartbeats; if they stop, treat as ended.
     // WHIP (OBS/Larix) has no heartbeat — it ends via explicit DELETE.
     const stale = s.via !== 'whip' && s.heartbeatAt && (Date.now() - s.heartbeatAt > LIVE_STALE_MS);
+    if (stale) {
+      // a dead broadcaster never calls /end — close out the session log here
+      s.active = false; s.endedAt = new Date(s.heartbeatAt).toISOString();
+      await this.ctx.storage.put('session', s);
+      await this.finalizeSession(s, s.heartbeatAt);
+      return { active: false, viewers: this.viewerCount() };
+    }
     return {
-      active: !stale,
+      active: true,
       publisherSessionId: s.publisherSessionId,
       trackNames: s.trackNames,
       startedAt: s.startedAt,
       via: s.via,
       viewers: this.viewerCount(),
     };
+  }
+
+  // Accumulate viewer-seconds + peak into the active session (mutates s; caller persists).
+  // atMs caps the credited interval — pass the real end time when closing a stale session.
+  sampleInto(s, atMs) {
+    const now = atMs || Date.now();
+    const n = this.viewerCount();
+    if (s.lastSampleAt && now > s.lastSampleAt) {
+      s.viewerSec = (s.viewerSec || 0) + ((now - s.lastSampleAt) / 1000) * (s.lastViewers || 0);
+    }
+    s.lastSampleAt = now;
+    s.lastViewers = n;
+    if (n > (s.peakViewers || 0)) s.peakViewers = n;
+  }
+
+  // Called whenever the viewer count changes mid-stream.
+  async sampleViewers() {
+    const s = await this.ctx.storage.get('session');
+    if (!s || !s.active) return;
+    this.sampleInto(s);
+    await this.ctx.storage.put('session', s);
+  }
+
+  // Append the finished session to the per-tenant stream log (newest last, capped).
+  async finalizeSession(s, endedAtMs) {
+    this.sampleInto(s, endedAtMs); // capture the tail interval, capped at the real end time
+    const startMs = Date.parse(s.startedAt) || endedAtMs;
+    const rec = {
+      startedAt: s.startedAt,
+      endedAt: new Date(endedAtMs).toISOString(),
+      durationSec: Math.max(0, Math.round((endedAtMs - startMs) / 1000)),
+      peakViewers: s.peakViewers || 0,
+      viewerSec: Math.round(s.viewerSec || 0),
+      via: s.via || 'browser',
+    };
+    const log = (await this.ctx.storage.get('streamLog')) || [];
+    log.push(rec);
+    if (log.length > 50) log.splice(0, log.length - 50);
+    await this.ctx.storage.put('streamLog', log);
+    // chat belongs to the stream — don't let it linger for late visitors after the stream ends
+    await this.ctx.storage.put('chat', []);
   }
 
   viewerCount() {
@@ -252,12 +423,20 @@ export class LiveRoom extends DurableObject {
     return (await this.ctx.storage.get('chat')) || [];
   }
 
-  async addChat(text, name) {
+  // sid is a short SHA-256 prefix of the sender's viewer id — safe to broadcast, useless to spoofers
+  async sidOf(vid) {
+    if (!vid) return '';
+    const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(vid)));
+    return [...new Uint8Array(d)].slice(0, 6).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async addChat(text, name, sid) {
     if (!text || !String(text).trim()) return null;
     const msg = {
       id: crypto.randomUUID(),
       text: String(text).slice(0, 200),
       name: String(name || 'viewer').slice(0, 30),
+      sid: sid || '',
       at: new Date().toISOString(),
     };
     const chat = (await this.ctx.storage.get('chat')) || [];
@@ -290,16 +469,20 @@ export class LiveRoom extends DurableObject {
       if (now - last < CHAT_MIN_GAP_MS) return;
       this._rate.set(ws, now);
       const att = ws.deserializeAttachment() || {};
-      await this.addChat(data.text, data.name || att.name);
+      const muted = (await this.ctx.storage.get('muted')) || {};
+      if (att.sid && muted[att.sid]) return; // shadow-mute: silently dropped
+      await this.addChat(data.text, data.name || att.name, att.sid);
     }
   }
 
   async webSocketClose(ws, code, reason) {
     try { ws.close(code, reason); } catch {}
+    await this.sampleViewers();
     this.broadcastViewers();
   }
 
   async webSocketError() {
+    await this.sampleViewers();
     this.broadcastViewers();
   }
 }
@@ -389,6 +572,42 @@ async function verify(publicKeyB64, signatureB64, data) {
 function bufferToBase64(buf) { return btoa(String.fromCharCode(...new Uint8Array(buf))); }
 function base64ToBuffer(b64) { return Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer; }
 
+// constant-time string compare — avoids leaking token length/contents via timing
+function ctEq(a, b) {
+  const ea = new TextEncoder().encode(a), eb = new TextEncoder().encode(b);
+  if (ea.length !== eb.length) return false;
+  let d = 0; for (let i = 0; i < ea.length; i++) d |= ea[i] ^ eb[i];
+  return d === 0;
+}
+async function sha256hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function randomTokenHex() {
+  return [...crypto.getRandomValues(new Uint8Array(32))].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function bytesToHex(bytes) { return [...bytes].map(b => b.toString(16).padStart(2, '0')).join(''); }
+function hexToBytes(hex) { const a = new Uint8Array(hex.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(hex.substr(i * 2, 2), 16); return a; }
+// PBKDF2-SHA256 password hashing (native WebCrypto) — for per-creator passwords (Phase 2 auth)
+async function pbkdf2(password, saltHex, iterations) {
+  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: hexToBytes(saltHex), iterations, hash: 'SHA-256' }, km, 256);
+  return bytesToHex(new Uint8Array(bits));
+}
+// Stateless session token: base64(payload).base64(sig), signed by the tenant's own Ed25519 key.
+// No server-side session store; verified by re-checking the signature + expiry against the serving tenant.
+async function makeSession(identity, host, days = 30) {
+  const payload = btoa(JSON.stringify({ h: host, exp: Math.floor(Date.now() / 1000) + days * 86400 }));
+  return payload + '.' + (await sign(identity.privateKey, payload));
+}
+async function verifySession(identity, host, tokenStr) {
+  const dot = tokenStr.indexOf('.');
+  if (dot < 0) return false;
+  const payload = tokenStr.slice(0, dot), sig = tokenStr.slice(dot + 1);
+  if (!(await verify(identity.publicKey, sig, payload))) return false;
+  try { const p = JSON.parse(atob(payload)); return p.h === host && p.exp > Date.now() / 1000; } catch (e) { return false; }
+}
+
 // ============================================================
 // NODE STATE
 // ============================================================
@@ -412,6 +631,19 @@ async function addPeer(storage, peer) {
   peers.push({ ...peer, addedAt: new Date().toISOString() });
   await storage.set('peers', peers);
   return peers;
+}
+
+// Mark a join_request inbox notification as resolved once it's been approved/denied,
+// so the inbox stops rendering its Approve/Deny buttons. storage = the root tenant's KV.
+async function resolveJoinNotif(storage, pubkey, outcome) {
+  const notifs = (await storage.get('inbox:notifications')) || [];
+  let changed = false;
+  for (const n of notifs) {
+    if (n.type === 'join_request' && n.publicKey === pubkey && !n.resolved) {
+      n.resolved = outcome; n.read = true; changed = true;
+    }
+  }
+  if (changed) await storage.set('inbox:notifications', notifs);
 }
 
 // ---- network registry (root of trust) ----
@@ -442,7 +674,7 @@ async function registrySigned(env, identity, subdomain) {
 // ROUTING
 // ============================================================
 
-async function handleRequest(request, storage, env) {
+async function handleRequest(request, storage, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
   const subdomain = url.hostname;
@@ -453,8 +685,21 @@ async function handleRequest(request, storage, env) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  await ensureIdentity(storage);
-  const identity = await storage.get('identity');
+  // ---- provisioning gate (wildcard auto-create protection) ----
+  // A wildcard host auto-creates a tenant on first hit, which is an open mint surface.
+  // Opt-in: while the provisioned list is EMPTY the gate is off (backward compatible —
+  // simple/forked deploys keep auto-create). Once any host is provisioned, only allowed
+  // hosts serve/auto-create. Always allowed: the network root + any registry member
+  // (real nodes never get locked out). Unknown hosts 404 BEFORE ensureIdentity → no KV write.
+  const provisioned = (await gstore.get('provisioned')) || [];
+  if (provisioned.length > 0 && subdomain !== NETWORK_ROOT_HOST && !provisioned.includes(subdomain)) {
+    const regMembers = (await gstore.get('registry:members')) || [];
+    if (!regMembers.find(m => m.subdomain === subdomain)) {
+      return html(renderUnclaimed(subdomain), 404);
+    }
+  }
+
+  const identity = await ensureIdentity(storage);
 
   // ---- PWA files ----
   if (path === '/' || path === '/index.html') {
@@ -475,21 +720,66 @@ async function handleRequest(request, storage, env) {
   }
 
   // ---- media serving (public) ----
+  // Range support is required for iOS Safari video playback/seeking; full responses are
+  // edge-cached (keys are immutable UUIDs) so repeat views don't hit R2 or burn Worker CPU.
   if (path.startsWith('/media/') && request.method === 'GET') {
     if (!env.NODE_MEDIA) return new Response('R2 not configured', { status: 503 });
     const key = path.slice(7);
     if (!key) return new Response('not found', { status: 404 });
-    const object = await env.NODE_MEDIA.get(key);
+    const rangeHeader = request.headers.get('Range');
+    const cacheKey = new Request(url.origin + path);
+    // Edge cache serves FULL requests only. Range requests go straight to R2's native
+    // range reads — slicing a cached full object through JS meant reading and discarding
+    // up to the whole file per request (iOS asks for high offsets on MP4s with trailing
+    // metadata), which stalled large videos and burned CPU.
+    if (!rangeHeader) {
+      try { const hit = await caches.default.match(cacheKey); if (hit) return hit; } catch (e) {}
+    }
+    let object;
+    try {
+      object = await env.NODE_MEDIA.get(key, rangeHeader ? { range: request.headers } : undefined);
+    } catch (e) {
+      object = await env.NODE_MEDIA.get(key); // unsatisfiable Range → serve the full object
+    }
     if (!object) return new Response('not found', { status: 404 });
     const headers = new Headers();
     object.writeHttpMetadata(headers);
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    headers.set('Accept-Ranges', 'bytes');
+    headers.set('ETag', object.httpEtag);
+    // Warm the full-object edge cache in the background so the next FULL request is
+    // served from cache. Skip very large files to bound the background read.
+    if (ctx && !rangeHeader && object.size <= 64 * 1024 * 1024) {
+      ctx.waitUntil((async () => {
+        try {
+          const full = await env.NODE_MEDIA.get(key);
+          if (!full) return;
+          const fh = new Headers();
+          full.writeHttpMetadata(fh);
+          fh.set('Cache-Control', 'public, max-age=31536000, immutable');
+          fh.set('Accept-Ranges', 'bytes');
+          fh.set('ETag', full.httpEtag);
+          fh.set('Content-Length', String(full.size));
+          await caches.default.put(cacheKey, new Response(full.body, { headers: fh }));
+        } catch (e) {}
+      })());
+    }
+    if (rangeHeader && object.range) {
+      const size = object.size;
+      let offset = 0, length = size;
+      if (object.range.suffix != null) { length = Math.min(object.range.suffix, size); offset = size - length; }
+      else { offset = object.range.offset ?? 0; length = object.range.length ?? (size - offset); }
+      headers.set('Content-Range', 'bytes ' + offset + '-' + (offset + length - 1) + '/' + size);
+      headers.set('Content-Length', String(length));
+      return new Response(object.body, { status: 206, headers });
+    }
+    headers.set('Content-Length', String(object.size));
     return new Response(object.body, { headers });
   }
 
   // ---- protocol surface ----
   if (path === '/.well-known/node.json') {
-    return json({
+    return jsonCors({
       protocol: PROTOCOL_VERSION,
       subdomain,
       publicKey: identity.publicKey,
@@ -499,14 +789,38 @@ async function handleRequest(request, storage, env) {
   }
   if (path === '/.well-known/feed.json') {
     const feed = await getFeed(storage);
-    return json({ subdomain, publicKey: identity.publicKey, items: feed });
+    const profile = (await storage.get('profile')) || {};
+    // Optional pagination (?limit=&offset=) so big accounts don't ship their whole
+    // history on every boot. No params → full feed (backward compatible).
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit')) || 0, 0), 100);
+    const offset = Math.max(parseInt(url.searchParams.get('offset')) || 0, 0);
+    return jsonCors({
+      subdomain,
+      publicKey: identity.publicKey,
+      displayName: profile.displayName || '',
+      avatarUrl: profile.avatarUrl || null,
+      total: feed.length,
+      offset,
+      items: limit ? feed.slice(offset, offset + limit) : feed,
+    });
   }
   if (path === '/.well-known/peers.json') {
-    return json({ subdomain, peers: await getPeers(storage) });
+    return jsonCors({ subdomain, peers: await getPeers(storage) });
   }
-  // signed member registry — the canonical network is whatever the root signs here
+  // signed member registry — the canonical network is whatever the root signs here.
+  // Signed once per MUTATION (stored blob) instead of per request, and edge-cached 60s:
+  // every client in the network fetches this on boot, and all of that lands on the root.
   if (path === '/.well-known/registry.json') {
-    return jsonCors(await registrySigned(env, identity, subdomain));
+    try { const hit = await caches.default.match(request); if (hit) return hit; } catch (e) {}
+    let signed = await gstore.get('registry:signed');
+    if (!signed || !signed.members) {
+      signed = await registrySigned(env, identity, subdomain);
+      // only persist a root-signed blob — other tenants must not poison the global key
+      if (isRoot(identity)) await gstore.set('registry:signed', signed);
+    }
+    const resp = jsonCors(signed, 200, { 'Cache-Control': 'public, max-age=60' });
+    try { await caches.default.put(request, resp.clone()); } catch (e) {}
+    return resp;
   }
   if (path === '/.well-known/source.json') {
     return json({
@@ -572,40 +886,63 @@ async function handleRequest(request, storage, env) {
   if (path === '/profile.json') {
     const profile = (await storage.get('profile')) || {};
     const feed = await getFeed(storage);
-    const peers = await getPeers(storage);
+    // "peerCount" historically came from the dead local `peers` list (only ever written
+    // by the legacy /protocol/announce bootstrap). In the registry era real membership is
+    // the global signed registry, so report the network size instead — always > 0 for a member.
+    let networkSize = (await getRegistryMembers(env, identity)).length;
+    // Separate-worker nodes keep an empty local registry — the canonical one lives at the root.
+    if (networkSize === 0 && !isRoot(identity)) {
+      try {
+        const r = await fetch('https://' + NETWORK_ROOT_HOST + '/.well-known/registry.json', { cf: { cacheTtl: 300, cacheEverything: true } });
+        networkSize = ((await r.json()).members || []).length;
+      } catch (e) {}
+    }
     return jsonCors({
       subdomain,
       displayName: profile.displayName || subdomain.split('.')[0],
       bio: profile.bio || '',
       avatarUrl: profile.avatarUrl || null,
       postCount: feed.length,
-      peerCount: peers.length,
+      peerCount: networkSize,
+      networkSize,
+      adsEnabled: !!(((await storage.get('ads')) || {}).enabled),
     });
   }
 
   // ---- admin: auth check ----
-  function checkAuth(req) {
-    const expected = env.ADMIN_TOKEN;
-    if (!expected) return false; // fail closed: no token configured = no admin access
+  // Authorize a request. Two tiers, fails closed if neither matches:
+  //  1. host master token (env.ADMIN_TOKEN) — works on EVERY tenant of this Worker.
+  //  2. this tenant's own per-creator token — hash stored at t:<host>:auth, scoped to this host only.
+  async function checkAuth(req, presentedOverride) {
+    let presented = presentedOverride || '';
+    if (!presented) {
+      const auth = req.headers.get('Authorization') || '';
+      if (!auth.startsWith('Bearer ')) return false;
+      presented = auth.slice(7);
+    }
+    if (!presented) return false;
+    if (env.ADMIN_TOKEN && ctEq(presented, env.ADMIN_TOKEN)) return true;
+    const tenantAuth = await storage.get('auth');
+    if (tenantAuth && tenantAuth.tokenHash && ctEq(await sha256hex(presented), tenantAuth.tokenHash)) return true;
+    // Phase 2: a signed session token (from /auth/login or /auth/claim) scoped to this host
+    if (presented.includes('.') && await verifySession(identity, subdomain, presented)) return true;
+    return false;
+  }
+  // Host master ONLY — per-creator tokens cannot manage credentials/provisioning.
+  function isMaster(req) {
     const auth = req.headers.get('Authorization') || '';
-    if (auth.length !== ('Bearer ' + expected).length) return false;
-    // constant-time compare
-    const a = new TextEncoder().encode(auth);
-    const b = new TextEncoder().encode('Bearer ' + expected);
-    let diff = 0;
-    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-    return diff === 0;
+    return auth.startsWith('Bearer ') && !!env.ADMIN_TOKEN && ctEq(auth.slice(7), env.ADMIN_TOKEN);
   }
 
   // ---- admin: verify token ----
   if (path === '/admin/verify' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ ok: false }, 401);
-    return json({ ok: true });
+    if (!(await checkAuth(request))) return json({ ok: false }, 401);
+    return json({ ok: true, master: isMaster(request) });
   }
 
   // ---- admin: upload media to R2 ----
   if (path === '/admin/upload' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!env.NODE_MEDIA) return json({ error: 'R2 bucket NODE_MEDIA not configured' }, 503);
 
     const formData = await request.formData();
@@ -622,9 +959,64 @@ async function handleRequest(request, storage, env) {
     return json({ url: '/media/' + key, contentType: file.type, key });
   }
 
+  // ---- admin: import a video by URL (TikTok data-export links etc.) ----
+  // The Worker pulls the file server-side into R2 — the creator never touches the bytes.
+  // Items keep their ORIGINAL date and the feed stays sorted, so imports slot into history
+  // instead of burying native posts. Idempotent per source URL.
+  if (path === '/admin/import-url' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    if (!env.NODE_MEDIA) return json({ error: 'R2 bucket NODE_MEDIA not configured' }, 503);
+    const b = await request.json().catch(() => ({}));
+    const srcUrl = (b.url || '').trim();
+    if (!srcUrl.startsWith('http://') && !srcUrl.startsWith('https://')) return json({ error: 'url required' }, 400);
+    const feed = await getFeed(storage);
+    const dup = feed.find(it => it.importedSrc === srcUrl);
+    if (dup) return json({ ok: true, dup: true, id: dup.id });
+
+    let res;
+    try { res = await fetch(srcUrl, { redirect: 'follow' }); }
+    catch (e) { return json({ error: 'fetch failed: ' + e.message }, 502); }
+    if (!res.ok) return json({ error: 'source returned ' + res.status + ' (export links expire — request a fresh export)' }, 502);
+    const ct = (res.headers.get('Content-Type') || '').split(';')[0].trim() || 'video/mp4';
+    if (!ct.startsWith('video/') && ct !== 'application/octet-stream') {
+      return json({ error: 'not a video (' + ct + ') — the link may have expired into an error page' }, 415);
+    }
+    const len = parseInt(res.headers.get('Content-Length') || '0', 10);
+    if (len > 256 * 1024 * 1024) return json({ error: 'file too large' }, 413);
+    const key = crypto.randomUUID() + '.mp4';
+    try {
+      if (len > 0) {
+        await env.NODE_MEDIA.put(key, res.body, { httpMetadata: { contentType: ct } });
+      } else {
+        // unknown length — buffer (capped) so R2 gets a sized body
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength > 256 * 1024 * 1024) return json({ error: 'file too large' }, 413);
+        await env.NODE_MEDIA.put(key, buf, { httpMetadata: { contentType: ct } });
+      }
+    } catch (e) { return json({ error: 'storage failed: ' + e.message }, 502); }
+
+    const when = b.createdAt && !isNaN(Date.parse(b.createdAt)) ? new Date(Date.parse(b.createdAt)).toISOString() : new Date().toISOString();
+    const item = {
+      id: crypto.randomUUID(),
+      type: 'video',
+      title: String(b.title || '').slice(0, 300),
+      body: '',
+      mediaUrl: '/media/' + key,
+      mediaContentType: ct,
+      importedFrom: String(b.source || 'tiktok').slice(0, 30),
+      importedSrc: srcUrl,
+      createdAt: when,
+      authorPublicKey: identity.publicKey,
+    };
+    feed.push(item);
+    feed.sort((a, c) => (c.createdAt || '').localeCompare(a.createdAt || '')); // newest first
+    await storage.set('feed', feed);
+    return json({ ok: true, published: item });
+  }
+
   // ---- admin: publish ----
   if (path === '/admin/publish' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const content = await request.json();
     const feed = await getFeed(storage);
     const item = {
@@ -645,7 +1037,7 @@ async function handleRequest(request, storage, env) {
 
   // ---- admin: delete an item ----
   if (path === '/admin/delete' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const { id } = await request.json();
     const feed = await getFeed(storage);
     const item = feed.find(i => i.id === id);
@@ -661,7 +1053,7 @@ async function handleRequest(request, storage, env) {
 
   // ---- admin: inherit from ancestor ----
   if (path === '/admin/inherit') {
-    if (!checkAuth(request)) return new Response('unauthorized — send Authorization: Bearer <ADMIN_TOKEN>', { status: 401 });
+    if (!(await checkAuth(request))) return new Response('unauthorized — send Authorization: Bearer <ADMIN_TOKEN>', { status: 401 });
     const from = url.searchParams.get('from');
     if (!from) return new Response('missing ?from=', { status: 400 });
 
@@ -711,6 +1103,14 @@ async function handleRequest(request, storage, env) {
     return jsonCors(await r.json());
   }
 
+  // ---- live: public viewer list (names + sids of connected sockets) ----
+  if (path === '/live/who.json') {
+    const r = await liveDO(env, subdomain, '/who');
+    const data = await r.json();
+    if (!(await checkAuth(request))) delete data.mutedList; // moderation list is creator-only
+    return jsonCors(data);
+  }
+
   // ---- live: public chat (DO-backed; WS is preferred, these are fallbacks) ----
   if (path === '/live/chat.json') {
     const r = await liveDO(env, subdomain, '/chat');
@@ -718,13 +1118,16 @@ async function handleRequest(request, storage, env) {
   }
   if (path === '/live/chat' && request.method === 'POST') {
     const body = await request.text();
-    const r = await liveDO(env, subdomain, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const r = await liveDO(env, subdomain, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Chat-Ip': request.headers.get('CF-Connecting-IP') || '' }, body });
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
   // ---- live: pre-roll ad gate (public) ----
+  // REVENUE MODEL: the ad slot belongs to the node being VIEWED. The worker-wide HOST ad
+  // (global 'hostad', master-set) serves on every tenant; impressions count in the viewed
+  // tenant's own ledger so the host can pay each creator their share %.
   if (path === '/live/preroll' && request.method === 'GET') {
-    const cfg = await storage.get('preroll');
+    const cfg = await gstore.get('hostad');
     if (!cfg || !cfg.enabled || !cfg.mediaUrl) return jsonCors({ show: false });
     const vid = url.searchParams.get('vid') || '';
     const r = await liveDO(env, subdomain, '/ad-allowed?vid=' + encodeURIComponent(vid));
@@ -735,12 +1138,41 @@ async function handleRequest(request, storage, env) {
       sponsorName: cfg.sponsorName || '',
       clickUrl: cfg.clickUrl || '',
       durationSec: cfg.durationSec || 15,
+      category: cfg.category || 'general',
     }});
   }
   if (path === '/live/preroll/seen' && request.method === 'POST') {
     const { vid } = await request.json().catch(() => ({}));
-    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }) });
+    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Real-Ip': request.headers.get('CF-Connecting-IP') || '' }, body: JSON.stringify({ vid }) });
     return jsonCors({ ok: true });
+  }
+
+  // ---- network measurement (served by the ROOT only) ----
+  // "Don't grade your own homework": the viewed node's local meter pays creators, but
+  // advertiser-facing numbers come from these root-verified, deduped counts. Clients
+  // beacon here in parallel with the local seen-call. Per-host DO 'measure:<host>'.
+  if (path === '/measure/impression' && request.method === 'POST') {
+    if (!isRoot(identity)) return jsonCors({ error: 'not the network root' }, 403);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    const vid = (b.vid || '').slice(0, 64);
+    if (!host || !vid) return jsonCors({ error: 'host and vid required' }, 400);
+    const members = (await gstore.get('registry:members')) || [];
+    if (!members.find(m => m.subdomain === host)) return jsonCors({ error: 'not a network member' }, 400);
+    const r = await env.LIVE_ROOM.getByName('measure:' + host).fetch('https://live.do/m-imp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Real-Ip': request.headers.get('CF-Connecting-IP') || '' },
+      body: JSON.stringify({ vid }),
+    });
+    return jsonCors(await r.json(), r.status);
+  }
+  // Public, auditable: anyone (a sponsor, a host, a skeptic) can read the verified counts.
+  if (path === '/measure/stats.json') {
+    if (!isRoot(identity)) return jsonCors({ error: 'not the network root' }, 403);
+    const host = (url.searchParams.get('host') || '').trim().toLowerCase();
+    if (!host) return jsonCors({ error: 'host required' }, 400);
+    const r = await env.LIVE_ROOM.getByName('measure:' + host).fetch('https://live.do/m-stats');
+    return jsonCors({ host, ...(await r.json()) });
   }
   if (path === '/live/preroll/click' && request.method === 'POST') {
     await liveDO(env, subdomain, '/ad-click', { method: 'POST' });
@@ -769,9 +1201,10 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: viewer subscribe session ----
   if (path === '/live/subscribe' && request.method === 'POST') {
-    if (!env.CALLS_APP_ID) return jsonCors({ error: 'not configured' }, 503);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return jsonCors({ error: 'not configured' }, 503);
     try {
-      const data = await callsApi(env, 'POST', '/sessions/new', undefined);
+      const data = await callsApi(creds, 'POST', '/sessions/new', undefined);
       return jsonCors({ sessionId: data.sessionId });
     } catch(e) {
       return jsonCors({ error: e.message }, 502);
@@ -780,10 +1213,11 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: viewer subscribe to tracks ----
   if (path === '/live/tracks' && request.method === 'POST') {
-    if (!env.CALLS_APP_ID) return jsonCors({ error: 'not configured' }, 503);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return jsonCors({ error: 'not configured' }, 503);
     try {
       const { subscriberSessionId, tracks } = await request.json();
-      const data = await callsApi(env, 'POST', `/sessions/${subscriberSessionId}/tracks/new`, { tracks });
+      const data = await callsApi(creds, 'POST', `/sessions/${subscriberSessionId}/tracks/new`, { tracks });
       return jsonCors(data);
     } catch(e) {
       return jsonCors({ error: e.message }, 502);
@@ -792,25 +1226,32 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: viewer renegotiate ----
   if (path === '/live/renegotiate' && request.method === 'POST') {
-    if (!env.CALLS_APP_ID) return jsonCors({ error: 'not configured' }, 503);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return jsonCors({ error: 'not configured' }, 503);
     const { subscriberSessionId, sessionDescription } = await request.json();
-    const data = await callsApi(env, 'PUT', `/sessions/${subscriberSessionId}/renegotiate`, { sessionDescription });
+    const data = await callsApi(creds, 'PUT', `/sessions/${subscriberSessionId}/renegotiate`, { sessionDescription });
     return jsonCors(data);
   }
 
   // ---- live: WHIP ingest (Larix / OBS → Cloudflare Realtime) ----
   if (path === '/live/whip' || path.startsWith('/live/whip/')) {
-    if (!env.CALLS_APP_ID) return new Response('not configured', { status: 503 });
+    const whipCreds = await getCallsCreds(env, storage);
+    if (!whipCreds) return new Response('not configured', { status: 503 });
 
     // WHIP POST — Larix sends SDP offer, we proxy to Cloudflare Realtime WHIP endpoint
     if (request.method === 'POST') {
+      // Broadcasting is creator-only. WHIP clients vary in auth support, so accept the
+      // creator token either as Authorization: Bearer or as a ?token= query param.
+      if (!(await checkAuth(request, url.searchParams.get('token') || undefined))) {
+        return new Response('unauthorized — supply your creator token (Authorization: Bearer <token> or ?token=)', { status: 401 });
+      }
       const sdpOffer = await request.text();
       const whipRes = await fetch(
-        `https://rtc.live.cloudflare.com/v1/apps/${env.CALLS_APP_ID}/sessions/whip`,
+        `https://rtc.live.cloudflare.com/v1/apps/${whipCreds.appId}/sessions/whip`,
         {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${env.CALLS_APP_SECRET}`,
+            'Authorization': `Bearer ${whipCreds.appSecret}`,
             'Content-Type': 'application/sdp',
           },
           body: sdpOffer,
@@ -846,15 +1287,20 @@ async function handleRequest(request, storage, env) {
       });
     }
 
-    // WHIP DELETE — Larix ended the stream
+    // WHIP DELETE — Larix ended the stream. The sessionId in the path acts as a
+    // capability: only the publisher that created the session knows it.
     if (request.method === 'DELETE') {
+      const sessionId = path.split('/live/whip/')[1];
+      const st = await liveDO(env, subdomain, '/status').then(r => r.json()).catch(() => ({}));
+      if (!sessionId || st.publisherSessionId !== sessionId) {
+        return new Response('unknown session', { status: 403, headers: { 'Access-Control-Allow-Origin': '*' } });
+      }
       await liveDO(env, subdomain, '/end', { method: 'POST' });
       // Forward DELETE to Cloudflare Realtime
-      const sessionId = path.split('/live/whip/')[1];
       if (sessionId) {
         await fetch(
-          `https://rtc.live.cloudflare.com/v1/apps/${env.CALLS_APP_ID}/sessions/${sessionId}`,
-          { method: 'DELETE', headers: { 'Authorization': `Bearer ${env.CALLS_APP_SECRET}` } }
+          `https://rtc.live.cloudflare.com/v1/apps/${whipCreds.appId}/sessions/${sessionId}`,
+          { method: 'DELETE', headers: { 'Authorization': `Bearer ${whipCreds.appSecret}` } }
         ).catch(() => {});
       }
       return new Response(null, { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
@@ -877,10 +1323,11 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: admin — create publisher session ----
   if (path === '/admin/live/start' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
-    if (!env.CALLS_APP_ID) return json({ error: 'CALLS_APP_ID not set' }, 503);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return json({ error: 'Calls credentials not set' }, 503);
     try {
-      const data = await callsApi(env, 'POST', '/sessions/new', undefined);
+      const data = await callsApi(creds, 'POST', '/sessions/new', undefined);
       return json({ sessionId: data.sessionId });
     } catch(e) {
       return json({ error: e.message }, 502);
@@ -889,15 +1336,17 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: admin — add publisher tracks ----
   if (path === '/admin/live/tracks' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return json({ error: 'Calls credentials not set' }, 503);
     const { sessionId, tracks, sessionDescription } = await request.json();
-    const data = await callsApi(env, 'POST', `/sessions/${sessionId}/tracks/new`, { tracks, sessionDescription });
+    const data = await callsApi(creds, 'POST', `/sessions/${sessionId}/tracks/new`, { tracks, sessionDescription });
     return json(data);
   }
 
   // ---- live: admin — mark as live (store session + tracks in DO) ----
   if (path === '/admin/live/publish' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const { sessionId, trackNames } = await request.json();
     await liveDO(env, subdomain, '/publish', {
       method: 'POST',
@@ -909,21 +1358,36 @@ async function handleRequest(request, storage, env) {
 
   // ---- live: admin — heartbeat (keeps a browser stream from going stale) ----
   if (path === '/admin/live/heartbeat' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     await liveDO(env, subdomain, '/heartbeat', { method: 'POST' });
     return json({ ok: true });
   }
 
   // ---- live: admin — end ----
   if (path === '/admin/live/end' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     await liveDO(env, subdomain, '/end', { method: 'POST' });
     return json({ ok: true });
   }
 
+  // ---- live: admin — chat moderation (persistent shadow-mute by sid) ----
+  if (path === '/admin/live/mute' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const body = await request.text();
+    const r = await liveDO(env, subdomain, '/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
+
+  // ---- live: admin — past stream sessions (creator analytics) ----
+  if (path === '/admin/live/history') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const r = await liveDO(env, subdomain, '/history');
+    return json(await r.json());
+  }
+
   // ---- admin: update profile ----
   if (path === '/admin/profile' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const { displayName, bio, avatarUrl } = await request.json();
     const existing = (await storage.get('profile')) || {};
     const updated = {
@@ -939,49 +1403,95 @@ async function handleRequest(request, storage, env) {
 
   // ---- admin: delete a comment on your own post ----
   if (path === '/admin/comment/delete' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const body = await request.text();
     const r = await liveDO(env, subdomain, '/comment-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return json(await r.json());
   }
 
   // ---- admin: pre-roll sponsor ad config ----
+  // The node HOST (master) chooses the ad for the whole node and collects the revenue;
+  // creators are paid via their share % (/admin/ads). One config per worker.
   if (path === '/admin/preroll' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!isMaster(request)) return json({ error: 'master token required — the node host chooses the ad' }, 401);
     const b = await request.json().catch(() => ({}));
-    const clickUrl = (b.clickUrl || '').trim();
+    // Normalize the click-through URL instead of silently discarding it: people type
+    // "joescoffee.com" — prepend https:// and keep it if it parses as a real URL.
+    let clickUrl = (b.clickUrl || '').trim();
+    if (clickUrl && !/^https?:\/\//i.test(clickUrl)) clickUrl = 'https://' + clickUrl;
+    try { const u = new URL(clickUrl); if (!u.hostname.includes('.')) clickUrl = ''; } catch (e) { clickUrl = ''; }
     const cfg = {
       enabled: !!b.enabled,
       mediaUrl: b.mediaUrl || null,
       contentType: b.contentType || null,
       sponsorName: (b.sponsorName || '').slice(0, 60),
-      clickUrl: /^https?:\/\//.test(clickUrl) ? clickUrl.slice(0, 300) : '',
+      clickUrl: clickUrl.slice(0, 300),
       durationSec: Math.min(Math.max(parseInt(b.durationSec) || 15, 3), 60),
-      cpm: Math.max(0, Math.min(parseFloat(b.cpm) || 0, 1000)), // creator's rate, $ per 1000 views
-      source: 'self', // 'self' = creator's own sponsor. 'network' reserved for approved nodes (house ad pool) later.
+      cpm: Math.max(0, Math.min(parseFloat(b.cpm) || 0, 1000)), // host's rate, $ per 1000 views
+      category: (b.category || 'general').trim().toLowerCase().slice(0, 30), // self-declared — mis-declaring is a membership violation
+      source: 'self', // 'self' = host's own sponsor. 'network' reserved for the network ad pool later.
       updatedAt: new Date().toISOString(),
     };
-    await storage.set('preroll', cfg);
+    await gstore.set('hostad', cfg);
     return json({ ok: true, preroll: cfg });
   }
   if (path === '/admin/preroll.json') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
-    const cfg = (await storage.get('preroll')) || { enabled: false };
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    // prefill fallback: pre-rev-share deploys stored the config per-tenant
+    const cfg = (await gstore.get('hostad')) || (await storage.get('preroll')) || { enabled: false };
     const r = await liveDO(env, subdomain, '/ad-stats');
     const stats = await r.json();
     const earnings = +(((stats.impressions || 0) / 1000) * (cfg.cpm || 0)).toFixed(2);
     return json({ preroll: cfg, stats: { ...stats, earnings } });
   }
+  // Host ledger: lifetime ad views per tenant × the host's CPM × each creator's share %.
+  // This IS the rev-share product even before a payment rail exists: "you owe creator X $Y".
+  if (path === '/admin/ads-ledger') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const cfg = (await gstore.get('hostad')) || {};
+    const cpm = cfg.cpm || 0;
+    const hosts = [...new Set([subdomain, ...((await gstore.get('provisioned')) || [])])];
+    const rows = [];
+    let totalImp = 0, totalClicks = 0, totalOwed = 0;
+    for (const h of hosts) {
+      const st = await liveDO(env, h, '/ad-stats').then(r => r.json()).catch(() => ({}));
+      const imp = st.impressions || 0;
+      const sharePct = (((await makeStorage(env, h).get('ads')) || {}).sharePct) || 0;
+      const owed = +(((imp / 1000) * cpm * sharePct) / 100).toFixed(2);
+      totalImp += imp; totalClicks += st.clicks || 0; totalOwed += owed;
+      rows.push({ host: h, impressions: imp, clicks: st.clicks || 0, sharePct, owed });
+    }
+    const gross = +((totalImp / 1000) * cpm).toFixed(2);
+    const networkFee = +(gross * 0.02).toFixed(2); // 2% genesis: 1% maintenance, 1% contributors
+    return json({ cpm, rows, totals: {
+      impressions: totalImp, clicks: totalClicks, gross,
+      owedToCreators: +totalOwed.toFixed(2), networkFee,
+      hostNet: +(gross - totalOwed - networkFee).toFixed(2),
+    }});
+  }
+  // A creator's own earnings view: their content's ad views × host CPM × their share %.
+  if (path === '/admin/my-earnings') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const cfg = (await gstore.get('hostad')) || {};
+    const ads = (await storage.get('ads')) || {};
+    const st = await liveDO(env, subdomain, '/ad-stats').then(r => r.json()).catch(() => ({}));
+    const gross = ((st.impressions || 0) / 1000) * (cfg.cpm || 0);
+    return json({
+      impressions: st.impressions || 0, clicks: st.clicks || 0,
+      sharePct: ads.sharePct || 0,
+      owed: +((gross * (ads.sharePct || 0)) / 100).toFixed(2),
+    });
+  }
 
   // ---- admin: inbox ----
   if (path === '/admin/inbox.json') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const notifs = (await storage.get('inbox:notifications')) || [];
     return json({ notifications: notifs, unread: notifs.filter(n => !n.read).length });
   }
 
   if (path === '/admin/inbox/read' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const notifs = (await storage.get('inbox:notifications')) || [];
     notifs.forEach(n => { n.read = true; });
     await storage.set('inbox:notifications', notifs);
@@ -990,8 +1500,31 @@ async function handleRequest(request, storage, env) {
 
   // ---- network: this node asks the root to join ----
   if (path === '/admin/request-join' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (isRoot(identity)) return json({ ok: true, alreadyMember: true });
+    // Same-worker short-circuit: if the network root is a tenant on THIS Worker
+    // (e.g. scotty.tuliptown.ca joining root social.tuliptown.ca), a fetch to the
+    // root host is a Worker self-subrequest and Cloudflare returns 522 (whose body
+    // "error code: 522" then fails r.json() → "token 'e' is not valid JSON"). The
+    // registry:pending list is global (gstore) and the root inbox is just another
+    // tenant's KV, so write the join request directly instead of fetching ourselves.
+    const rootStore = makeStorage(env, NETWORK_ROOT_HOST);
+    const rootIdentity = await rootStore.get('identity');
+    if (rootIdentity && isRoot(rootIdentity)) {
+      const members = await getRegistryMembers(env, rootIdentity);
+      if (members.find(m => m.pubkey === identity.publicKey)) return json({ ok: true, alreadyMember: true });
+      const pending = (await gstore.get('registry:pending')) || [];
+      if (!pending.find(p => p.pubkey === identity.publicKey)) {
+        pending.unshift({ subdomain, pubkey: identity.publicKey, at: new Date().toISOString() });
+        await gstore.set('registry:pending', pending);
+        const notifs = (await rootStore.get('inbox:notifications')) || [];
+        notifs.unshift({ id: crypto.randomUUID(), type: 'join_request', subdomain, publicKey: identity.publicKey, at: new Date().toISOString(), read: false });
+        if (notifs.length > 100) notifs.splice(100);
+        await rootStore.set('inbox:notifications', notifs);
+      }
+      return json({ ok: true, pending: true });
+    }
+    // Cross-worker (e.g. social.bigdumbvan.com → social.tuliptown.ca): normal signed POST.
     const message = JSON.stringify({ subdomain, pubkey: identity.publicKey, timestamp: new Date().toISOString() });
     const signature = await sign(identity.privateKey, message);
     try {
@@ -1005,12 +1538,12 @@ async function handleRequest(request, storage, env) {
 
   // ---- network registry admin (root only) ----
   if (path === '/admin/registry.json') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     return json({ members: await getRegistryMembers(env, identity), pending: (await gstore.get('registry:pending')) || [] });
   }
   if ((path === '/admin/registry/add' || path === '/admin/registry/approve') && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const b = await request.json().catch(() => ({}));
     if (!b.pubkey) return json({ error: 'pubkey required' }, 400);
@@ -1023,25 +1556,155 @@ async function handleRequest(request, storage, env) {
     if (!members.find(m => m.pubkey === b.pubkey)) members.push({ subdomain: sd, pubkey: b.pubkey, addedAt: new Date().toISOString() });
     await gstore.set('registry:members', members);
     await gstore.set('registry:updatedAt', new Date().toISOString());
+    await gstore.set('registry:signed', await registrySigned(env, identity, subdomain));
+    try { await caches.default.delete(new Request('https://' + subdomain + '/.well-known/registry.json')); } catch (e) {}
+    await resolveJoinNotif(storage, b.pubkey, 'approved');
     return json({ ok: true, members });
   }
   if (path === '/admin/registry/deny' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const { pubkey } = await request.json().catch(() => ({}));
     const pending = ((await gstore.get('registry:pending')) || []).filter(p => p.pubkey !== pubkey);
     await gstore.set('registry:pending', pending);
+    await resolveJoinNotif(storage, pubkey, 'denied');
     return json({ ok: true });
   }
   if (path === '/admin/registry/remove' && request.method === 'POST') {
-    if (!checkAuth(request)) return json({ error: 'unauthorized' }, 401);
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!isRoot(identity)) return json({ error: 'not the network root' }, 403);
     const { pubkey } = await request.json().catch(() => ({}));
     if (pubkey === NETWORK_ROOT_PUBKEY) return json({ error: 'cannot remove the root' }, 400);
     const members = (await getRegistryMembers(env, identity)).filter(m => m.pubkey !== pubkey);
     await gstore.set('registry:members', members);
     await gstore.set('registry:updatedAt', new Date().toISOString());
+    await gstore.set('registry:signed', await registrySigned(env, identity, subdomain));
+    try { await caches.default.delete(new Request('https://' + subdomain + '/.well-known/registry.json')); } catch (e) {}
     return json({ ok: true, members });
+  }
+
+  // ---- provisioning (local host-operator: gate the wildcard auto-create surface) ----
+  // Auth = host MASTER token only. checkAuth would also accept per-creator sessions,
+  // which must not be able to mint new tenants on this Worker.
+  if (path === '/admin/provisioned' && request.method === 'GET') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const list = (await gstore.get('provisioned')) || [];
+    const ads = {};
+    for (const h of list) ads[h] = (((await makeStorage(env, h).get('ads')) || {}).sharePct) || 0;
+    return json({ provisioned: list, ads });
+  }
+  // Host sets a creator's revenue share % (the "earnings share" — 0 = no share).
+  if (path === '/admin/ads' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    const sharePct = Math.max(0, Math.min(parseFloat(b.sharePct) || 0, 100));
+    await makeStorage(env, host).set('ads', { enabled: sharePct > 0, sharePct, setAt: new Date().toISOString() });
+    return json({ ok: true, host, sharePct });
+  }
+  if ((path === '/admin/provision' || path === '/admin/unprovision') && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    let list = (await gstore.get('provisioned')) || [];
+    if (path === '/admin/provision') {
+      if (!list.includes(host)) list.push(host);
+    } else {
+      list = list.filter(h => h !== host);
+    }
+    await gstore.set('provisioned', list);
+    return json({ ok: true, provisioned: list });
+  }
+
+  // ---- creator credentials (host master only): per-tenant login tokens ----
+  // Mint a token scoped to one host; only its hash is stored. The plaintext is
+  // returned ONCE — the host hands it to the creator, who pastes it to unlock
+  // creator mode on that host only. The host master token still works everywhere.
+  if (path === '/admin/creator/mint-token' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    const creatorToken = randomTokenHex();
+    await makeStorage(env, host).set('auth', { tokenHash: await sha256hex(creatorToken), setAt: new Date().toISOString() });
+    return json({ ok: true, host, creatorToken, note: 'shown once — unlocks creator mode only on ' + host });
+  }
+  if (path === '/admin/creator/clear-token' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    await makeStorage(env, host).delete('auth');
+    return json({ ok: true, host, cleared: true });
+  }
+  // Per-tenant Realtime/Calls credentials (host master only): a streamer supplies their own
+  // Cloudflare Realtime app so THEIR account is billed for their streaming, not the operator's.
+  if (path === '/admin/calls-creds' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    const ts = makeStorage(env, host);
+    if (b.clear) { await ts.delete('calls'); return json({ ok: true, host, cleared: true }); }
+    if (!b.appId || !b.appSecret) return json({ error: 'appId and appSecret required' }, 400);
+    await ts.set('calls', { appId: String(b.appId), appSecret: String(b.appSecret), setAt: new Date().toISOString() });
+    return json({ ok: true, host, note: 'this host now streams on its own Cloudflare Realtime app (its own bill)' });
+  }
+  // Host mints a one-time claim code for a handle; the creator redeems it at /auth/claim to set a password.
+  if (path === '/admin/creator/mint-claim' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    if (!host) return json({ error: 'host required' }, 400);
+    const ts = makeStorage(env, host);
+    const auth = (await ts.get('auth')) || {};
+    const claimCode = randomTokenHex();
+    auth.claimHash = await sha256hex(claimCode);
+    auth.claimed = false;
+    auth.setAt = new Date().toISOString();
+    await ts.set('auth', auth);
+    return json({ ok: true, host, claimCode, claimUrl: 'https://' + host + '/', note: 'give the creator this code (shown once); they claim it at the URL and set their own password' });
+  }
+
+  // Brute-force guard for the password endpoints: 10 attempts / 10 min / IP, tracked in
+  // this tenant's DO. Each attempt also burns 100k PBKDF2 iterations of OUR cpu — the
+  // limiter is as much a cost cap as a security one. Fails open (availability > lockout).
+  async function authAllowed() {
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    try {
+      const r = await liveDO(env, subdomain, '/rl', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'auth:' + ip, max: 10, windowMs: 600000 }),
+      });
+      return (await r.json()).allowed !== false;
+    } catch (e) { return true; }
+  }
+
+  // ---- creator self-service auth (Phase 2): claim a handle + password login → signed session ----
+  if (path === '/auth/claim' && request.method === 'POST') {
+    if (!(await authAllowed())) return jsonCors({ error: 'too many attempts — try again in a few minutes' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const code = (b.code || '').trim();
+    const password = b.password || '';
+    if (!code || password.length < 8) return jsonCors({ error: 'code and password (min 8 chars) required' }, 400);
+    const auth = (await storage.get('auth')) || {};
+    if (!auth.claimHash || auth.claimed) return jsonCors({ error: 'no pending claim for this handle' }, 400);
+    if (!ctEq(await sha256hex(code), auth.claimHash)) return jsonCors({ error: 'invalid claim code' }, 401);
+    const salt = randomTokenHex();
+    auth.pwSalt = salt; auth.pwIter = 100000; auth.pwHash = await pbkdf2(password, salt, 100000);
+    auth.claimed = true; delete auth.claimHash; auth.setAt = new Date().toISOString();
+    await storage.set('auth', auth);
+    return jsonCors({ ok: true, session: await makeSession(identity, subdomain) });
+  }
+  if (path === '/auth/login' && request.method === 'POST') {
+    if (!(await authAllowed())) return jsonCors({ error: 'too many attempts — try again in a few minutes' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const auth = (await storage.get('auth')) || {};
+    if (!auth.pwHash) return jsonCors({ error: 'no password set for this handle' }, 400);
+    if (!ctEq(await pbkdf2(b.password || '', auth.pwSalt, auth.pwIter || 100000), auth.pwHash)) return jsonCors({ error: 'wrong password' }, 401);
+    return jsonCors({ ok: true, session: await makeSession(identity, subdomain) });
   }
 
   return new Response('not found', { status: 404 });
@@ -1058,15 +1721,25 @@ function json(data, status = 200, extra = {}) {
     status, headers: { 'Content-Type': 'application/json', ...extra },
   });
 }
-function jsonCors(data, status = 200) { return json(data, status, CORS_HEADERS); }
+function jsonCors(data, status = 200, extra = {}) { return json(data, status, { ...CORS_HEADERS, ...extra }); }
 
-async function callsApi(env, method, path, body) {
+// Per-tenant Cloudflare Realtime (Calls) credentials — lets each streamer's traffic bill
+// their OWN Cloudflare account instead of the operator's. A tenant with creds stored at
+// t:<host>:calls uses those; otherwise falls back to the Worker-wide secrets (operator pays).
+async function getCallsCreds(env, storage) {
+  const own = await storage.get('calls');
+  if (own && own.appId && own.appSecret) return { appId: own.appId, appSecret: own.appSecret };
+  if (env.CALLS_APP_ID && env.CALLS_APP_SECRET) return { appId: env.CALLS_APP_ID, appSecret: env.CALLS_APP_SECRET };
+  return null;
+}
+
+async function callsApi(creds, method, path, body) {
   const res = await fetch(
-    `https://rtc.live.cloudflare.com/v1/apps/${env.CALLS_APP_ID}${path}`,
+    `https://rtc.live.cloudflare.com/v1/apps/${creds.appId}${path}`,
     {
       method,
       headers: {
-        'Authorization': `Bearer ${env.CALLS_APP_SECRET}`,
+        'Authorization': `Bearer ${creds.appSecret}`,
         'Content-Type': 'application/json',
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -1076,8 +1749,9 @@ async function callsApi(env, method, path, body) {
   if (!res.ok) throw new Error(`Calls API ${method} ${path} → ${res.status}: ${text}`);
   return JSON.parse(text);
 }
-function html(content) {
+function html(content, status = 200) {
   return new Response(content, {
+    status,
     headers: { 'Content-Type': 'text/html; charset=utf-8' },
   });
 }
@@ -1143,6 +1817,28 @@ self.addEventListener('fetch', e => {
 // Only the active panel ever plays video.
 // Node feeds are loaded lazily on first visit.
 // ============================================================
+
+function renderUnclaimed(subdomain) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(subdomain)} — available</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:#0a0a0a; color:#eee; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .card { max-width:420px; padding:40px 32px; text-align:center; }
+  .dot { width:14px; height:14px; border-radius:50%; background:#ff3b5c; display:inline-block; margin-bottom:24px; }
+  h1 { font-size:20px; margin:0 0 8px; font-weight:600; word-break:break-all; color:#ff3b5c; }
+  p { color:#999; font-size:14px; line-height:1.6; margin:8px 0 0; }
+</style></head><body>
+  <div class="card">
+    <span class="dot"></span>
+    <h1>${escapeHtml(subdomain)}</h1>
+    <p>This handle isn't registered on this network yet.</p>
+    <p>If you'd like to claim it, contact the network operator.</p>
+  </div>
+</body></html>`;
+}
 
 function renderApp({ identity, subdomain }) {
   return `<!DOCTYPE html>
@@ -1367,8 +2063,10 @@ body.creator .card-del { display: flex; }
 .live-card-chat-area {
   position: absolute; bottom: 15%; left: 0; right: 80px;
   padding: 0 12px; z-index: 5;
+  max-height: 25.5vh; overflow-y: auto; overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   display: flex; flex-direction: column; gap: 5px;
-  pointer-events: none;
+  pointer-events: auto;
 }
 .live-card-chat-msg {
   background: rgba(0,0,0,0.5); backdrop-filter: blur(6px);
@@ -1406,30 +2104,15 @@ body.creator .card-del { display: flex; }
 .bnav-label { font-size: 10px; color: rgba(255,255,255,0.6); font-weight: 500; }
 .bnav-item.active .bnav-label { color: #fff; font-weight: 700; }
 
-/* The + create button */
-.bnav-create { flex: 1; display: flex; align-items: center; justify-content: center; }
-.create-pill {
-  display: flex; align-items: center; height: 28px;
-  border-radius: 6px; overflow: hidden; gap: 0;
-}
-.create-pill-l { width: 12px; height: 28px; background: #20D5EC; border-radius: 6px 0 0 6px; }
-.create-pill-m {
-  width: 36px; height: 28px; background: #fff;
+/* The + create button — neutral outline; fills in when this account is a creator,
+   so the create affordance itself signals creator status (no separate badge). */
+.create-btn {
+  width: 42px; height: 28px; border-radius: 8px;
+  border: 1.5px solid rgba(255,255,255,0.85);
   display: flex; align-items: center; justify-content: center;
-  font-size: 22px; font-weight: 300; color: #000; line-height: 1;
+  font-size: 20px; font-weight: 400; color: #fff; line-height: 1;
 }
-.create-pill-r { width: 12px; height: 28px; background: #FE2C55; border-radius: 0 6px 6px 0; }
-
-/* Creator badge */
-.creator-badge {
-  position: fixed; top: calc(max(env(safe-area-inset-top),0px) + 52px); left: 12px;
-  z-index: 25;
-  background: #FE2C55; color: #fff;
-  padding: 3px 8px; border-radius: 4px;
-  font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700;
-  display: none;
-}
-body.creator .creator-badge { display: block; }
+body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
 
 /* ── MODALS ───────────────────────────────────────────────── */
 .modal {
@@ -1661,8 +2344,12 @@ body.creator .creator-badge { display: block; }
 <!-- Progress bar (post position) -->
 <div class="progress-segs" id="progressSegs"></div>
 
-<!-- Creator badge -->
-<div class="creator-badge" id="creatorBadge">creator</div>
+<!-- First-visit hint (pointer-events:none — swipes pass through) -->
+<div id="swipeHint" style="display:none;position:fixed;inset:0;z-index:80;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;flex-direction:column;gap:16px;pointer-events:none">
+  <div style="font-size:40px">⬆️</div>
+  <div style="font-size:16px;font-weight:700">Swipe up for the next creator</div>
+  <div style="font-size:13px;color:rgba(255,255,255,0.75)">Swipe left / right for more from this one</div>
+</div>
 
 <!-- Bottom nav -->
 <div class="bottom-nav">
@@ -1674,15 +2361,10 @@ body.creator .creator-badge { display: block; }
     <span class="bnav-icon">🔴</span>
     <span class="bnav-label">Live</span>
   </button>
-  <div class="bnav-create">
-    <button style="background:none;border:none;padding:0" onclick="onCreateTap()">
-      <div class="create-pill">
-        <div class="create-pill-l"></div>
-        <div class="create-pill-m">+</div>
-        <div class="create-pill-r"></div>
-      </div>
-    </button>
-  </div>
+  <button class="bnav-item" onclick="onCreateTap()">
+    <span class="create-btn">+</span>
+    <span class="bnav-label">Create</span>
+  </button>
   <button class="bnav-item" id="bnavInbox" onclick="onInboxTap()">
     <span class="bnav-icon">💬</span>
     <span class="bnav-label">Inbox</span>
@@ -1711,13 +2393,42 @@ body.creator .creator-badge { display: block; }
     <button class="modal-close" onclick="closeUnlock()">×</button>
   </div>
   <div class="field">
-    <label>Admin Token</label>
-    <input type="password" id="tokenInput" placeholder="paste your token" autocomplete="off">
+    <label>Password</label>
+    <input type="password" id="pwInput" placeholder="your password" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitLogin()">
   </div>
-  <button class="submit-btn" onclick="submitToken()">Unlock</button>
-  <p style="margin-top:16px;font-size:12px;color:rgba(255,255,255,0.4);line-height:1.6">
-    Set ADMIN_TOKEN as a secret in Cloudflare Workers. The token stays on this device only.
+  <button class="submit-btn" onclick="submitLogin()">Log in</button>
+  <p style="margin-top:14px;font-size:12px;text-align:center;line-height:1.8">
+    <a href="#" onclick="toggleClaim();return false" style="color:#20D5EC">First time? Claim with a code</a><br>
+    <a href="#" onclick="toggleTokenUnlock();return false" style="color:rgba(255,255,255,0.5)">Use an admin / creator token</a>
   </p>
+  <div id="claimForm" style="display:none;margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);padding-top:14px">
+    <div class="field"><label>Claim code</label><input type="text" id="claimCode" placeholder="code from your host" autocomplete="off"></div>
+    <div class="field"><label>Set a password (min 8)</label><input type="password" id="claimPw" placeholder="new password" autocomplete="new-password"></div>
+    <button class="submit-btn" onclick="submitClaim()">Claim &amp; set password</button>
+  </div>
+  <div id="tokenForm" style="display:none;margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);padding-top:14px">
+    <div class="field"><label>Admin / creator token</label><input type="password" id="tokenInput" placeholder="paste token" autocomplete="off"></div>
+    <button class="submit-btn" onclick="submitToken()">Unlock</button>
+  </div>
+</div>
+
+<!-- Manage creators (host master only) — z-index above the profile-sheet (110) it's opened from -->
+<div class="modal" id="creatorsModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Manage Creators</div>
+    <button class="modal-close" onclick="closeCreators()">×</button>
+  </div>
+  <div class="field">
+    <label>New creator handle</label>
+    <input type="text" id="newCreatorHandle" placeholder="e.g. alice" autocomplete="off" onkeydown="if(event.key==='Enter')addCreator()">
+  </div>
+  <button class="submit-btn" onclick="addCreator()">Create &amp; get invite link</button>
+  <div id="creatorLinkBox" style="display:none;margin-top:14px;padding:12px;background:rgba(32,213,236,0.08);border:1px solid rgba(32,213,236,0.3);border-radius:10px">
+    <div style="font-size:12px;color:rgba(255,255,255,0.6);margin-bottom:6px">Send this invite link to the creator — they set their own password:</div>
+    <div id="creatorLink" style="font-size:12px;word-break:break-all;color:#20D5EC"></div>
+    <button class="btn-secondary" style="margin-top:10px" onclick="copyCreatorLink()">Copy link</button>
+  </div>
+  <div id="creatorList" style="margin-top:18px"></div>
 </div>
 
 <!-- Name modal (guest display name for comments + live chat) -->
@@ -1739,12 +2450,12 @@ body.creator .creator-badge { display: block; }
 <!-- Live fullscreen overlay -->
 <div id="liveModal" style="display:none;position:fixed;inset:0;z-index:100;background:#000;flex-direction:column">
   <!-- Fullscreen video -->
-  <video id="livePreview"   autoplay muted     playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1"></video>
-  <video id="liveViewVideo" autoplay playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1"></video>
+  <video disableremoteplayback x-webkit-airplay="deny" id="livePreview"   autoplay muted     playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1;transform:scaleX(-1)"></video>
+  <video disableremoteplayback x-webkit-airplay="deny" id="liveViewVideo" autoplay playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1"></video>
 
   <!-- Pre-roll sponsor ad overlay (covers the stream until the ad finishes) -->
   <div id="prerollOverlay" style="display:none;position:absolute;inset:0;z-index:30;background:#000">
-    <video id="prerollVideo" playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000"></video>
+    <video disableremoteplayback x-webkit-airplay="deny" id="prerollVideo" playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000"></video>
     <div style="position:absolute;top:max(env(safe-area-inset-top),16px);left:16px;background:rgba(0,0,0,0.5);border-radius:6px;padding:4px 8px;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,255,255,0.85)">Ad</div>
     <div id="prerollCountdown" style="position:absolute;top:max(env(safe-area-inset-top),16px);right:60px;background:rgba(0,0,0,0.6);border-radius:16px;padding:6px 12px;font-size:13px;font-weight:600;color:#fff">Stream starts soon…</div>
     <div id="prerollSponsor" onclick="onPrerollClick()" style="display:none;position:absolute;bottom:max(env(safe-area-inset-bottom),20px);left:16px;right:16px;background:rgba(0,0,0,0.55);backdrop-filter:blur(6px);border-radius:12px;padding:12px 16px;color:#fff;font-size:14px;cursor:pointer"></div>
@@ -1754,7 +2465,7 @@ body.creator .creator-badge { display: block; }
   <div style="position:absolute;top:max(env(safe-area-inset-top),16px);left:0;right:0;padding:0 16px;display:flex;align-items:center;justify-content:space-between;z-index:41">
     <div style="display:flex;align-items:center;gap:8px">
       <div class="info-live-badge" style="font-size:13px;padding:4px 10px" id="liveModalTitle">LIVE</div>
-      <div class="live-viewer-badge" style="position:static" id="liveViewerBadge"><span id="liveViewerCount">0</span></div>
+      <div class="live-viewer-badge" style="position:static;cursor:pointer" id="liveViewerBadge" onclick="openLiveViewers()"><span id="liveViewerCount">0</span></div>
     </div>
     <button onclick="closeLiveModal()" style="background:rgba(0,0,0,0.5);border:none;color:#fff;font-size:22px;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center">×</button>
   </div>
@@ -1765,7 +2476,10 @@ body.creator .creator-badge { display: block; }
       <button class="btn-primary" id="liveBtnStart" onclick="liveStart()" style="min-width:120px">Start Live</button>
       <button class="btn-secondary" id="liveBtnEnd" onclick="liveEnd()" style="display:none;min-width:120px">End Live</button>
     </div>
-    <button id="liveBtnPreroll" onclick="openPrerollSheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🎬 Sponsor Ad</button>
+    <div style="display:flex;gap:8px">
+      <button id="liveBtnPreroll" onclick="openPrerollSheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🎬 Sponsor Ad</button>
+      <button onclick="openStreamHistory()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">📊 Past streams</button>
+    </div>
     <div id="liveStatusMsg" style="font-size:13px;color:rgba(255,255,255,0.7);text-align:center"></div>
   </div>
 
@@ -1774,14 +2488,63 @@ body.creator .creator-badge { display: block; }
   <!-- Tap to unmute (shown if autoplay blocks audio) -->
   <div id="liveUnmuteBtn" onclick="const v=document.getElementById('liveViewVideo');v.muted=false;v.play().catch(()=>{});this.style.display='none'" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);border-radius:24px;padding:12px 24px;color:#fff;font-size:15px;font-weight:600;z-index:11;align-items:center;gap:8px;cursor:pointer">🔊 Tap to unmute</div>
 
-  <!-- Chat overlay — bottom 15% -->
-  <div style="position:absolute;bottom:calc(15% + max(env(safe-area-inset-bottom),0px));left:0;width:75%;padding:0 16px;z-index:10;display:flex;flex-direction:column;gap:5px;pointer-events:none" id="liveChatBox"></div>
+  <!-- Chat overlay — sits just above the chat input; capped height, scrollable history -->
+  <div style="position:absolute;bottom:calc(max(env(safe-area-inset-bottom),12px) + 52px);left:0;width:75%;max-height:25.5vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 16px;z-index:10;display:flex;flex-direction:column;gap:5px;pointer-events:auto" id="liveChatBox"></div>
 
   <!-- Chat input -->
   <div style="position:absolute;bottom:max(env(safe-area-inset-bottom),12px);left:0;right:0;padding:0 16px;display:flex;gap:8px;z-index:10">
     <input id="liveChatInput" placeholder="Say something…" style="flex:1;background:rgba(255,255,255,0.15);border:none;border-radius:20px;padding:8px 16px;color:#fff;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')liveSendChat()">
     <button onclick="liveSendChat()" style="background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:20px;padding:8px 16px;font-size:14px">Send</button>
   </div>
+</div>
+
+<!-- TikTok import — opened from the profile sheet (z 110), so needs a higher z -->
+<div class="modal" id="importModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Import from TikTok</div>
+    <button class="modal-close" onclick="closeImport()">×</button>
+  </div>
+  <div id="importIntro">
+    <p style="font-size:13px;color:rgba(255,255,255,0.65);line-height:1.6;margin-bottom:14px">
+      In TikTok: <strong>Profile → ☰ → Settings and privacy → Account → Download your data</strong>.
+      Choose <strong>JSON</strong> format. When it's ready (can take a day), download the ZIP, open it,
+      and pick the <strong>user_data*.json</strong> file here. Your videos import with their original
+      captions and dates — fresh exports work best (video links inside expire).
+    </p>
+    <input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="onImportFile(this.files[0])">
+    <button class="submit-btn" onclick="document.getElementById('importFile').click()">Choose export file…</button>
+  </div>
+  <div id="importPlan" style="display:none">
+    <div id="importSummary" style="font-size:14px;margin-bottom:12px"></div>
+    <button class="submit-btn" id="importStartBtn" onclick="runImport()">Import all</button>
+  </div>
+  <div id="importProgress" style="display:none">
+    <div id="importStatus" style="font-size:14px;margin-bottom:8px"></div>
+    <div style="height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden"><div id="importBar" style="height:100%;width:0%;background:#20D5EC"></div></div>
+    <div id="importErrors" style="font-size:12px;color:#FE2C55;margin-top:10px;max-height:25vh;overflow-y:auto"></div>
+    <button class="btn-secondary" id="importCancelBtn" style="margin-top:12px" onclick="_importCancel=true">Cancel</button>
+  </div>
+</div>
+
+<!-- Live viewer list (+ mute moderation for the broadcaster) — opened from inside #liveModal (z 100) -->
+<div class="modal" id="liveViewersModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">In this live</div>
+    <button class="modal-close" onclick="closeLiveViewers()">×</button>
+  </div>
+  <div id="liveViewersBody" style="max-height:55vh;overflow-y:auto">Loading…</div>
+</div>
+
+<!-- Past streams (broadcaster analytics) — opened from inside #liveModal (z 100), so needs a higher z -->
+<div class="modal" id="streamHistoryModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Past streams</div>
+    <button class="modal-close" onclick="closeStreamHistory()">×</button>
+  </div>
+  <div id="streamHistoryBody" style="max-height:60vh;overflow-y:auto">Loading…</div>
+  <p style="margin-top:12px;font-size:11px;color:rgba(255,255,255,0.4);line-height:1.5">
+    Data &amp; cost are estimates: ~2.5 Mbps per viewer × watch time, egress at $0.05/GB (first 1 TB/month free).
+  </p>
 </div>
 
 <!-- Profile sheet -->
@@ -1826,7 +2589,7 @@ body.creator .creator-badge { display: block; }
     <button class="modal-close" onclick="closePrerollSheet()">×</button>
   </div>
   <p style="font-size:13px;color:rgba(255,255,255,0.5);line-height:1.5;margin-bottom:20px">
-    A 15s clip shown before viewers see your stream. Keep it under ~5&nbsp;MB so it loads instantly. Each viewer sees it at most once per 8&nbsp;minutes.
+    Your node's sponsor ad — a short clip shown before live streams and occasionally between feed posts, <strong>across every creator on this node</strong>. You collect the revenue and share it per-creator (Manage Creators → Share %). Each viewer sees it at most once per 8&nbsp;minutes.
   </p>
   <label style="display:flex;align-items:center;gap:10px;margin-bottom:20px;font-size:15px">
     <input type="checkbox" id="prerollEnabled" style="width:20px;height:20px"> Show pre-roll ad
@@ -1849,11 +2612,28 @@ body.creator .creator-badge { display: block; }
     <input type="text" id="prerollClickUrl" placeholder="https://…" maxlength="300">
   </div>
   <div class="field">
+    <label>Ad category (viewers can mute categories)</label>
+    <input type="text" id="prerollCategory" placeholder="e.g. food, auto, fashion" maxlength="30">
+  </div>
+  <div class="field">
     <label>Your rate — CPM ($ per 1000 views)</label>
     <input type="text" id="prerollCpm" inputmode="decimal" placeholder="e.g. 4.00">
   </div>
   <div id="prerollStats" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px"></div>
+  <div id="hostLedger" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px;display:none"></div>
   <button class="submit-btn" id="prerollSaveBtn" onclick="savePreroll()">Save</button>
+</div>
+
+<!-- Creator earnings (hosted creators with a revenue share) -->
+<div class="edit-profile-sheet" id="earningsSheet">
+  <div class="modal-header">
+    <div class="modal-title">Your Earnings</div>
+    <button class="modal-close" onclick="document.getElementById('earningsSheet').classList.remove('show')">×</button>
+  </div>
+  <div id="earningsBody" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:16px">Loading…</div>
+  <p style="margin-top:14px;font-size:12px;color:rgba(255,255,255,0.4);line-height:1.6">
+    Your host runs the sponsor ad on this node and shares revenue from ad views on YOUR content at the % shown. Payouts are settled by your host.
+  </p>
 </div>
 
 <!-- Inbox sheet -->
@@ -1918,6 +2698,16 @@ body.creator .creator-badge { display: block; }
   <button class="submit-btn" id="publishBtn" onclick="submitPublish()">Post</button>
 </div>
 
+<!-- In-feed sponsor ad: shows the current creator's pre-roll ad between posts -->
+<div id="feedAdOverlay" style="display:none;position:fixed;inset:0;z-index:90;background:#000">
+  <video disableremoteplayback x-webkit-airplay="deny" id="feedAdVideo" playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000"></video>
+  <div style="position:absolute;top:max(env(safe-area-inset-top),16px);left:16px;background:rgba(0,0,0,0.5);border-radius:6px;padding:4px 8px;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,255,255,0.85)">Sponsored</div>
+  <div id="feedAdCountdown" style="position:absolute;top:max(env(safe-area-inset-top),16px);right:16px;background:rgba(0,0,0,0.6);border-radius:16px;padding:6px 12px;font-size:13px;font-weight:600;color:#fff"></div>
+  <button id="feedAdSkip" onclick="skipFeedAd()" style="display:none;position:absolute;top:max(env(safe-area-inset-top),16px);right:16px;background:rgba(0,0,0,0.6);border:none;border-radius:16px;padding:6px 14px;font-size:13px;font-weight:600;color:#fff">Skip ›</button>
+  <div id="feedAdSponsor" onclick="onFeedAdClick()" style="display:none;position:absolute;bottom:max(env(safe-area-inset-bottom),20px);left:16px;right:16px;background:rgba(0,0,0,0.55);border-radius:12px;padding:12px 16px;color:#fff;font-size:14px;cursor:pointer"></div>
+  <button onclick="muteFeedAd()" style="position:absolute;bottom:calc(max(env(safe-area-inset-bottom),20px) + 64px);right:16px;background:none;border:none;color:rgba(255,255,255,0.55);font-size:12px;text-decoration:underline">Hide ads like this</button>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1939,6 +2729,7 @@ let currentTab = 'foryou';
 
 let token    = localStorage.getItem('adminToken') || '';
 let isCreator = false;
+let isHost    = false; // true only when unlocked with the host master token (shows creator-management UI)
 
 let selectedType             = 'writing';
 let selectedFile             = null;
@@ -1958,6 +2749,22 @@ function fmtCount(n) {
   return n >= 1e6 ? (n/1e6).toFixed(1).replace('.0','')+'M'
        : n >= 1e3 ? (n/1e3).toFixed(1).replace('.0','')+'K'
        : String(n);
+}
+
+// ── SEEN HISTORY (local) — returning viewers land on unseen posts, so content feels new ──
+function loadSeen() { try { return new Set(JSON.parse(localStorage.getItem('seen') || '[]')); } catch(e) { return new Set(); } }
+let seenSet = loadSeen();
+function markSeen(id) {
+  if (!id || seenSet.has(id)) return;
+  seenSet.add(id);
+  let arr = [...seenSet];
+  if (arr.length > 2000) { arr = arr.slice(arr.length - 2000); seenSet = new Set(arr); } // cap growth
+  try { localStorage.setItem('seen', JSON.stringify(arr)); } catch(e) {}
+}
+function firstUnseenIndex(feed) {
+  if (!Array.isArray(feed) || !feed.length) return 0;
+  const i = feed.findIndex(it => it && it.id && !seenSet.has(it.id));
+  return i === -1 ? 0 : i;
 }
 
 // ── AVATAR ────────────────────────────────────────────────────
@@ -1999,14 +2806,24 @@ function toast(msg) {
 const showToast = toast;
 
 // ── NODE LOADING ──────────────────────────────────────────────
+const FEED_PAGE = 30; // posts per fetch — big accounts page in instead of shipping everything
+
 async function loadNode(node) {
   if (node.loaded || node.loading) return;
   node.loading = true;
   try {
-    const res = await fetch(node.url + '/.well-known/feed.json');
-    node.feed = (await res.json()).items || [];
+    const res = await fetch(node.url + '/.well-known/feed.json?limit=' + FEED_PAGE);
+    const fd = await res.json();
+    node.feed = fd.items || [];
+    node.feedTotal = fd.total ?? node.feed.length;
+    node.displayName = fd.displayName || '';
+    node.avatarUrl = fd.avatarUrl ? (fd.avatarUrl.startsWith('http') ? fd.avatarUrl : (node.url || '') + fd.avatarUrl) : null;
+    node.postIndex = firstUnseenIndex(node.feed); // land on first unseen post (runs once — loadNode guards on loaded)
   } catch(e) { node.feed = null; }
   node.loaded = true; node.loading = false;
+  // The viewer may be parked on this card's spinner (swiped faster than the prefetch) —
+  // without this the loading card sat there until the next manual swipe re-rendered.
+  if (nodeGraph[nodeIndex] === node) renderCurrent();
   // Fetch live status separately — never blocks feed display
   fetch(node.url + '/live/status.json')
     .then(r => r.ok ? r.json() : null)
@@ -2021,8 +2838,10 @@ async function initNetwork() {
     const reg = await fetch('https://' + NETWORK_ROOT_HOST + '/.well-known/registry.json').then(r => r.json());
     const members = reg.members || [];
     isMember = members.some(m => m.pubkey === SELF_PUBKEY);
+    const blocked = getBlocked();
     for (const m of members) {
       if (m.subdomain === SELF_SUBDOMAIN) continue;
+      if (blocked.includes(m.subdomain)) continue;
       if (nodeGraph.find(n => n.subdomain === m.subdomain)) continue;
       nodeGraph.push({ subdomain: m.subdomain, url: 'https://' + m.subdomain,
         feed: null, postIndex: 0, loaded: false, loading: false });
@@ -2050,6 +2869,49 @@ function preloadAdjacent() {
   [-1,1].forEach(d => { const i = nodeIndex+d; if (i>=0&&i<nodeGraph.length) loadNode(nodeGraph[i]); });
 }
 
+// Fetch the next page of a node's feed when the viewer is a few posts from the end.
+async function loadMorePosts(node) {
+  if (!node || node.loadingMore || !node.loaded || !node.feed) return;
+  if (node.feedTotal == null || node.feed.length >= node.feedTotal) return;
+  node.loadingMore = true;
+  try {
+    const fd = await fetch(node.url + '/.well-known/feed.json?limit=' + FEED_PAGE + '&offset=' + node.feed.length).then(r => r.json());
+    (fd.items || []).forEach(it => node.feed.push(it));
+    node.feedTotal = fd.total ?? node.feedTotal;
+  } catch(e) {}
+  node.loadingMore = false;
+}
+
+// ── MEDIA PREFETCH — load the NEXT thing while the current one plays ──
+// A detached <video preload=auto>/<img> pulls the head of the file into the browser's
+// media cache (and warms our edge cache), so the swipe lands on already-loading media.
+const _prefetched = new Set();
+function prefetchMedia(rawUrl, base, type) {
+  if (!rawUrl) return;
+  const u = rawUrl.startsWith('http') ? rawUrl : base + rawUrl;
+  if (_prefetched.has(u)) return;
+  _prefetched.add(u);
+  if (_prefetched.size > 80) _prefetched.clear();
+  if (type === 'photo') { const i = new Image(); i.src = u; return; }
+  if (type !== 'video') return;
+  const v = document.createElement('video');
+  v.preload = 'auto'; v.muted = true; v.src = u;
+  // stop pulling after the head is buffered — don't burn the viewer's data on full files
+  setTimeout(() => { try { v.removeAttribute('src'); v.load(); } catch(e) {} }, 12000);
+}
+function prefetchUpcoming() {
+  const node = nodeGraph[nodeIndex];
+  if (node?.feed) {
+    const nxt = node.feed[node.postIndex + 1];
+    if (nxt) prefetchMedia(nxt.mediaUrl, postBase(node), nxt.type);
+  }
+  [-1, 1].forEach(d => {
+    const n2 = nodeGraph[nodeIndex + d];
+    const it = n2?.feed?.[n2.postIndex];
+    if (it) prefetchMedia(it.mediaUrl, postBase(n2), it.type);
+  });
+}
+
 // ── LIVE STREAMING ────────────────────────────────────────────
 let liveBroadcaster = null;
 let liveViewer = null;
@@ -2057,6 +2919,7 @@ let liveChatInterval = null;
 let liveStatusInterval = null;
 let liveSocket = null;
 let prerollActive = false; // true while a pre-roll ad is playing — keeps the live stream muted
+let _pendingLiveRerender = false; // live status flipped while the live overlay was open — re-render on close
 
 // LiveSocket — realtime chat + viewer count + status via the node's LiveRoom DO.
 // Replaces 2s chat polling. Auto-reconnects. Works cross-node (wss to that node).
@@ -2069,7 +2932,7 @@ class LiveSocket {
     const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const host = subdomain === SELF_SUBDOMAIN ? location.host : subdomain;
     const name = displayName() || 'viewer';
-    this.url = wsScheme + host + '/live/ws?role=' + role + '&name=' + encodeURIComponent(name);
+    this.url = wsScheme + host + '/live/ws?role=' + role + '&name=' + encodeURIComponent(name) + '&vid=' + encodeURIComponent(getViewerId());
     this.connect();
   }
   connect() {
@@ -2097,10 +2960,17 @@ class LiveSocket {
   renderChat() {
     const box = this.opts.chatBoxId && document.getElementById(this.opts.chatBoxId);
     if (!box) return;
-    box.innerHTML = this.chat.slice(-6).map(m =>
-      \`<div class="live-chat-msg"><strong>\${esc(m.name)}</strong> \${esc(m.text)}</div>\`
-    ).join('');
-    box.scrollTop = box.scrollHeight;
+    // full history (DO retains last 100); stick to newest unless the user scrolled up
+    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.innerHTML = this.chat.map(m => {
+      // broadcaster can tap a message to mute its sender
+      const mod = this.opts.canMod && m.sid
+        ? ' data-sid="' + esc(m.sid) + '" data-name="' + esc(m.name) + '" onclick="modMuteTap(this)" style="cursor:pointer"'
+        : '';
+      const who = commenterInfo(m.name);
+      return '<div class="live-chat-msg"' + mod + '><strong>' + esc(who ? who.display : m.name) + '</strong> ' + esc(m.text) + '</div>';
+    }).join('');
+    if (stick) box.scrollTop = box.scrollHeight;
   }
   setViewers(n) {
     const el = this.opts.viewerCountId && document.getElementById(this.opts.viewerCountId);
@@ -2114,7 +2984,17 @@ class LiveSocket {
 }
 
 function pauseFeedVideos() { document.querySelectorAll('.card video').forEach(v => v.pause()); }
-function resumeFeedVideos() { document.querySelectorAll('.card.active video').forEach(v => v.play().catch(()=>{})); }
+// true while something fullscreen covers the feed — card videos must never (re)start underneath it
+function feedCovered() {
+  if (document.getElementById('liveModal').style.display === 'flex') return true;
+  if (typeof _feedAdShowing !== 'undefined' && _feedAdShowing) return true;
+  return false;
+}
+function resumeFeedVideos() {
+  // was '.card.active video' — a class no card ever had, so closing an overlay never resumed playback
+  if (feedCovered()) return;
+  activePanel().querySelectorAll('.card video').forEach(v => v.play().catch(()=>{}));
+}
 
 function onLiveTap() {
   const node = nodeGraph[nodeIndex];
@@ -2134,7 +3014,11 @@ function onLiveTap() {
     viewVideo.style.display = 'none';
     viewStatus.style.display = 'none';
     bcPanel.style.display   = 'block';
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
+    // 720p30 ideal (not exact — older devices fall back); default was often VGA
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: true,
+    }).then(stream => {
       preview.srcObject = stream;
       if (!liveBroadcaster) liveBroadcaster = new LiveBroadcaster(stream);
     }).catch(e => setLiveStatus('Camera error: ' + e.message));
@@ -2152,6 +3036,7 @@ function onLiveTap() {
   liveSocket = new LiveSocket(node.subdomain, isBroadcaster ? 'broadcaster' : 'viewer', {
     chatBoxId: 'liveChatBox',
     viewerCountId: 'liveViewerCount',
+    canMod: isBroadcaster,
     onEnded: () => { if (!isBroadcaster) { setLiveStatus('Stream ended'); } },
   });
 }
@@ -2178,7 +3063,9 @@ function closeLiveModal() {
   if (liveViewer) { liveViewer.cleanup(); liveViewer = null; }
   if (liveSocket) { liveSocket.close(); liveSocket = null; }
   stopLiveChatPoll();
-  resumeFeedVideos();
+  // live state flipped while the overlay was up → rebuild the card; otherwise just resume playback
+  if (_pendingLiveRerender) { _pendingLiveRerender = false; renderCurrent(); }
+  else resumeFeedVideos();
 }
 
 function setLiveStatus(msg) {
@@ -2224,7 +3111,7 @@ async function liveSendChat() {
   await fetch(base + '/live/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, name }),
+    body: JSON.stringify({ text, name, vid: getViewerId() }),
   }).catch(() => {});
 }
 
@@ -2267,9 +3154,12 @@ function startLiveCardChatPoll(subdomain) {
       const msgs = data.messages || data;
       const box = document.getElementById('liveCardChat');
       if (box) {
-        box.innerHTML = msgs.slice(-6).map(m =>
-          \`<div class="live-card-chat-msg"><strong>\${esc(m.name)}</strong> \${esc(m.text)}</div>\`
-        ).join('');
+        const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        box.innerHTML = msgs.map(m => {
+          const who = commenterInfo(m.name);
+          return \`<div class="live-card-chat-msg"><strong>\${esc(who ? who.display : m.name)}</strong> \${esc(m.text)}</div>\`;
+        }).join('');
+        if (stick) box.scrollTop = box.scrollHeight;
       }
     } catch {}
   }
@@ -2323,6 +3213,21 @@ class LiveBroadcaster {
     const tracksResp = await tracksRes.json();
 
     await this.pc.setRemoteDescription({ type: 'answer', sdp: tracksResp.sessionDescription.sdp });
+
+    // 5b. Quality tuning — cap bitrate so a shaky uplink degrades resolution, not latency.
+    // The 2.5 Mbps ceiling is plenty for 720p30 and bounds egress cost on fast connections.
+    const vTrack = this.stream.getVideoTracks()[0];
+    if (vTrack) { try { vTrack.contentHint = 'motion'; } catch(e) {} }
+    for (const sender of this.pc.getSenders()) {
+      if (!sender.track || sender.track.kind !== 'video') continue;
+      try {
+        const p = sender.getParameters();
+        p.degradationPreference = 'maintain-framerate';
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = 2500000;
+        await sender.setParameters(p);
+      } catch(e) {}
+    }
 
     // 6. Publish session (store trackNames in DO, set active=true)
     await fetch('/admin/live/publish', {
@@ -2460,14 +3365,14 @@ async function runPrerollThenView(subdomain) {
   let ad = null;
   try {
     const d = await fetch(base + '/live/preroll?vid=' + encodeURIComponent(vid)).then(r => r.json());
-    if (d.show) ad = d.ad;
+    if (d.show && !getAdMutes().includes((d.ad && d.ad.category) || 'general')) ad = d.ad;
   } catch(e) {}
 
   // Connect the stream in the background DURING the ad, so it's ready at countdown 0.
   prerollActive = !!ad;
   if (ad) { const lv = document.getElementById('liveViewVideo'); if (lv) lv.muted = true; }
   startLiveViewer(subdomain);
-  if (ad) await playPreroll(ad, base, vid);
+  if (ad) { reportImpression(subdomain, 'live'); await playPreroll(ad, base, vid); }
 }
 
 function playPreroll(ad, base, vid) {
@@ -2523,6 +3428,9 @@ function playPreroll(ad, base, vid) {
     video.onended = finish;
     video.onerror = finish; // if the creative fails to load, don't trap the viewer
     const guard = setTimeout(finish, (dur + 4) * 1000); // safety net if 'ended' never fires
+    // don't make the viewer stare at a black screen: if the creative hasn't started in 5s, skip to the stream
+    const startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) finish(); }, 5000);
+    video.onplaying = () => clearTimeout(startGuard);
 
     // We arrived here via the user's "Live" tap, so unmuted autoplay should be allowed;
     // fall back to muted if the browser still blocks it.
@@ -2537,12 +3445,120 @@ function onPrerollClick() {
   window.open(_prerollClickUrl, '_blank', 'noopener');
 }
 
+// ── IN-FEED SPONSOR ADS ───────────────────────────────────────
+// Every AD_EVERY committed swipes, show the CURRENT creator's pre-roll ad as a skippable
+// interstitial. Reuses the same config + DO impression counters + 8-min per-viewer grace
+// window as the live pre-roll, so the creator's earnings meter covers both surfaces —
+// the node being viewed serves (and earns from) its own ad.
+const AD_EVERY = 10;
+const AD_MIN_GAP_MS = 150000; // global cap: at most one interstitial per 2.5 min across ALL nodes
+let _swipesSinceAd = 0, _feedAdShowing = false, _feedAdClickUrl = '', _feedAdBase = '', _feedAdCategory = '';
+
+// Verified-impression beacon → the network root ("don't grade your own homework"):
+// the viewed node's local meter pays creators; the root's deduped count faces advertisers.
+function reportImpression(host, surface) {
+  fetch('https://' + NETWORK_ROOT_HOST + '/measure/impression', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ host: host || SELF_SUBDOMAIN, vid: getViewerId(), surface }),
+  }).catch(() => {});
+}
+
+// Viewer-side ad controls: muted categories live on-device, like seen-history.
+function getAdMutes() { try { return JSON.parse(localStorage.getItem('adMutes') || '[]'); } catch(e) { return []; } }
+function muteFeedAd() {
+  const m = getAdMutes();
+  if (_feedAdCategory && !m.includes(_feedAdCategory)) m.push(_feedAdCategory);
+  localStorage.setItem('adMutes', JSON.stringify(m));
+  toast("You'll see fewer ads like this");
+  skipFeedAd();
+}
+
+function maybeShowFeedAd() {
+  _swipesSinceAd++;
+  if (_feedAdShowing || _swipesSinceAd < AD_EVERY) return;
+  if (Date.now() - (+localStorage.getItem('lastAdAt') || 0) < AD_MIN_GAP_MS) return;
+  const node = nodeGraph[nodeIndex];
+  if (!node) return;
+  const base = postBase(node);
+  fetch(base + '/live/preroll?vid=' + encodeURIComponent(getViewerId()))
+    .then(r => r.json())
+    .then(d => {
+      if (d.show && d.ad && d.ad.mediaUrl && !getAdMutes().includes(d.ad.category || 'general')) showFeedAd(d.ad, base, node.subdomain);
+    })
+    .catch(() => {});
+}
+
+function showFeedAd(ad, base, host) {
+  _feedAdShowing = true; _swipesSinceAd = 0;
+  _feedAdCategory = ad.category || 'general';
+  localStorage.setItem('lastAdAt', String(Date.now()));
+  _feedAdClickUrl = ad.clickUrl || ''; _feedAdBase = base;
+  const ov = document.getElementById('feedAdOverlay');
+  const video = document.getElementById('feedAdVideo');
+  const sp = document.getElementById('feedAdSponsor');
+  const cd = document.getElementById('feedAdCountdown');
+  pauseFeedVideos();
+  if (ad.sponsorName || ad.clickUrl) {
+    sp.style.display = 'block';
+    sp.innerHTML = (ad.sponsorName ? '<strong>' + esc(ad.sponsorName) + '</strong>' : '') + (ad.clickUrl ? ' &nbsp;Learn more ›' : '');
+  } else sp.style.display = 'none';
+  document.getElementById('feedAdSkip').style.display = 'none';
+  cd.style.display = 'block'; cd.textContent = '5…';
+  ov.style.display = 'block';
+  video.src = ad.mediaUrl.startsWith('http') ? ad.mediaUrl : base + ad.mediaUrl;
+  let elapsed = 0;
+  video._timer = setInterval(() => {
+    elapsed++;
+    if (elapsed >= 5) {
+      cd.style.display = 'none';
+      document.getElementById('feedAdSkip').style.display = 'block';
+      clearInterval(video._timer); video._timer = null;
+    } else cd.textContent = (5 - elapsed) + '…';
+  }, 1000);
+  video.onended = skipFeedAd;
+  video.onerror = skipFeedAd; // never trap the viewer behind a broken creative
+  // a hung media fetch leaves play() pending forever — countdown over a black screen.
+  // If nothing has rendered within 4s, bail out instead of pretending an ad ran.
+  video._startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) skipFeedAd(); }, 4000);
+  video._counted = false;
+  video.onplaying = () => {
+    if (video._startGuard) { clearTimeout(video._startGuard); video._startGuard = null; }
+    if (video._counted) return;
+    video._counted = true;
+    // impression counts only when the creative actually renders (was: on display)
+    fetch(base + '/live/preroll/seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: getViewerId() }) }).catch(() => {});
+    reportImpression(host, 'feed');
+  };
+  video.muted = false;
+  video.play().catch(() => { video.muted = true; video.play().catch(skipFeedAd); });
+}
+
+function skipFeedAd() {
+  if (!_feedAdShowing) return;
+  _feedAdShowing = false;
+  const video = document.getElementById('feedAdVideo');
+  if (video._timer) { clearInterval(video._timer); video._timer = null; }
+  if (video._startGuard) { clearTimeout(video._startGuard); video._startGuard = null; }
+  try { video.pause(); } catch(e) {}
+  video.src = '';
+  document.getElementById('feedAdOverlay').style.display = 'none';
+  resumeFeedVideos();
+}
+
+function onFeedAdClick() {
+  if (!_feedAdClickUrl.startsWith('http://') && !_feedAdClickUrl.startsWith('https://')) return;
+  fetch(_feedAdBase + '/live/preroll/click', { method: 'POST' }).catch(() => {});
+  window.open(_feedAdClickUrl, '_blank', 'noopener');
+}
+
 // ── CARD RENDERING ────────────────────────────────────────────
 function renderSidebar(node, item) {
-  const handle   = node.subdomain.split('.')[0];
-  const letter   = handle[0].toUpperCase();
+  const letter   = ((node.displayName || node.subdomain)[0] || '?').toUpperCase();
   const grad     = avatarGrad(node.subdomain);
   const isSelf   = node.subdomain === SELF_SUBDOMAIN;
+  const avInner  = node.avatarUrl
+    ? \`<img src="\${esc(node.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
+    : esc(letter);
   const followEl = isSelf ? '' : \`<div class="avatar-follow">+</div>\`;
   const liked    = item ? isLiked(item.id) : false;
   const likeClr  = liked ? 'filter:none;color:#FE2C55' : 'filter:grayscale(0.2)';
@@ -2551,8 +3567,8 @@ function renderSidebar(node, item) {
 
   return \`<div class="sidebar">
     <div class="sidebar-item">
-      <div class="avatar-wrap">
-        <div class="avatar-circle" style="background:\${grad}">\${esc(letter)}</div>
+      <div class="avatar-wrap" onclick="openProfile('\${sub}')" style="cursor:pointer">
+        <div class="avatar-circle" style="background:\${grad};overflow:hidden">\${avInner}</div>
         \${followEl}
       </div>
     </div>
@@ -2574,14 +3590,14 @@ function renderSidebar(node, item) {
 }
 
 function renderInfo(node, item) {
-  const handle = '@' + node.subdomain.split('.')[0];
+  const handle = '@' + node.subdomain; // full host — handles are globally unique across the network
   const title  = item?.title || '';
   const body   = item?.body  || '';
   const desc   = [title, body].filter(Boolean).join(' · ');
-  const live   = node.liveStatus?.active ? \`<div class="info-live-badge">● LIVE</div>\` : '';
+  const live   = node.liveStatus?.active ? \`<div class="info-live-badge" onclick="onLiveTap()" style="cursor:pointer;pointer-events:auto">● LIVE — tap to watch</div>\` : '';
   return \`<div class="card-info">
     \${live}
-    <div class="info-username">\${esc(handle)}</div>
+    <div class="info-username" onclick="openProfile('\${esc(node.subdomain)}')" style="cursor:pointer">\${esc(handle)}</div>
     \${desc ? \`<div class="info-desc">\${esc(desc)}</div>\` : ''}
   </div>\`;
 }
@@ -2598,9 +3614,11 @@ function renderCard(node, postIdx) {
   const isSelf = node.subdomain === SELF_SUBDOMAIN;
   const sb     = renderSidebar(node, item);
   const info   = renderInfo(node, item);
+  // media lives on the owning node's R2 — prefix remote nodes' relative /media URLs with their origin
+  const msrc   = item.mediaUrl ? (item.mediaUrl.startsWith('http') ? item.mediaUrl : postBase(node) + item.mediaUrl) : '';
 
   if (item.type === 'live') {
-    const handle = '@' + node.subdomain.split('.')[0];
+    const handle = '@' + node.subdomain;
     const isSelf = node.subdomain === SELF_SUBDOMAIN;
     if (isSelf && isCreator) {
       return \`<div class="card card-live" data-live="self">
@@ -2613,7 +3631,7 @@ function renderCard(node, postIdx) {
       </div>\`;
     }
     return \`<div class="card card-live" data-live="viewer">
-      <video id="liveCardVideo" autoplay playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000"></video>
+      <video disableremoteplayback x-webkit-airplay="deny" id="liveCardVideo" autoplay playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000"></video>
       <div class="live-card-badges">
         <div class="info-live-badge">● LIVE</div>
       </div>
@@ -2627,13 +3645,13 @@ function renderCard(node, postIdx) {
 
   if (item.type === 'video' && item.mediaUrl) {
     return \`<div class="card card-video" data-id="\${esc(item.id)}">
-      <div class="c-media"><video src="\${esc(item.mediaUrl)}" playsinline preload="metadata" loop></video></div>
+      <div class="c-media"><video disableremoteplayback x-webkit-airplay="deny" src="\${esc(msrc)}" playsinline preload="metadata" loop></video></div>
       \${info}\${sb}
     </div>\`;
   }
   if (item.type === 'photo' && item.mediaUrl) {
     return \`<div class="card card-photo" data-id="\${esc(item.id)}">
-      <div class="c-media"><img src="\${esc(item.mediaUrl)}" alt="" loading="lazy"></div>
+      <div class="c-media"><img src="\${esc(msrc)}" alt="" loading="lazy"></div>
       \${info}\${sb}
     </div>\`;
   }
@@ -2659,6 +3677,7 @@ let liveCardViewer = null;
 function renderCurrent() {
   const node = nodeGraph[nodeIndex];
   const item = node.feed?.[node.postIndex];
+  markSeen(item?.id); // record this post as seen for unseen-first ordering on return visits
 
   // Disconnect previous live viewer if leaving a live card
   if (liveCardViewer) { liveCardViewer.cleanup(); liveCardViewer = null; stopLiveChatPoll(); }
@@ -2670,6 +3689,8 @@ function renderCurrent() {
   inactivePanel().style.zIndex   = '1';
   activateVideos(activePanel());
   refreshCurrentInteractions();
+  prefetchUpcoming();
+  if (node.feed && node.postIndex >= node.feed.length - 5) loadMorePosts(node);
 
   // Auto-connect viewer when landing on a live card
   if (item?.type === 'live' && !(isCreator && node.subdomain === SELF_SUBDOMAIN)) {
@@ -2695,6 +3716,9 @@ function activateVideos(p) {
         }
       });
     }
+    // never auto-start feed audio under the live overlay / ad interstitial
+    // (the 60s live-status flip re-rendering mid-broadcast was leaking the first video's audio)
+    if (feedCovered()) { v.pause(); return; }
     v.play().catch(() => {
       v.muted = true;
       v.play().catch(() => {});
@@ -2789,7 +3813,7 @@ async function refreshInteractions(node, item) {
 let _namePromiseResolve = null;
 
 function displayName() {
-  if (isCreator) return SELF_SUBDOMAIN.split('.')[0] || 'viewer';
+  if (isCreator) return SELF_SUBDOMAIN || 'viewer'; // full host — unique across the network
   return localStorage.getItem('guestName') || '';
 }
 
@@ -2849,6 +3873,14 @@ async function loadComments() {
       '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3)">Could not load comments</div>';
   }
 }
+// Creators comment under their full host (globally unique). At render time map a
+// host back to its node so they get their profile pic + display name; guests keep
+// their typed name and a letter avatar.
+function commenterInfo(name) {
+  const n = name && nodeGraph.find(x => x.subdomain === name);
+  if (!n) return null;
+  return { display: n.displayName || String(name).split('.')[0], avatarUrl: n.avatarUrl || null };
+}
 function renderComments(list) {
   const canDelete = isCreator && _commentsCtx.subdomain === SELF_SUBDOMAIN;
   if (!list.length) {
@@ -2857,12 +3889,17 @@ function renderComments(list) {
     return;
   }
   document.getElementById('commentsList').innerHTML = list.map(c => {
+    const who = commenterInfo(c.name);
+    const shown = who ? who.display : (c.name || 'viewer');
     const grad = avatarGrad(c.name || '?');
+    const avInner = who && who.avatarUrl
+      ? \`<img src="\${esc(who.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
+      : esc((shown[0] || '?').toUpperCase());
     const del = canDelete ? \`<button onclick="deleteComment('\${esc(c.id)}')" style="background:none;color:rgba(255,255,255,0.4);font-size:18px;padding:0 4px">×</button>\` : '';
     return \`<div class="inbox-notif" style="cursor:default">
-      <div class="inbox-notif-avatar" style="background:\${grad}">\${esc((c.name[0] || '?').toUpperCase())}</div>
+      <div class="inbox-notif-avatar" style="background:\${grad};overflow:hidden">\${avInner}</div>
       <div class="inbox-notif-body">
-        <div class="inbox-notif-text"><strong>\${esc(c.name)}</strong> \${esc(c.text)}</div>
+        <div class="inbox-notif-text"><strong>\${esc(shown)}</strong> \${esc(c.text)}</div>
         <div class="inbox-notif-time">\${timeAgo(c.at)}</div>
       </div>
       \${del}
@@ -2950,15 +3987,15 @@ function onCreateTap() {
 // ── PROFILE ───────────────────────────────────────────────────
 let _profileCache = {};
 
+// The Profile tab is always YOUR profile (reachable from anywhere in the app);
+// other creators' profiles open by tapping their avatar or @handle on their cards.
 function onProfileTap() {
-  const node = nodeGraph[nodeIndex];
-  openProfile(node.subdomain);
+  openProfile(SELF_SUBDOMAIN);
 }
 
 function openProfile(subdomain) {
   const sheet = document.getElementById('profileSheet');
-  const handle = subdomain.split('.')[0];
-  document.getElementById('profileHandle').textContent = '@' + handle;
+  document.getElementById('profileHandle').textContent = '@' + subdomain;
   const isOwn = subdomain === SELF_SUBDOMAIN && isCreator;
   document.getElementById('profileEditBtn').style.display = isOwn ? 'block' : 'none';
   document.getElementById('profileEditSpacer').style.display = isOwn ? 'none' : 'block';
@@ -2993,32 +4030,42 @@ async function loadProfileData(subdomain) {
 
 function renderProfileBody(data, subdomain) {
   const isOwn = subdomain === SELF_SUBDOMAIN && isCreator;
-  const handle = (data.subdomain || subdomain).split('.')[0];
-  const name = data.displayName || handle;
+  const handle = data.subdomain || subdomain; // full host — globally unique
+  const name = data.displayName || handle.split('.')[0];
   const bio = data.bio || '';
   const grad = avatarGrad(subdomain);
+  // media lives on the profile owner's R2 — prefix remote (non-self) relative URLs with their origin
+  const pbase = subdomain === SELF_SUBDOMAIN ? '' : 'https://' + subdomain;
+  const pabs = u => u ? (u.startsWith('http') ? u : pbase + u) : '';
   const avatarHtml = data.avatarUrl
-    ? \`<img src="\${esc(data.avatarUrl)}" alt="">\`
-    : esc(handle[0].toUpperCase());
+    ? \`<img src="\${esc(pabs(data.avatarUrl))}" alt="">\`
+    : esc(name[0].toUpperCase());
 
   const gridHtml = (data.feed || []).map(item => {
     const gridDel = isOwn ? \`<button class="grid-del" onclick="event.stopPropagation();deleteFromGrid('\${esc(item.id)}')">×</button>\` : '';
     if (item.type === 'video' && item.mediaUrl)
       return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
-        <video src="\${esc(item.mediaUrl)}" preload="metadata" muted playsinline></video>
+        <video disableremoteplayback x-webkit-airplay="deny" data-src="\${esc(pabs(item.mediaUrl))}" preload="metadata" muted playsinline></video>
         <div class="grid-type-icon">▶</div>\${gridDel}
       </div>\`;
     if (item.type === 'photo' && item.mediaUrl)
       return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
-        <img src="\${esc(item.mediaUrl)}" loading="lazy" alt="">\${gridDel}
+        <img src="\${esc(pabs(item.mediaUrl))}" loading="lazy" alt="">\${gridDel}
       </div>\`;
     return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
       <div class="profile-grid-text" style="background:\${grad}">\${esc((item.title||item.body||'').slice(0,40))}</div>\${gridDel}
     </div>\`;
   }).join('');
 
-  const connectBtn = !isOwn ? \`<button class="profile-connect-btn" onclick="connectToNode('\${esc(subdomain)}')">Connect</button>\` : '';
   const joinBtn = isOwn ? \`<button id="joinNetworkBtn" class="profile-connect-btn" style="display:\${isCreator && !isMember ? 'block' : 'none'};background:#20D5EC" onclick="requestJoin()">Join the network</button>\` : '';
+  const hostBtn = (isOwn && isHost) ? \`<button class="profile-connect-btn" style="background:#20D5EC" onclick="openCreators()">Manage creators</button>\` : '';
+  // Host configures the node-wide ad + sees the ledger; a hosted creator with a share %
+  // gets a read-only earnings view; everyone else gets nothing.
+  const adBtn = (isOwn && isHost) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openPrerollSheet()">💰 Node ad &amp; revenue</button>\`
+              : (isOwn && data.adsEnabled) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openEarnings()">💰 Your earnings</button>\` : '';
+  const blocked = getBlocked().includes(subdomain);
+  const blockBtn = !isOwn ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleBlock('\${esc(subdomain)}')">\${blocked ? 'Unblock' : 'Block'}</button>\` : '';
+  const importBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openImport()">📥 Import from TikTok</button>\` : '';
 
   document.getElementById('profileBody').innerHTML = \`
     <div class="profile-hero">
@@ -3031,15 +4078,33 @@ function renderProfileBody(data, subdomain) {
           <div class="profile-stat-l">Posts</div>
         </div>
         <div class="profile-stat">
-          <div class="profile-stat-n">\${data.peerCount || 0}</div>
-          <div class="profile-stat-l">Peers</div>
+          <div class="profile-stat-n">\${data.networkSize ?? data.peerCount ?? 0}</div>
+          <div class="profile-stat-l">Network</div>
         </div>
       </div>
       \${bio ? \`<div class="profile-bio">\${esc(bio)}</div>\` : ''}
-      \${connectBtn}\${joinBtn}
+      \${joinBtn}\${adBtn}\${hostBtn}\${importBtn}\${blockBtn}
     </div>
     <div class="profile-grid">\${gridHtml || '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3);grid-column:1/-1">No posts yet</div>'}</div>
   \`;
+  lazyLoadGridVideos(document.getElementById('profileBody'));
+}
+
+// Grid videos only fetch their metadata/thumbnail when scrolled near the viewport —
+// without this, opening a 100-post profile fires 100 video fetches at once.
+function lazyLoadGridVideos(root) {
+  const vids = root.querySelectorAll('video[data-src]');
+  if (!('IntersectionObserver' in window)) { vids.forEach(v => { v.src = v.dataset.src; }); return; }
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(en => {
+      if (en.isIntersecting) {
+        const v = en.target;
+        if (!v.src) v.src = v.dataset.src;
+        io.unobserve(v);
+      }
+    });
+  }, { root: root, rootMargin: '300px' });
+  vids.forEach(v => io.observe(v));
 }
 
 function openProfilePost(subdomain, postId) {
@@ -3055,14 +4120,25 @@ function openProfilePost(subdomain, postId) {
   }
 }
 
-function connectToNode(subdomain) {
-  if (nodeGraph.find(n => n.subdomain === subdomain)) {
-    showToast('Already connected');
-    return;
+// ── BLOCK (viewer-side, on-device) ────────────────────────────
+function getBlocked() { try { return JSON.parse(localStorage.getItem('blockedNodes') || '[]'); } catch(e) { return []; } }
+function toggleBlock(subdomain) {
+  let b = getBlocked();
+  if (b.includes(subdomain)) {
+    b = b.filter(x => x !== subdomain);
+    toast('Unblocked @' + subdomain);
+  } else {
+    b.push(subdomain);
+    toast("Blocked — you won't see this creator");
+    const i = nodeGraph.findIndex(n => n.subdomain === subdomain);
+    if (i > 0) { // index 0 is this origin itself — filtered on next visit instead
+      nodeGraph.splice(i, 1);
+      if (nodeIndex >= nodeGraph.length) nodeIndex = nodeGraph.length - 1;
+      renderCurrent(); updateIndicators();
+    }
+    closeProfile();
   }
-  nodeGraph.push({ subdomain, url: 'https://' + subdomain, feed: null, postIndex: 0, loaded: false, loading: false });
-  showToast('Connected to @' + subdomain.split('.')[0]);
-  delete _profileCache[subdomain];
+  localStorage.setItem('blockedNodes', JSON.stringify(b));
 }
 
 // ── EDIT PROFILE ──────────────────────────────────────────────
@@ -3132,6 +4208,201 @@ function closeEditProfile() {
   document.getElementById('editProfileSheet').classList.remove('show');
 }
 
+// ── TIKTOK IMPORT ────────────────────────────────────────────
+let _importItems = [];
+let _importCancel = false;
+function openImport() {
+  _importItems = []; _importCancel = false;
+  document.getElementById('importIntro').style.display = 'block';
+  document.getElementById('importPlan').style.display = 'none';
+  document.getElementById('importProgress').style.display = 'none';
+  document.getElementById('importFile').value = '';
+  document.getElementById('importModal').classList.add('show');
+}
+function closeImport() { _importCancel = true; document.getElementById('importModal').classList.remove('show'); }
+// TikTok export dates are "YYYY-MM-DD HH:MM:SS" (UTC); tolerate ISO too.
+function tiktokDateToIso(d) {
+  if (!d) return null;
+  const t = Date.parse(String(d).includes('T') ? d : String(d).replace(' ', 'T') + 'Z');
+  return isNaN(t) ? null : new Date(t).toISOString();
+}
+// Walk the export and collect POSTED videos: objects with an http Link + Date whose
+// key path looks like the user's own videos. Likes/favorites/shares/watch-history
+// sections also carry Link+Date — those are OTHER people's videos, so exclude them.
+function parseTikTokExport(data, basePath) {
+  const out = [];
+  const seen = {};
+  (function walk(o, path) {
+    if (Array.isArray(o)) { for (const it of o) walk(it, path); return; }
+    if (!o || typeof o !== 'object') return;
+    const link = o.Link || o.link || o.VideoLink || o.videoLink;
+    const date = o.Date || o.date || o.CreateTime || o.createTime;
+    if (typeof link === 'string' && link.startsWith('http') && date) {
+      const p = path.toLowerCase();
+      const owns = p.includes('video') || p.includes('post');
+      const theirs = p.includes('like') || p.includes('favorite') || p.includes('share') || p.includes('brows') || p.includes('watch') || p.includes('comment');
+      if (owns && !theirs && !seen[link]) {
+        seen[link] = 1;
+        out.push({
+          url: link,
+          createdAt: tiktokDateToIso(date),
+          title: String(o.Title || o.Desc || o.Description || o.Caption || o.title || '').slice(0, 300),
+          likes: o.Likes || o.likes || '',
+        });
+      }
+      return;
+    }
+    for (const k in o) walk(o[k], path + '/' + k);
+  })(data, basePath || '');
+  return out;
+}
+function onImportFile(file) {
+  if (!file) return;
+  file.text().then(txt => {
+    let data; try { data = JSON.parse(txt); } catch(e) { toast('That file is not valid JSON'); return; }
+    // prefer the canonical posted-videos section when present; fall back to the full walk
+    let items = [];
+    try {
+      const vl = data && data.Video && data.Video.Videos && data.Video.Videos.VideoList;
+      if (Array.isArray(vl)) items = parseTikTokExport(vl, 'video/videos/videolist');
+    } catch(e) {}
+    if (!items.length) items = parseTikTokExport(data);
+    items = items.filter(it => it.createdAt);
+    if (!items.length) { toast('No videos found in this file'); return; }
+    items.sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // oldest first — feed sort handles display order
+    _importItems = items;
+    document.getElementById('importIntro').style.display = 'none';
+    document.getElementById('importPlan').style.display = 'block';
+    document.getElementById('importSummary').textContent =
+      items.length + ' video' + (items.length === 1 ? '' : 's') + ' found (' +
+      items[0].createdAt.slice(0, 10) + ' → ' + items[items.length - 1].createdAt.slice(0, 10) +
+      '). They keep their original dates and captions.';
+  }).catch(() => toast('Could not read the file'));
+}
+async function runImport() {
+  if (!_importItems.length) return;
+  _importCancel = false;
+  document.getElementById('importPlan').style.display = 'none';
+  document.getElementById('importProgress').style.display = 'block';
+  document.getElementById('importErrors').innerHTML = '';
+  const total = _importItems.length;
+  let done = 0, failed = 0, dups = 0;
+  const status = document.getElementById('importStatus');
+  const bar = document.getElementById('importBar');
+  for (const it of _importItems) {
+    if (_importCancel) break;
+    status.textContent = 'Importing ' + (done + failed + 1) + ' of ' + total + '…';
+    try {
+      const r = await fetch('/admin/import-url', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: it.url, title: it.title, createdAt: it.createdAt, source: 'tiktok' }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) { done++; if (d.dup) dups++; }
+      else {
+        failed++;
+        document.getElementById('importErrors').innerHTML +=
+          '<div>' + esc(it.createdAt.slice(0, 10)) + ': ' + esc(d.error || ('error ' + r.status)) + '</div>';
+      }
+    } catch(e) { failed++; }
+    bar.style.width = Math.round(((done + failed) / total) * 100) + '%';
+  }
+  status.textContent = (_importCancel ? 'Cancelled — ' : 'Done — ') + done + ' imported' +
+    (dups ? ' (' + dups + ' already there)' : '') + (failed ? ', ' + failed + ' failed' : '') + '.';
+  document.getElementById('importCancelBtn').textContent = 'Close';
+  document.getElementById('importCancelBtn').onclick = closeImport;
+  // refresh our own feed so the imports show up without a reload
+  const self = nodeGraph.find(n => n.subdomain === SELF_SUBDOMAIN);
+  if (self) { self.loaded = false; self.feed = undefined; loadNode(self).then(() => { if (nodeGraph[nodeIndex] === self) renderCurrent(); }); }
+}
+
+// ── LIVE VIEWER LIST + CHAT MODERATION ───────────────────────
+function liveChatBase() {
+  const node = nodeGraph[nodeIndex];
+  return (node && node.subdomain !== SELF_SUBDOMAIN) ? 'https://' + node.subdomain : '';
+}
+async function openLiveViewers() {
+  document.getElementById('liveViewersModal').classList.add('show');
+  const body = document.getElementById('liveViewersBody');
+  body.textContent = 'Loading…';
+  const node = nodeGraph[nodeIndex];
+  const canMod = isCreator && (!node || node.subdomain === SELF_SUBDOMAIN);
+  try {
+    // auth only when moderating our own room (same-origin); the viewer list itself is public
+    const d = await fetch(liveChatBase() + '/live/who.json', canMod ? { headers: { 'Authorization': 'Bearer ' + token } } : {}).then(r => r.json());
+    const list = d.viewers || [];
+    const row = (name, tag, right) =>
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">' +
+      '<span style="font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis">' + name + tag + '</span>' + right + '</div>';
+    const muteBtn = (sid, name, muted) =>
+      '<button class="btn-secondary" style="padding:4px 10px;font-size:12px' + (muted ? ';color:#FE2C55' : '') + '" data-sid="' + esc(sid) + '" data-name="' + esc(name) + '" data-muted="' + (muted ? '1' : '') + '" onclick="toggleLiveMute(this)">' + (muted ? 'Unmute' : 'Mute') + '</button>';
+    let html = list.map(v => {
+      const tag = v.role === 'broadcaster' ? ' <span style="font-size:11px;color:#FE2C55;font-weight:600">● host</span>' : '';
+      const right = canMod && v.sid && v.role !== 'broadcaster' ? muteBtn(v.sid, v.name, v.muted) : '';
+      return row(esc(v.name), tag, right);
+    }).join('') || '<div style="color:rgba(255,255,255,0.5);font-size:14px;padding:16px 0;text-align:center">Nobody connected right now</div>';
+    if (canMod && d.mutedList && d.mutedList.length) {
+      const online = {}; list.forEach(v => { if (v.sid) online[v.sid] = 1; });
+      const offline = d.mutedList.filter(m => !online[m.sid]);
+      if (offline.length) {
+        html += '<div style="font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin:14px 0 4px">Muted (not here now)</div>' +
+          offline.map(m => row(esc(m.name), '', muteBtn(m.sid, m.name, true))).join('');
+      }
+    }
+    body.innerHTML = html;
+  } catch(e) { body.textContent = 'Could not load the viewer list'; }
+}
+function closeLiveViewers() { document.getElementById('liveViewersModal').classList.remove('show'); }
+async function toggleLiveMute(el) {
+  const sid = el.dataset.sid, name = el.dataset.name || 'viewer', mute = !el.dataset.muted;
+  if (mute && !confirm('Mute ' + name + '? Their chat messages will be hidden for everyone, on this and future streams.')) return;
+  try {
+    await fetch('/admin/live/mute', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, name, muted: mute }) });
+    toast(name + (mute ? ' muted' : ' unmuted'));
+    openLiveViewers();
+  } catch(e) { toast('failed'); }
+}
+function modMuteTap(el) {
+  const sid = el.dataset.sid; if (!sid) return;
+  const name = el.dataset.name || 'viewer';
+  if (!confirm('Mute ' + name + '? Their chat messages will be hidden for everyone, on this and future streams.')) return;
+  fetch('/admin/live/mute', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, name, muted: true }) })
+    .then(() => toast(name + ' muted')).catch(() => toast('failed'));
+}
+
+// ── STREAM HISTORY (broadcaster analytics) ───────────────────
+function fmtStreamDur(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h) return h + 'h ' + String(m).padStart(2, '0') + 'm';
+  if (m) return m + 'm ' + String(s).padStart(2, '0') + 's';
+  return s + 's';
+}
+async function openStreamHistory() {
+  document.getElementById('streamHistoryModal').classList.add('show');
+  const body = document.getElementById('streamHistoryBody');
+  body.textContent = 'Loading…';
+  try {
+    const d = await fetch('/admin/live/history', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    const streams = d.streams || [];
+    if (!streams.length) { body.innerHTML = '<div style="color:rgba(255,255,255,0.5);font-size:14px;padding:20px 0;text-align:center">No streams yet — go live and your sessions will show up here.</div>'; return; }
+    const BITRATE_MBPS = 2.5, EGRESS_PER_GB = 0.05; // matches the broadcaster's maxBitrate cap
+    body.innerHTML = streams.map(s => {
+      const when = new Date(s.startedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      const gb = (s.viewerSec || 0) * BITRATE_MBPS / 8 / 1000; // Mbps→MB/s, sec→GB
+      const cost = gb * EGRESS_PER_GB;
+      return '<div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08)">' +
+        '<div style="display:flex;justify-content:space-between;font-size:14px;font-weight:600"><span>' + esc(when) + '</span><span>' + fmtStreamDur(s.durationSec || 0) + '</span></div>' +
+        '<div style="display:flex;justify-content:space-between;font-size:12px;color:rgba(255,255,255,0.55);margin-top:4px">' +
+          '<span>peak ' + (s.peakViewers || 0) + ' viewer' + (s.peakViewers === 1 ? '' : 's') + ' · ' + fmtStreamDur(Math.round(s.viewerSec || 0)) + ' watched</span>' +
+          '<span>~' + (gb < 0.01 ? '<0.01' : gb.toFixed(2)) + ' GB · ~$' + cost.toFixed(2) + '</span>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) { body.textContent = 'Could not load stream history'; }
+}
+function closeStreamHistory() { document.getElementById('streamHistoryModal').classList.remove('show'); }
+
 // ── PRE-ROLL ADMIN ────────────────────────────────────────────
 let _prerollMediaUrl = null, _prerollContentType = null;
 
@@ -3143,12 +4414,46 @@ async function openPrerollSheet() {
     document.getElementById('prerollEnabled').checked = !!cfg.enabled;
     document.getElementById('prerollSponsorName').value = cfg.sponsorName || '';
     document.getElementById('prerollClickUrl').value = cfg.clickUrl || '';
+    document.getElementById('prerollCategory').value = cfg.category || '';
     document.getElementById('prerollCpm').value = cfg.cpm ? String(cfg.cpm) : '';
     _prerollMediaUrl = cfg.mediaUrl || null;
     _prerollContentType = cfg.contentType || null;
     document.getElementById('prerollFileName').textContent = cfg.mediaUrl ? 'current ad uploaded ✓' : '';
     renderPrerollStats(data.stats || {}, cfg);
+    loadHostLedger();
   } catch(e) {}
+}
+
+// The host's rev-share ledger: per-creator views × CPM × share %, plus the 2% network fee.
+async function loadHostLedger() {
+  try {
+    const led = await fetch('/admin/ads-ledger', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    if (!led || !led.rows) return;
+    const box = document.getElementById('hostLedger');
+    box.style.display = 'block';
+    const row = (l, r, strong) => \`<div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:4px 0;\${strong ? 'font-weight:700;border-top:1px solid rgba(255,255,255,0.12);margin-top:4px;padding-top:8px' : ''}"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis">\${l}</span><span style="white-space:nowrap">\${r}</span></div>\`;
+    box.innerHTML =
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Revenue ledger (lifetime)</div>' +
+      led.rows.map(r => row(esc(r.host), r.impressions + ' views · ' + r.sharePct + '% → $' + r.owed.toFixed(2))).join('') +
+      row('Gross (all creators)', '$' + led.totals.gross.toFixed(2)) +
+      row('Owed to creators', '−$' + led.totals.owedToCreators.toFixed(2)) +
+      row('Network fee (2%)', '−$' + led.totals.networkFee.toFixed(2)) +
+      row('Your net', '$' + led.totals.hostNet.toFixed(2), true);
+  } catch(e) {}
+}
+
+// Hosted creator's read-only earnings view.
+async function openEarnings() {
+  document.getElementById('earningsSheet').classList.add('show');
+  const el = document.getElementById('earningsBody');
+  el.textContent = 'Loading…';
+  try {
+    const d = await fetch('/admin/my-earnings', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    el.innerHTML =
+      '<div style="font-size:26px;font-weight:800;line-height:1">$' + (d.owed || 0).toFixed(2) + '</div>' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px">owed to you (' + (d.sharePct || 0) + '% share)</div>' +
+      '<div style="font-size:13px;color:rgba(255,255,255,0.6);margin-top:10px">' + (d.impressions || 0) + ' ad views on your content · ' + (d.clicks || 0) + ' clicks</div>';
+  } catch(e) { el.textContent = 'Could not load earnings'; }
 }
 
 function renderPrerollStats(s, cfg) {
@@ -3197,6 +4502,7 @@ async function savePreroll() {
         contentType: _prerollContentType,
         sponsorName: document.getElementById('prerollSponsorName').value.trim(),
         clickUrl: document.getElementById('prerollClickUrl').value.trim(),
+        category: document.getElementById('prerollCategory').value.trim(),
         cpm: document.getElementById('prerollCpm').value.trim(),
         durationSec: 15,
       }),
@@ -3238,17 +4544,22 @@ function renderInbox(notifs) {
     return;
   }
   document.getElementById('inboxList').innerHTML = notifs.map(n => {
-    const handle = (n.subdomain || '').split('.')[0];
+    const handle = n.subdomain || '';
     const grad = avatarGrad(n.subdomain || '');
     const dot = n.read ? '' : '<div class="inbox-unread-dot"></div>';
     let text = '';
     if (n.type === 'peer_connected') text = \`<strong>@\${esc(handle)}</strong> connected to your node\`;
     else if (n.type === 'join_request') text = \`<strong>@\${esc(handle)}</strong> wants to join your network\`;
     else text = esc(n.type);
-    const actions = n.type === 'join_request' ? \`<div style="display:flex;gap:8px;margin-top:8px">
+    let actions = '';
+    if (n.type === 'join_request') {
+      if (n.resolved === 'approved') actions = '<div style="margin-top:6px;font-size:13px;color:#20D5EC">✓ Added to the network</div>';
+      else if (n.resolved === 'denied') actions = '<div style="margin-top:6px;font-size:13px;color:rgba(255,255,255,0.4)">Request denied</div>';
+      else actions = \`<div style="display:flex;gap:8px;margin-top:8px">
       <button onclick="event.stopPropagation();approveJoin('\${esc(n.publicKey)}','\${esc(n.subdomain)}')" style="background:#FE2C55;border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px;font-weight:600">Approve</button>
       <button onclick="event.stopPropagation();denyJoin('\${esc(n.publicKey)}')" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px">Deny</button>
-    </div>\` : '';
+    </div>\`;
+    }
     return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" onclick="openProfile('\${esc(n.subdomain)}')">
       <div class="inbox-notif-avatar" style="background:\${grad}">\${esc(handle[0]?.toUpperCase() || '?')}</div>
       <div class="inbox-notif-body">
@@ -3268,7 +4579,7 @@ async function approveJoin(pubkey, subdomain) {
       body: JSON.stringify({ pubkey, subdomain }),
     });
     if (!r.ok) throw new Error('failed');
-    showToast('@' + (subdomain || '').split('.')[0] + ' added to the network');
+    showToast('@' + (subdomain || '') + ' added to the network');
     // add to the live graph immediately
     if (subdomain && !nodeGraph.find(n => n.subdomain === subdomain)) {
       nodeGraph.push({ subdomain, url: 'https://' + subdomain, feed: null, postIndex: 0, loaded: false, loading: false });
@@ -3347,13 +4658,16 @@ function renderSearchResults(q) {
     return;
   }
   box.innerHTML = matches.map((n, i) => {
-    const handle = n.subdomain.split('.')[0];
     const grad   = avatarGrad(n.subdomain);
+    const letter = ((n.displayName || n.subdomain)[0] || '?').toUpperCase();
+    const avInner = n.avatarUrl
+      ? \`<img src="\${esc(n.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
+      : esc(letter);
     return \`<div onclick="goToNode('\${esc(n.subdomain)}')" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);cursor:pointer">
-      <div style="width:42px;height:42px;border-radius:50%;background:\${grad};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;flex-shrink:0">\${esc(handle[0].toUpperCase())}</div>
+      <div style="width:42px;height:42px;border-radius:50%;background:\${grad};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;flex-shrink:0;overflow:hidden">\${avInner}</div>
       <div>
-        <div style="font-weight:600">@\${esc(handle)}</div>
-        <div style="font-size:12px;color:rgba(255,255,255,0.5)">\${esc(n.subdomain)}</div>
+        <div style="font-weight:600">@\${esc(n.subdomain)}</div>
+        \${n.displayName ? \`<div style="font-size:12px;color:rgba(255,255,255,0.5)">\${esc(n.displayName)}</div>\` : ''}
       </div>
     </div>\`;
   }).join('');
@@ -3384,22 +4698,130 @@ async function submitToken() {
   try {
     const res = await fetch('/admin/verify', { method:'POST', headers:{'Authorization':'Bearer '+val} });
     if (res.ok) {
+      const d = await res.json().catch(() => ({})); isHost = !!d.master;
       token = val; localStorage.setItem('adminToken', val);
       enableCreator(); closeUnlock(); toast('creator mode on');
     } else { toast('invalid token'); }
   } catch(e) { toast('failed'); }
 }
 
+function toggleClaim() {
+  const f = document.getElementById('claimForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('tokenForm').style.display = 'none';
+}
+function toggleTokenUnlock() {
+  const f = document.getElementById('tokenForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('claimForm').style.display = 'none';
+}
+// Password login → signed session (stored in the same slot the token used; checkAuth accepts both)
+async function submitLogin() {
+  const password = document.getElementById('pwInput').value;
+  if (!password) return;
+  try {
+    const res = await fetch('/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password }) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.session) {
+      token = d.session; localStorage.setItem('adminToken', d.session);
+      enableCreator(); closeUnlock(); toast('logged in');
+    } else { toast(d.error || 'login failed'); }
+  } catch(e) { toast('login failed'); }
+}
+// First-time claim: redeem the host's code + set a password → signed session
+async function submitClaim() {
+  const code = document.getElementById('claimCode').value.trim();
+  const password = document.getElementById('claimPw').value;
+  if (!code || !password) return;
+  try {
+    const res = await fetch('/auth/claim', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code, password }) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.session) {
+      token = d.session; localStorage.setItem('adminToken', d.session);
+      enableCreator(); closeUnlock(); toast('account claimed');
+    } else { toast(d.error || 'claim failed'); }
+  } catch(e) { toast('claim failed'); }
+}
+
 async function restoreCreator() {
   if (!token) return;
   try {
     const res = await fetch('/admin/verify', { method:'POST', headers:{'Authorization':'Bearer '+token} });
-    if (res.ok) enableCreator();
+    if (res.ok) { const d = await res.json().catch(() => ({})); isHost = !!d.master; enableCreator(); }
     else { localStorage.removeItem('adminToken'); token = ''; }
   } catch(e) {}
 }
 
 function enableCreator() { isCreator = true; document.body.classList.add('creator'); refreshJoinButton(); }
+
+// ── HOST: manage creators (master only) ───────────────────────
+let _lastCreatorLink = '';
+function closeCreators() { document.getElementById('creatorsModal').classList.remove('show'); }
+function creatorBaseDomain() { const p = SELF_SUBDOMAIN.split('.'); return p.length > 2 ? p.slice(1).join('.') : SELF_SUBDOMAIN; }
+async function openCreators() {
+  if (!isHost) { toast('host master token required'); return; }
+  document.getElementById('creatorLinkBox').style.display = 'none';
+  document.getElementById('newCreatorHandle').value = '';
+  document.getElementById('creatorsModal').classList.add('show');
+  loadCreatorList();
+}
+async function loadCreatorList() {
+  try {
+    const d = await fetch('/admin/provisioned', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    const list = (d.provisioned || []).filter(h => h !== SELF_SUBDOMAIN);
+    const ads = d.ads || {};
+    document.getElementById('creatorList').innerHTML = list.length
+      ? '<div style="font-size:12px;color:rgba(255,255,255,0.5);margin-bottom:8px">Creators — "Share %" is their cut of ad revenue earned on their content</div>' + list.map(h =>
+          \`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">
+            <span style="font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">\${esc(h)}</span>
+            <button class="btn-secondary" style="padding:4px 10px;font-size:12px;\${ads[h] ? 'color:#20D5EC' : 'opacity:0.6'}" onclick="setCreatorShare('\${esc(h)}', \${ads[h] || 0})">Share \${ads[h] || 0}%</button>
+            <button class="btn-secondary" style="padding:4px 10px;font-size:12px" onclick="issueCreatorLink('\${esc(h)}')">New link</button>
+            <button class="btn-secondary" style="padding:4px 10px;font-size:12px;color:#FE2C55" onclick="removeCreator('\${esc(h)}')" title="Remove">✕</button>
+          </div>\`).join('')
+      : '';
+  } catch(e) {}
+}
+async function setCreatorShare(host, current) {
+  const v = prompt('Revenue share % for ' + host + ' (0–100, 0 = no share)', String(current || 0));
+  if (v === null) return;
+  const pct = Math.max(0, Math.min(parseFloat(v) || 0, 100));
+  try {
+    await fetch('/admin/ads', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ host, sharePct: pct }) });
+    toast(host + ' → ' + pct + '% share');
+    loadCreatorList();
+  } catch(e) { toast('failed'); }
+}
+async function removeCreator(host) {
+  if (!confirm('Remove ' + host + ' from this node? It will stop serving. Its content stays in storage — re-adding the handle restores it.')) return;
+  try {
+    const d = await fetch('/admin/unprovision', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ host }) }).then(r => r.json());
+    if (d.ok) { toast(host + ' removed'); loadCreatorList(); } else toast(d.error || 'failed');
+  } catch(e) { toast('failed'); }
+}
+async function addCreator() {
+  const handle = document.getElementById('newCreatorHandle').value.trim().toLowerCase();
+  if (!handle) return;
+  const host = handle.includes('.') ? handle : handle + '.' + creatorBaseDomain();
+  await issueCreatorLink(host);
+  loadCreatorList();
+}
+async function issueCreatorLink(host) {
+  try {
+    const hdr = { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' };
+    await fetch('/admin/provision', { method:'POST', headers: hdr, body: JSON.stringify({ host }) });
+    const d = await fetch('/admin/creator/mint-claim', { method:'POST', headers: hdr, body: JSON.stringify({ host }) }).then(r => r.json());
+    if (d.claimCode) {
+      _lastCreatorLink = 'https://' + host + '/?claim=' + d.claimCode;
+      document.getElementById('creatorLink').textContent = _lastCreatorLink;
+      document.getElementById('creatorLinkBox').style.display = 'block';
+      toast('invite link ready');
+    } else toast(d.error || 'failed');
+  } catch(e) { toast('failed'); }
+}
+function copyCreatorLink() {
+  (navigator.clipboard ? navigator.clipboard.writeText(_lastCreatorLink) : Promise.reject())
+    .then(() => toast('link copied')).catch(() => toast('copy this link manually'));
+}
 
 // ── PUBLISH MODAL ─────────────────────────────────────────────
 function closePublish() {
@@ -3728,6 +5150,10 @@ function commitSwipe() {
     refreshCurrentInteractions();
     preloadAdjacent();
     updateIndicators();
+    maybeShowFeedAd();
+    prefetchUpcoming();
+    const cur = nodeGraph[nodeIndex];
+    if (cur.feed && cur.postIndex >= cur.feed.length - 5) loadMorePosts(cur);
   }, 290);
 }
 
@@ -3753,6 +5179,45 @@ function cancelGesture() {
 }
 
 // ── INIT ─────────────────────────────────────────────────────
+// ── BACK-GESTURE NAVIGATION ──────────────────────────────────
+// One history sentinel, re-armed after every pop: back-swipe closes the topmost
+// overlay instead of the app. On the bare feed, back twice within 2s exits.
+function closeTopOverlay() {
+  const vis = id => { const el = document.getElementById(id); return el && el.classList.contains('show'); };
+  const shut = id => document.getElementById(id).classList.remove('show');
+  // modals that stack above everything (z 130)
+  if (vis('liveViewersModal')) { closeLiveViewers(); return true; }
+  if (vis('streamHistoryModal')) { closeStreamHistory(); return true; }
+  if (vis('creatorsModal')) { closeCreators(); return true; }
+  if (vis('importModal')) { closeImport(); return true; }
+  if (vis('nameModal')) { closeNameModal(); return true; }
+  if (document.getElementById('liveModal').style.display === 'flex') {
+    if (vis('prerollSheet')) { closePrerollSheet(); return true; }
+    // a stray edge-swipe must never end a running broadcast
+    const endBtn = document.getElementById('liveBtnEnd');
+    if (liveBroadcaster && endBtn && endBtn.style.display !== 'none') { toast('Use End Live to stop streaming'); return true; }
+    closeLiveModal(); return true;
+  }
+  const order = [
+    ['commentsSheet', closeComments], ['searchModal', () => shut('searchModal')],
+    ['unlockModal', closeUnlock], ['publishModal', closePublish],
+    ['prerollSheet', closePrerollSheet], ['earningsSheet', () => shut('earningsSheet')],
+    ['inboxSheet', closeInbox], ['editProfileSheet', closeEditProfile],
+    ['profileSheet', closeProfile],
+  ];
+  for (const pair of order) { if (vis(pair[0])) { pair[1](); return true; } }
+  return false;
+}
+let _exitArmedAt = 0;
+history.pushState({ sn: 1 }, '');
+window.addEventListener('popstate', () => {
+  if (closeTopOverlay()) { history.pushState({ sn: 1 }, ''); return; } // re-arm the sentinel
+  // bare feed: first back warns, a second within 2s leaves naturally (sentinel consumed)
+  _exitArmedAt = Date.now();
+  toast('Swipe back again to exit');
+  setTimeout(() => { if (Date.now() - _exitArmedAt >= 2000) history.pushState({ sn: 1 }, ''); }, 2100);
+});
+
 (async () => {
   await restoreCreator();
   await loadNode(nodeGraph[0]);
@@ -3760,9 +5225,43 @@ function cancelGesture() {
   updateIndicators();
   initNetwork();
   preloadAdjacent();
+  // First visit: show how to navigate, once (pointer-events:none, auto-dismisses)
+  if (!localStorage.getItem('hintSeen')) {
+    localStorage.setItem('hintSeen', '1');
+    const hint = document.getElementById('swipeHint');
+    hint.style.display = 'flex';
+    const hide = () => { hint.style.display = 'none'; };
+    setTimeout(hide, 3500);
+    stage.addEventListener('touchstart', hide, { once: true });
+  }
+  // Keep the current creator's live state fresh so the "tap to watch" badge appears/disappears
+  setInterval(() => {
+    const n = nodeGraph[nodeIndex];
+    if (!n || !n.loaded) return;
+    fetch((n.url || '') + '/live/status.json').then(r => r.json()).then(s => {
+      const was = !!(n.liveStatus && n.liveStatus.active);
+      n.liveStatus = s;
+      if (was !== !!(s && s.active)) {
+        // never re-render (and start card videos) under the live overlay — defer to close
+        if (feedCovered()) _pendingLiveRerender = true;
+        else renderCurrent();
+      }
+    }).catch(() => {});
+  }, 60000);
   if (isCreator) {
     pollInboxBadge();
     setInterval(pollInboxBadge, 60000);
+  }
+  // Invite deep-link: ?claim=CODE → open the claim form with the code prefilled (one-step onboarding)
+  if (!isCreator) {
+    const claim = new URLSearchParams(location.search).get('claim');
+    if (claim) {
+      document.getElementById('unlockModal').classList.add('show');
+      document.getElementById('claimForm').style.display = 'block';
+      document.getElementById('claimCode').value = claim;
+      setTimeout(() => document.getElementById('claimPw').focus(), 150);
+      history.replaceState(null, '', location.pathname); // strip the code from the URL bar
+    }
   }
 })();
 </script>

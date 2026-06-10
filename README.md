@@ -27,3 +27,6 @@ To stream, create a **Cloudflare Realtime** app and add `CALLS_APP_ID` + `CALLS_
 
 ## Hosting others (and earning)
 Point a wildcard domain (`*.yourdomain.com`) at your Worker to host other creators as subdomains. Hosts earn the ad revenue on their domain — see the network docs.
+
+## Building on the protocol
+Every node exposes a clean, CORS-enabled JSON API — the embedded app is just another client of it, with no private seams. Custom dashboards, creator portals, mobile/TV clients, and sponsor-auditable impression stats are all built against the same surface. See **[PROTOCOL.md](PROTOCOL.md)**.
