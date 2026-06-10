@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.6.0';
+const PROTOCOL_VERSION = '0.7.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -922,6 +922,12 @@ async function handleRequest(request, storage, env, ctx) {
       headers: { 'Content-Type': 'application/xml', 'Cache-Control': 'public, max-age=600' },
     });
   }
+  // Node policies: acceptable use, reporting/takedown process, privacy, import rights.
+  // Served per-node so every fork ships its operator's obligations with the software.
+  if (path === '/legal') {
+    const profile = (await storage.get('profile')) || {};
+    return html(renderLegalPage(subdomain, profile.displayName || subdomain.split('.')[0]));
+  }
   // ---- protocol surface ----
   if (path === '/.well-known/node.json') {
     return jsonCors({
@@ -1011,6 +1017,64 @@ async function handleRequest(request, storage, env, ctx) {
       await storage.set('inbox:notifications', notifs);
     }
     return jsonCors({ ok: true, pending: true });
+  }
+
+  // ---- public content report (moderation) ----
+  // Anyone can flag content on this node. The report lands in THIS node's inbox (the
+  // creator/host must act on notice — Canadian notice regimes) AND is escalated to the
+  // network root's inbox (root operator's visibility + registry-ejection power; for CSAM
+  // the operator has a statutory reporting duty). Rate-limited; no auth by design.
+  if (path === '/report' && request.method === 'POST') {
+    if (!(await rlAllowed('report', 5, 600000))) return jsonCors({ error: 'rate limited' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const notif = {
+      id: crypto.randomUUID(), type: 'report',
+      reason: REPORT_REASONS.includes(b.reason) ? b.reason : 'other',
+      postId: String(b.postId || '').slice(0, 60),
+      details: String(b.details || '').slice(0, 1000),
+      subdomain, at: new Date().toISOString(), read: false,
+    };
+    const notifs = (await storage.get('inbox:notifications')) || [];
+    notifs.unshift(notif);
+    if (notifs.length > 100) notifs.splice(100);
+    await storage.set('inbox:notifications', notifs);
+    if (!isRoot(identity)) {
+      // Same-worker root → write its inbox directly (a self-fetch would 522, see request-join).
+      const rootStore = makeStorage(env, NETWORK_ROOT_HOST);
+      const rootIdentity = await rootStore.get('identity');
+      if (rootIdentity && isRoot(rootIdentity)) {
+        const rn = (await rootStore.get('inbox:notifications')) || [];
+        rn.unshift(notif);
+        if (rn.length > 100) rn.splice(100);
+        await rootStore.set('inbox:notifications', rn);
+      } else {
+        try {
+          await fetch('https://' + NETWORK_ROOT_HOST + '/protocol/report', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host: subdomain, postId: notif.postId, reason: notif.reason, details: notif.details }),
+          });
+        } catch (e) {}
+      }
+    }
+    return jsonCors({ ok: true });
+  }
+  // Root-side ingest for reports escalated from separate-worker nodes.
+  if (path === '/protocol/report' && request.method === 'POST') {
+    if (!isRoot(identity)) return jsonCors({ error: 'this node is not the network root' }, 403);
+    if (!(await rlAllowed('report', 10, 600000))) return jsonCors({ error: 'rate limited' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const notifs = (await storage.get('inbox:notifications')) || [];
+    notifs.unshift({
+      id: crypto.randomUUID(), type: 'report',
+      reason: REPORT_REASONS.includes(b.reason) ? b.reason : 'other',
+      postId: String(b.postId || '').slice(0, 60),
+      details: String(b.details || '').slice(0, 1000),
+      subdomain: String(b.host || '').slice(0, 100).toLowerCase(),
+      at: new Date().toISOString(), read: false,
+    });
+    if (notifs.length > 100) notifs.splice(100);
+    await storage.set('inbox:notifications', notifs);
+    return jsonCors({ ok: true });
   }
 
   // ---- public profile ----
@@ -1992,6 +2056,63 @@ function buildSeo({ origin, subdomain, profile, feed, post }) {
   return { head, noscript: '<noscript>' + noscript + '</noscript>', postId: post ? post.id : '' };
 }
 
+// ---- node policies page (/legal) ----
+const REPORT_REASONS = ['csam', 'ncii', 'hate', 'harassment', 'copyright', 'defamation', 'other'];
+
+function renderLegalPage(subdomain, name) {
+  const h = escapeHtml(subdomain), n = escapeHtml(name);
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Policies — ${h}</title>
+<style>
+body{background:#000;color:rgba(255,255,255,0.85);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.65;max-width:680px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:22px;color:#fff}h2{font-size:16px;color:#fff;margin-top:32px}
+a{color:#20D5EC}p,li{font-size:14px}code{background:rgba(255,255,255,0.1);padding:1px 5px;border-radius:4px;font-size:13px}
+.muted{color:rgba(255,255,255,0.45);font-size:12px}
+</style></head><body>
+<h1>Policies &amp; reporting — ${n} (${h})</h1>
+<p class="muted">This node runs the open-source <a href="https://github.com/aitchisonpeter/social-node">Social Node</a> software. The operator of this hostname is responsible for the content it serves and for acting on the reports below.</p>
+
+<h2>Acceptable use</h2>
+<p>Content on this node must be legal where the node is operated. The following is removed on notice, and gets the poster removed for repeat or serious cases:</p>
+<ul>
+<li><strong>Child sexual abuse material</strong> — removed immediately and reported to authorities. Not negotiable.</li>
+<li><strong>Intimate images shared without consent</strong> — removed immediately.</li>
+<li>Hate propaganda or incitement to violence.</li>
+<li>Targeted harassment or threats.</li>
+<li>Content that infringes someone else's copyright (see imported content, below).</li>
+<li>Defamatory content, on notice.</li>
+</ul>
+
+<h2>How to report</h2>
+<p>Use the flag button on any post in the app, or send <code>POST /report</code> to this node with <code>{"postId","reason","details"}</code>. Reports go to this node's operator <em>and</em> to the network root operator. You don't need an account.</p>
+<p>If you are reporting child sexual abuse material you can also report directly to <a href="https://www.cybertip.ca">Cybertip.ca</a> or your local police.</p>
+
+<h2>Takedown process</h2>
+<ul>
+<li>Reports land in the operator's inbox and are reviewed by a human.</li>
+<li>Illegal content (CSAM, non-consensual intimate images) is removed on sight; CSAM is reported to authorities as the law requires.</li>
+<li>Copyright complaints: include the work, proof you hold rights, and the post link — the operator removes the content or forwards your notice to the poster (Canadian notice-and-notice).</li>
+<li>Defamation and other on-notice claims are actioned once the operator is made aware.</li>
+<li><strong>Network enforcement:</strong> nodes that won't moderate are removed from the network registry by the root operator. That removes them from cross-node discovery — their hostname and hosting are their own.</li>
+</ul>
+
+<h2>Privacy</h2>
+<p>This node collects almost nothing:</p>
+<ul>
+<li>No viewer accounts. Your display name and preferences live in your browser's local storage, on your device.</li>
+<li>The node stores what you submit: comments (with the name you chose), like counts keyed to a random per-device id, and reports.</li>
+<li>IP addresses are used transiently for rate-limiting and ad-impression deduping, in short rolling windows.</li>
+<li>No tracking pixels, no analytics scripts, no data sales.</li>
+</ul>
+
+<h2>Imported content</h2>
+<p>The import tools (e.g. TikTok export import) re-host <em>your</em> files on <em>this</em> node. Platform licences do not transfer — in particular, commercial music licensed to TikTok is <strong>not</strong> licensed here. You are responsible for holding the rights to everything you import. Rights-holder complaints follow the takedown process above.</p>
+
+<p class="muted" style="margin-top:40px"><a href="/">← back to ${n}</a></p>
+</body></html>`;
+}
+
 // ============================================================
 // PWA MANIFEST
 // ============================================================
@@ -2779,6 +2900,11 @@ ${s.noscript || ''}
       and pick the <strong>user_data*.json</strong> file here. Your videos import with their original
       captions and dates — fresh exports work best (video links inside expire).
     </p>
+    <p style="font-size:12px;color:rgba(255,255,255,0.45);line-height:1.6;margin-bottom:14px">
+      ⚠️ Only import what you have the rights to re-host. TikTok's music licences do <strong>not</strong>
+      transfer with your videos — commercial soundtracks become your responsibility here.
+      <a href="/legal" target="_blank" style="color:#20D5EC">Details</a>
+    </p>
     <input type="file" id="importFile" accept=".json,application/json" style="display:none" onchange="onImportFile(this.files[0])">
     <button class="submit-btn" onclick="document.getElementById('importFile').click()">Choose export file…</button>
   </div>
@@ -2792,6 +2918,31 @@ ${s.noscript || ''}
     <div id="importErrors" style="font-size:12px;color:#FE2C55;margin-top:10px;max-height:25vh;overflow-y:auto"></div>
     <button class="btn-secondary" id="importCancelBtn" style="margin-top:12px" onclick="_importCancel=true">Cancel</button>
   </div>
+</div>
+
+<!-- Report content — public moderation flag, goes to the node operator + network root -->
+<div class="modal" id="reportModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Report this post</div>
+    <button class="modal-close" onclick="closeReport()">×</button>
+  </div>
+  <div class="field"><label>Reason</label>
+    <select id="reportReason" style="width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);color:#fff;padding:14px;border-radius:10px;font-size:16px">
+      <option value="other" selected>Something else</option>
+      <option value="csam">Child sexual abuse material</option>
+      <option value="ncii">Intimate images shared without consent</option>
+      <option value="hate">Hate speech or incitement</option>
+      <option value="harassment">Harassment or threats</option>
+      <option value="copyright">Copyright infringement</option>
+      <option value="defamation">Defamation</option>
+    </select></div>
+  <div class="field"><label>Details (optional)</label>
+    <textarea id="reportDetails" maxlength="1000" style="min-height:80px" placeholder="Anything that helps the operator act on this"></textarea></div>
+  <button class="submit-btn" style="background:#FE2C55" onclick="submitReport()">Send report</button>
+  <p style="margin-top:12px;font-size:12px;color:rgba(255,255,255,0.4);line-height:1.6">
+    Your report goes to this node's operator and the network root. No account needed.
+    <a href="/legal" target="_blank" style="color:#20D5EC">Policies &amp; reporting</a>
+  </p>
 </div>
 
 <!-- Live viewer list (+ mute moderation for the broadcaster) — opened from inside #liveModal (z 100) -->
@@ -3906,6 +4057,10 @@ function renderSidebar(node, item) {
       <button class="sidebar-btn" onclick="onShare()"><span class="sidebar-icon">↗</span></button>
       <div class="sidebar-label">Share</div>
     </div>
+    \${isSelf ? '' : \`<div class="sidebar-item">
+      <button class="sidebar-btn" onclick="openReport('\${sub}','\${id}')"><span class="sidebar-icon" style="font-size:20px;opacity:0.8">⚑</span></button>
+      <div class="sidebar-label">Report</div>
+    </div>\`}
   </div>\`;
 }
 
@@ -4243,6 +4398,34 @@ async function deleteComment(id) {
   } catch(e) {}
 }
 
+// ── REPORT CONTENT ────────────────────────────────────────────
+let _reportTarget = null;
+function openReport(sub, postId) {
+  _reportTarget = { sub, postId };
+  document.getElementById('reportDetails').value = '';
+  document.getElementById('reportReason').value = 'other';
+  document.getElementById('reportModal').classList.add('show');
+}
+function closeReport() { document.getElementById('reportModal').classList.remove('show'); }
+async function submitReport() {
+  if (!_reportTarget) return;
+  // the report goes to the node that HOSTS the content
+  const base = _reportTarget.sub === SELF_SUBDOMAIN ? '' : 'https://' + _reportTarget.sub;
+  try {
+    const r = await fetch(base + '/report', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        postId: _reportTarget.postId,
+        reason: document.getElementById('reportReason').value,
+        details: document.getElementById('reportDetails').value.trim(),
+      }),
+    });
+    if (!r.ok) throw new Error(r.status);
+    toast('Report sent to the operator');
+  } catch(e) { toast('Could not send report'); }
+  closeReport();
+}
+
 // ── DOUBLE-TAP LIKE ───────────────────────────────────────────
 let lastTap = 0;
 const stage = document.getElementById('stage');
@@ -4399,6 +4582,7 @@ function renderProfileBody(data, subdomain) {
       </div>
       \${bio ? \`<div class="profile-bio">\${esc(bio)}</div>\` : ''}
       \${joinBtn}\${adBtn}\${hostBtn}\${importBtn}\${algoBtn}\${selBtn}\${blockBtn}
+      <a href="\${pbase}/legal" target="_blank" style="display:inline-block;margin-top:12px;font-size:12px;color:rgba(255,255,255,0.4);text-decoration:underline">Policies &amp; reporting</a>
     </div>
     <div class="profile-grid">\${gridHtml || '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3);grid-column:1/-1">No posts yet</div>'}</div>
   \`;
@@ -4909,8 +5093,20 @@ function renderInbox(notifs) {
     let text = '';
     if (n.type === 'peer_connected') text = \`<strong>@\${esc(handle)}</strong> connected to your node\`;
     else if (n.type === 'join_request') text = \`<strong>@\${esc(handle)}</strong> wants to join your network\`;
+    else if (n.type === 'report') {
+      const rl = { csam: 'Child sexual abuse material', ncii: 'Non-consensual intimate images', hate: 'Hate speech / incitement', harassment: 'Harassment or threats', copyright: 'Copyright infringement', defamation: 'Defamation', other: 'Other' };
+      text = \`<strong style="color:#FE2C55">⚑ Content report</strong> on <strong>@\${esc(handle)}</strong> — \${rl[n.reason] || 'Other'}\`;
+    }
     else text = esc(n.type);
     let actions = '';
+    if (n.type === 'report') {
+      const det = n.details ? \`<div style="margin-top:4px;font-size:12px;color:rgba(255,255,255,0.55)">“\${esc(n.details)}”</div>\` : '';
+      const duty = n.reason === 'csam'
+        ? '<div style="margin-top:6px;font-size:12px;color:#FE2C55">If real: remove it, preserve evidence, and report to Cybertip.ca — a legal duty for the operator.</div>'
+        : n.reason === 'ncii' ? '<div style="margin-top:6px;font-size:12px;color:#FE2C55">Remove fast — criminal and provincial takedown laws apply.</div>' : '';
+      const view = n.postId ? \`<a href="https://\${esc(n.subdomain)}/p/\${esc(n.postId)}" target="_blank" onclick="event.stopPropagation()" style="display:inline-block;margin-top:6px;font-size:13px;color:#20D5EC">View reported post →</a>\` : '';
+      actions = det + duty + view;
+    }
     if (n.type === 'join_request') {
       if (n.resolved === 'approved') actions = '<div style="margin-top:6px;font-size:13px;color:#20D5EC">✓ Added to the network</div>';
       else if (n.resolved === 'denied') actions = '<div style="margin-top:6px;font-size:13px;color:rgba(255,255,255,0.4)">Request denied</div>';
@@ -5550,6 +5746,7 @@ function closeTopOverlay() {
   if (vis('streamHistoryModal')) { closeStreamHistory(); return true; }
   if (vis('creatorsModal')) { closeCreators(); return true; }
   if (vis('importModal')) { closeImport(); return true; }
+  if (vis('reportModal')) { closeReport(); return true; }
   if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }
   if (document.getElementById('liveModal').style.display === 'flex') {

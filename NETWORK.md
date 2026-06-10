@@ -41,5 +41,6 @@ The model: **the ad slot belongs to the node being viewed, and the host owns it.
 Running a node means hosting content on infrastructure you control, under your name:
 
 - You are responsible for what your node (and your hosted creators) serve, under the laws that apply to you.
+- Every node ships a **report button** (`POST /report`) and a policies page (`/legal`). Reports land in your inbox AND the root's — read yours, act on notice, and treat CSAM/NCII reports as drop-everything (in many jurisdictions, including Canada, reporting CSAM to authorities is a legal duty for service operators).
 - The root operator moderates *network membership*, not your node. Registry removal is the network's only enforcement tool.
 - Imported content (e.g. the TikTok importer) is content you chose to host — licensing for music and other third-party material in it is on you.

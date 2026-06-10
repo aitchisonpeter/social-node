@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.6.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.7.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -68,6 +68,21 @@ For link sharing and crawlers — these serve HTML/text, not JSON:
 - `GET /` — node-level meta (profile bio, avatar) + a crawler-readable list of recent post links.
 - `GET /robots.txt` — allows all, disallows `/admin/` and `/auth/`, points at the sitemap.
 - `GET /sitemap.xml` — homepage + every `/p/<id>` URL with `lastmod`.
+- `GET /legal` (added 0.7.0) — the node's policies page: acceptable use, how to report, takedown process, privacy, imported-content rights.
+
+---
+
+## Moderation (added 0.7.0)
+
+### `POST /report`
+Flag content on the node you send it to. Public, no auth, rate-limited (5/10min/IP → `429`).
+```json
+{ "postId": "<uuid, optional>", "reason": "csam|ncii|hate|harassment|copyright|defamation|other", "details": "<≤1000 chars, optional>" }
+```
+→ `{ "ok": true }`. The report lands in that node's operator inbox **and** is escalated to the network root's inbox — moderation failures are visible at the network level, and registry removal is the enforcement tool (see `/legal`).
+
+### `POST /protocol/report` (root only)
+The escalation ingest: `{ "host", "postId", "reason", "details" }`. Non-root nodes answer `403`. Clients should use `/report` on the content's node, not this.
 
 ---
 

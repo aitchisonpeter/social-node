@@ -31,7 +31,7 @@ Point a wildcard domain (`*.yourdomain.com`) at your Worker to host other creato
 
 ## Honest limits (read before announcing your node)
 - **There is no payment rail.** The ad ledger tracks impressions and what's owed at your configured CPM; actually invoicing sponsors and paying creators is between you and them, off-platform.
-- **You are the host.** Content your node serves is your responsibility, including the legal duties that come with hosting user content in your jurisdiction.
+- **You are the host.** Content your node serves is your responsibility, including the legal duties that come with hosting user content in your jurisdiction. Every node ships a report button and a `/legal` policies page — reports arrive in your in-app inbox; read it and act on notice.
 - **Live streaming bills your Cloudflare account** (Realtime usage). The app shows per-stream cost estimates, but the meter is yours.
 - **Membership is moderated.** The network is whatever the root signs — joining needs approval, and nodes can be removed from the registry.
 
