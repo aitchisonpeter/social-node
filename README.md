@@ -7,8 +7,9 @@ A sovereign, TikTok-style social app that runs as a **single Cloudflare Worker**
 ## What you get
 - Your own node on **your** Cloudflare account (the free tier is enough to start)
 - Storage (KV + R2) and the live-streaming engine (Durable Object) **provisioned automatically**
-- Likes, comments, profiles, a vertical video/photo/text feed, and live streaming
-- Auto-joins the network — host your own creators and earn the ad revenue on your domain
+- Likes, comments, profiles, a vertical video/photo/text feed, live streaming, TikTok import, per-post permalinks with proper link unfurls
+- One-tap **Join the network** (a human — the root operator — approves new members; see [NETWORK.md](NETWORK.md))
+- Host other creators on your domain and run your own sponsor ads
 
 ## Deploy (~3 clicks)
 1. Click **Deploy to Cloudflare** above and sign in (a free account works).
@@ -26,7 +27,13 @@ A sovereign, TikTok-style social app that runs as a **single Cloudflare Worker**
 To stream, create a **Cloudflare Realtime** app and add `CALLS_APP_ID` + `CALLS_APP_SECRET` as secrets to your Worker. Everything except live works without them.
 
 ## Hosting others (and earning)
-Point a wildcard domain (`*.yourdomain.com`) at your Worker to host other creators as subdomains. Hosts earn the ad revenue on their domain — see the network docs.
+Point a wildcard domain (`*.yourdomain.com`) at your Worker to host other creators as subdomains. The host owns the ad slot on their domain and shares revenue with their creators — how this works (and what doesn't exist yet) is in **[NETWORK.md](NETWORK.md)**.
+
+## Honest limits (read before announcing your node)
+- **There is no payment rail.** The ad ledger tracks impressions and what's owed at your configured CPM; actually invoicing sponsors and paying creators is between you and them, off-platform.
+- **You are the host.** Content your node serves is your responsibility, including the legal duties that come with hosting user content in your jurisdiction.
+- **Live streaming bills your Cloudflare account** (Realtime usage). The app shows per-stream cost estimates, but the meter is yours.
+- **Membership is moderated.** The network is whatever the root signs — joining needs approval, and nodes can be removed from the registry.
 
 ## Building on the protocol
 Every node exposes a clean, CORS-enabled JSON API — the embedded app is just another client of it, with no private seams. Custom dashboards, creator portals, mobile/TV clients, and sponsor-auditable impression stats are all built against the same surface. See **[PROTOCOL.md](PROTOCOL.md)**.

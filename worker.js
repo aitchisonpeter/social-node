@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.5.0';
+const PROTOCOL_VERSION = '0.6.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -623,7 +623,97 @@ async function ensureIdentity(storage) {
 
 async function getPeers(storage) { return (await storage.get('peers')) || []; }
 async function getAncestors(storage) { return (await storage.get('ancestors')) || []; }
-async function getFeed(storage) { return (await storage.get('feed')) || []; }
+// ---- feed storage: sharded across KV chunk keys ----
+// The old layout was ONE unbounded array under 'feed' — capped at KV's 25MB value limit
+// and fully rewritten on every publish/delete. Now: 'feedIndex' holds a small manifest
+// { v:1, total, chunks:[{n,count},...] } (newest-first, n descending) and each
+// 'feed:c:<n>' holds up to FEED_CHUNK_SIZE posts, newest-first. Chunks are anchored at
+// the OLDEST end (chunk 0 = the oldest posts), so old chunks' contents are position-stable
+// and a publish only ever rewrites the head chunk + index. The feed.json contract is
+// unchanged — this is internal layout only.
+const FEED_CHUNK_SIZE = 200; // worst-case post ~6KB (5000-char transcript) → ~1.2MB/chunk
+
+function chunkFeed(feed) {
+  const total = feed.length;
+  const chunks = []; // [{n, items}] newest-first (n = top..0)
+  for (let n = total ? Math.floor((total - 1) / FEED_CHUNK_SIZE) : -1; n >= 0; n--) {
+    const end = total - n * FEED_CHUNK_SIZE;
+    chunks.push({ n, items: feed.slice(Math.max(0, end - FEED_CHUNK_SIZE), end) });
+  }
+  return chunks;
+}
+
+async function getFeed(storage) {
+  const idx = await storage.get('feedIndex');
+  if (idx && Array.isArray(idx.chunks)) {
+    const parts = await Promise.all(idx.chunks.map(c => storage.get('feed:c:' + c.n)));
+    // Snapshot each chunk's JSON at read time (before callers mutate items in place) so
+    // saveFeed can diff and write only the chunks that actually changed.
+    const snap = {}, feed = [];
+    idx.chunks.forEach((c, i) => {
+      const items = parts[i] || [];
+      snap[c.n] = JSON.stringify(items);
+      for (const it of items) feed.push(it);
+    });
+    storage._feedSnap = snap;
+    return feed;
+  }
+  const legacy = (await storage.get('feed')) || [];
+  // Lazy one-time migration to the sharded layout. Idempotent (concurrent first reads
+  // write identical chunks) and fail-safe: on error the legacy key is untouched and
+  // still serves. The pre-sharding value is kept as a rollback backup.
+  try { await saveFeed(storage, legacy, { migrating: true }); } catch (e) {}
+  return legacy;
+}
+
+async function saveFeed(storage, feed, opts) {
+  const chunks = chunkFeed(feed);
+  const snap = storage._feedSnap || {}; // empty snap (no prior chunked read) → write everything
+  const newSnap = {};
+  for (const c of chunks) {
+    const json = JSON.stringify(c.items);
+    newSnap[c.n] = json;
+    if (snap[c.n] !== json) await storage.set('feed:c:' + c.n, c.items);
+  }
+  await storage.set('feedIndex', { v: 1, total: feed.length, chunks: chunks.map(c => ({ n: c.n, count: c.items.length })) });
+  // Stale chunks (bulk delete shrank the feed) go AFTER the index write, so a racing
+  // reader holding the old index never dereferences a deleted chunk.
+  for (const n of Object.keys(snap)) {
+    if (!(n in newSnap)) await storage.delete('feed:c:' + n);
+  }
+  storage._feedSnap = newSnap;
+  if (opts && opts.migrating) {
+    if (feed.length) await storage.set('feed:presharding-backup', feed);
+    await storage.delete('feed');
+  }
+}
+
+// Serve a window of the feed reading only the chunks that cover it (feed.json ?limit=&offset=
+// is every client's boot path — a 30-post page shouldn't load a 10,000-post history).
+async function getFeedPage(storage, offset, limit) {
+  const idx = await storage.get('feedIndex');
+  if (!idx || !Array.isArray(idx.chunks)) {
+    const feed = await getFeed(storage); // legacy (triggers migration)
+    return { total: feed.length, items: feed.slice(offset, offset + limit) };
+  }
+  const wanted = [];
+  let pos = 0;
+  for (const c of idx.chunks) {
+    if (pos < offset + limit && pos + c.count > offset) wanted.push({ n: c.n, pos });
+    pos += c.count;
+  }
+  const parts = await Promise.all(wanted.map(c => storage.get('feed:c:' + c.n)));
+  let items = [];
+  for (const p of parts) items = items.concat(p || []);
+  const start = wanted.length ? wanted[0].pos : 0;
+  return { total: idx.total || 0, items: items.slice(offset - start, offset - start + limit) };
+}
+
+async function getFeedTotal(storage) {
+  const idx = await storage.get('feedIndex');
+  if (idx && Array.isArray(idx.chunks)) return idx.total || 0;
+  return (await getFeed(storage)).length;
+}
 
 async function addPeer(storage, peer) {
   const peers = await getPeers(storage);
@@ -674,6 +764,19 @@ async function registrySigned(env, identity, subdomain) {
 // ROUTING
 // ============================================================
 
+// Per-isolate memory cache for hot, rarely-changing KV values (provisioned list, tenant
+// identities). Isolates persist across requests, so this turns a KV read per request into
+// one per TTL per isolate — the difference between blowing the KV budget and ignoring it.
+const _memCache = new Map();
+function memGet(key, ttlMs) {
+  const e = _memCache.get(key);
+  return e && Date.now() - e.at < ttlMs ? e.v : undefined;
+}
+function memSet(key, v) {
+  if (_memCache.size > 500) _memCache.clear(); // crude bound; entries are tiny
+  _memCache.set(key, { v, at: Date.now() });
+}
+
 async function handleRequest(request, storage, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -685,43 +788,11 @@ async function handleRequest(request, storage, env, ctx) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  // ---- provisioning gate (wildcard auto-create protection) ----
-  // A wildcard host auto-creates a tenant on first hit, which is an open mint surface.
-  // Opt-in: while the provisioned list is EMPTY the gate is off (backward compatible —
-  // simple/forked deploys keep auto-create). Once any host is provisioned, only allowed
-  // hosts serve/auto-create. Always allowed: the network root + any registry member
-  // (real nodes never get locked out). Unknown hosts 404 BEFORE ensureIdentity → no KV write.
-  const provisioned = (await gstore.get('provisioned')) || [];
-  if (provisioned.length > 0 && subdomain !== NETWORK_ROOT_HOST && !provisioned.includes(subdomain)) {
-    const regMembers = (await gstore.get('registry:members')) || [];
-    if (!regMembers.find(m => m.subdomain === subdomain)) {
-      return html(renderUnclaimed(subdomain), 404);
-    }
-  }
-
-  const identity = await ensureIdentity(storage);
-
-  // ---- PWA files ----
-  if (path === '/' || path === '/index.html') {
-    return html(renderApp({ identity, subdomain }));
-  }
-  if (path === '/manifest.json') {
-    return json(renderManifest(subdomain));
-  }
-  if (path === '/sw.js') {
-    return new Response(renderServiceWorker(), {
-      headers: { 'Content-Type': 'application/javascript' },
-    });
-  }
-  if (path === '/icon.svg') {
-    return new Response(renderIcon(), {
-      headers: { 'Content-Type': 'image/svg+xml' },
-    });
-  }
-
-  // ---- media serving (public) ----
+  // ---- media serving (public, FAST PATH — before the gate and ensureIdentity) ----
+  // Media uses neither KV nor identity (R2 keys are immutable UUIDs), and video playback
+  // fires storms of range requests — keeping it above the gate means zero KV reads here.
   // Range support is required for iOS Safari video playback/seeking; full responses are
-  // edge-cached (keys are immutable UUIDs) so repeat views don't hit R2 or burn Worker CPU.
+  // edge-cached so repeat views don't hit R2 or burn Worker CPU.
   if (path.startsWith('/media/') && request.method === 'GET') {
     if (!env.NODE_MEDIA) return new Response('R2 not configured', { status: 503 });
     const key = path.slice(7);
@@ -777,6 +848,80 @@ async function handleRequest(request, storage, env, ctx) {
     return new Response(object.body, { headers });
   }
 
+  // Static app files — no KV/identity needed, also served before the gate.
+  if (path === '/sw.js') {
+    return new Response(renderServiceWorker(), {
+      headers: { 'Content-Type': 'application/javascript' },
+    });
+  }
+  if (path === '/icon.svg') {
+    return new Response(renderIcon(), {
+      headers: { 'Content-Type': 'image/svg+xml' },
+    });
+  }
+  if (path === '/manifest.json') {
+    return json(renderManifest(subdomain));
+  }
+
+  // ---- provisioning gate (wildcard auto-create protection) ----
+  // A wildcard host auto-creates a tenant on first hit, which is an open mint surface.
+  // Opt-in: while the provisioned list is EMPTY the gate is off (backward compatible —
+  // simple/forked deploys keep auto-create). Once any host is provisioned, only allowed
+  // hosts serve/auto-create. Always allowed: the network root + any registry member
+  // (real nodes never get locked out). Unknown hosts 404 BEFORE ensureIdentity → no KV write.
+  // The list is isolate-cached 60s: it changes rarely, and reading it from KV on every
+  // request was the bulk of the worker's KV bill. Provision/unprovision can take up to
+  // 60s per isolate to be seen — acceptable.
+  let provisioned = memGet('prov', 60000);
+  if (provisioned === undefined) {
+    provisioned = (await gstore.get('provisioned')) || [];
+    memSet('prov', provisioned);
+  }
+  if (provisioned.length > 0 && subdomain !== NETWORK_ROOT_HOST && !provisioned.includes(subdomain)) {
+    const regMembers = (await gstore.get('registry:members')) || [];
+    if (!regMembers.find(m => m.subdomain === subdomain)) {
+      return html(renderUnclaimed(subdomain), 404);
+    }
+  }
+
+  // Identity is immutable once minted → cache it per tenant in isolate memory (5 min)
+  // instead of a KV read per request. Only successful identities are cached, so a new
+  // tenant's first-visit creation still runs.
+  let identity = memGet('id:' + subdomain, 300000);
+  if (!identity) {
+    identity = await ensureIdentity(storage);
+    if (identity && identity.publicKey) memSet('id:' + subdomain, identity);
+  }
+
+  // ---- PWA files ----
+  if (path === '/' || path === '/index.html') {
+    const profile = (await storage.get('profile')) || {};
+    const feed = await getFeed(storage);
+    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed }) }));
+  }
+  // Per-post permalink: same app, but with post-specific OG meta so shares unfurl,
+  // plus a crawler-readable noscript body. The client deep-links to the post on boot.
+  if (path.startsWith('/p/') && request.method === 'GET') {
+    const feed = await getFeed(storage);
+    const post = feed.find(i => i.id === path.slice(3));
+    if (!post) return Response.redirect(url.origin + '/', 302); // deleted/stale link → profile
+    const profile = (await storage.get('profile')) || {};
+    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed, post }) }));
+  }
+  if (path === '/robots.txt') {
+    return new Response('User-agent: *\nAllow: /\nDisallow: /admin/\nDisallow: /auth/\n\nSitemap: ' + url.origin + '/sitemap.xml\n', {
+      headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'public, max-age=3600' },
+    });
+  }
+  if (path === '/sitemap.xml') {
+    const feed = await getFeed(storage);
+    const urls = ['<url><loc>' + url.origin + '/</loc></url>']
+      .concat(feed.map(i => '<url><loc>' + url.origin + '/p/' + i.id + '</loc>'
+        + (i.createdAt ? '<lastmod>' + i.createdAt.slice(0, 10) + '</lastmod>' : '') + '</url>'));
+    return new Response('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.join('') + '</urlset>', {
+      headers: { 'Content-Type': 'application/xml', 'Cache-Control': 'public, max-age=600' },
+    });
+  }
   // ---- protocol surface ----
   if (path === '/.well-known/node.json') {
     return jsonCors({
@@ -788,20 +933,27 @@ async function handleRequest(request, storage, env, ctx) {
     });
   }
   if (path === '/.well-known/feed.json') {
-    const feed = await getFeed(storage);
     const profile = (await storage.get('profile')) || {};
     // Optional pagination (?limit=&offset=) so big accounts don't ship their whole
-    // history on every boot. No params → full feed (backward compatible).
+    // history on every boot. No params → full feed (backward compatible). Paged
+    // requests only read the KV chunks that cover the window.
     const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit')) || 0, 0), 100);
     const offset = Math.max(parseInt(url.searchParams.get('offset')) || 0, 0);
+    let total, items;
+    if (limit) {
+      ({ total, items } = await getFeedPage(storage, offset, limit));
+    } else {
+      items = await getFeed(storage);
+      total = items.length;
+    }
     return jsonCors({
       subdomain,
       publicKey: identity.publicKey,
       displayName: profile.displayName || '',
       avatarUrl: profile.avatarUrl || null,
-      total: feed.length,
+      total,
       offset,
-      items: limit ? feed.slice(offset, offset + limit) : feed,
+      items,
     });
   }
   if (path === '/.well-known/peers.json') {
@@ -837,29 +989,8 @@ async function handleRequest(request, storage, env, ctx) {
     });
   }
 
-  // ---- peer protocol ----
-  if (path === '/protocol/announce' && request.method === 'POST') {
-    const body = await request.json();
-    const msg = JSON.parse(body.message);
-    const valid = await verify(msg.publicKey, body.signature, body.message);
-    if (!valid) return json({ error: 'invalid signature' }, 400);
-    await addPeer(storage, { publicKey: msg.publicKey, subdomain: msg.subdomain });
-    // inbox notification
-    const notifs = (await storage.get('inbox:notifications')) || [];
-    notifs.unshift({ id: crypto.randomUUID(), type: 'peer_connected', subdomain: msg.subdomain, publicKey: msg.publicKey, at: new Date().toISOString(), read: false });
-    if (notifs.length > 100) notifs.splice(100);
-    await storage.set('inbox:notifications', notifs);
-    return json({
-      welcome: true,
-      ancestor: { publicKey: identity.publicKey, subdomain },
-      peerCount: (await getPeers(storage)).length,
-    });
-  }
-
-  if (path === '/protocol/peers' && request.method === 'GET') {
-    const peers = await getPeers(storage);
-    return json({ peers: peers.map(p => ({ publicKey: p.publicKey, subdomain: p.subdomain })) });
-  }
+  // /protocol/announce + /protocol/peers REMOVED 2026-06-10 (legacy pre-registry bootstrap,
+  // unauthenticated writers — see PROTOCOL.md legacy section). Membership = the signed registry.
 
   // ---- network join request (sent to the root) ----
   if (path === '/protocol/join-request' && request.method === 'POST') {
@@ -885,7 +1016,6 @@ async function handleRequest(request, storage, env, ctx) {
   // ---- public profile ----
   if (path === '/profile.json') {
     const profile = (await storage.get('profile')) || {};
-    const feed = await getFeed(storage);
     // "peerCount" historically came from the dead local `peers` list (only ever written
     // by the legacy /protocol/announce bootstrap). In the registry era real membership is
     // the global signed registry, so report the network size instead — always > 0 for a member.
@@ -902,7 +1032,7 @@ async function handleRequest(request, storage, env, ctx) {
       displayName: profile.displayName || subdomain.split('.')[0],
       bio: profile.bio || '',
       avatarUrl: profile.avatarUrl || null,
-      postCount: feed.length,
+      postCount: await getFeedTotal(storage),
       peerCount: networkSize,
       networkSize,
       adsEnabled: !!(((await storage.get('ads')) || {}).enabled),
@@ -948,6 +1078,7 @@ async function handleRequest(request, storage, env, ctx) {
     const formData = await request.formData();
     const file = formData.get('file');
     if (!file) return json({ error: 'no file provided' }, 400);
+    if (file.size > 256 * 1024 * 1024) return json({ error: 'file too large (max 256MB)' }, 413); // same cap as import-url
 
     const ext = (file.name || '').split('.').pop().toLowerCase() || 'bin';
     const key = crypto.randomUUID() + '.' + ext;
@@ -971,7 +1102,12 @@ async function handleRequest(request, storage, env, ctx) {
     if (!srcUrl.startsWith('http://') && !srcUrl.startsWith('https://')) return json({ error: 'url required' }, 400);
     const feed = await getFeed(storage);
     const dup = feed.find(it => it.importedSrc === srcUrl);
-    if (dup) return json({ ok: true, dup: true, id: dup.id });
+    if (dup) {
+      // re-running an import can repair metadata (e.g. the 'N/A' titles an earlier parser kept)
+      const newTitle = String(b.title || '').slice(0, 300);
+      if (newTitle !== (dup.title || '')) { dup.title = newTitle; await saveFeed(storage, feed); }
+      return json({ ok: true, dup: true, id: dup.id });
+    }
 
     let res;
     try { res = await fetch(srcUrl, { redirect: 'follow' }); }
@@ -1010,7 +1146,7 @@ async function handleRequest(request, storage, env, ctx) {
     };
     feed.push(item);
     feed.sort((a, c) => (c.createdAt || '').localeCompare(a.createdAt || '')); // newest first
-    await storage.set('feed', feed);
+    await saveFeed(storage, feed);
     return json({ ok: true, published: item });
   }
 
@@ -1026,29 +1162,33 @@ async function handleRequest(request, storage, env, ctx) {
       body: content.body || '',
       mediaUrl: content.mediaUrl || null,
       mediaContentType: content.mediaContentType || null,
+      transcript: String(content.transcript || '').slice(0, 5000), // searchable text for media posts (OCR/captions later)
       importedFrom: content.importedFrom || 'native',
       createdAt: new Date().toISOString(),
       authorPublicKey: identity.publicKey,
     };
     feed.unshift(item);
-    await storage.set('feed', feed);
+    await saveFeed(storage, feed);
     return json({ published: item });
   }
 
   // ---- admin: delete an item ----
   if (path === '/admin/delete' && request.method === 'POST') {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
-    const { id } = await request.json();
+    // single {id} or bulk {ids:[...]} — one feed rewrite either way
+    const b = await request.json();
+    const ids = Array.isArray(b.ids) ? b.ids.slice(0, 500) : (b.id ? [b.id] : []);
+    if (!ids.length) return json({ error: 'id or ids required' }, 400);
+    const idSet = new Set(ids);
     const feed = await getFeed(storage);
-    const item = feed.find(i => i.id === id);
-    // optionally delete from R2 too
-    if (item && item.mediaUrl && env.NODE_MEDIA) {
-      const key = item.mediaUrl.replace('/media/', '');
-      await env.NODE_MEDIA.delete(key).catch(() => {});
+    for (const item of feed) {
+      if (idSet.has(item.id) && item.mediaUrl && env.NODE_MEDIA) {
+        await env.NODE_MEDIA.delete(item.mediaUrl.replace('/media/', '')).catch(() => {});
+      }
     }
-    const filtered = feed.filter(i => i.id !== id);
-    await storage.set('feed', filtered);
-    return json({ deleted: id });
+    const filtered = feed.filter(i => !idSet.has(i.id));
+    await saveFeed(storage, filtered);
+    return json({ deleted: feed.length - filtered.length });
   }
 
   // ---- admin: inherit from ancestor ----
@@ -1200,7 +1340,12 @@ async function handleRequest(request, storage, env, ctx) {
   }
 
   // ---- live: viewer subscribe session ----
+  // The three viewer endpoints below mint/drive PAID Calls sessions on the operator's
+  // account, with no auth (viewers are anonymous) — so they get a per-IP rate limit.
+  // A real join = 1 subscribe + 1 tracks + ~1 renegotiate; 30/min shared leaves headroom
+  // for reconnects while killing mint-in-a-loop abuse.
   if (path === '/live/subscribe' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
     const creds = await getCallsCreds(env, storage);
     if (!creds) return jsonCors({ error: 'not configured' }, 503);
     try {
@@ -1213,6 +1358,7 @@ async function handleRequest(request, storage, env, ctx) {
 
   // ---- live: viewer subscribe to tracks ----
   if (path === '/live/tracks' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
     const creds = await getCallsCreds(env, storage);
     if (!creds) return jsonCors({ error: 'not configured' }, 503);
     try {
@@ -1226,6 +1372,7 @@ async function handleRequest(request, storage, env, ctx) {
 
   // ---- live: viewer renegotiate ----
   if (path === '/live/renegotiate' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
     const creds = await getCallsCreds(env, storage);
     if (!creds) return jsonCors({ error: 'not configured' }, 503);
     const { subscriberSessionId, sessionDescription } = await request.json();
@@ -1615,6 +1762,7 @@ async function handleRequest(request, storage, env, ctx) {
       list = list.filter(h => h !== host);
     }
     await gstore.set('provisioned', list);
+    memSet('prov', list); // refresh this isolate immediately (others converge within 60s)
     return json({ ok: true, provisioned: list });
   }
 
@@ -1668,19 +1816,21 @@ async function handleRequest(request, storage, env, ctx) {
     return json({ ok: true, host, claimCode, claimUrl: 'https://' + host + '/', note: 'give the creator this code (shown once); they claim it at the URL and set their own password' });
   }
 
-  // Brute-force guard for the password endpoints: 10 attempts / 10 min / IP, tracked in
-  // this tenant's DO. Each attempt also burns 100k PBKDF2 iterations of OUR cpu — the
-  // limiter is as much a cost cap as a security one. Fails open (availability > lockout).
-  async function authAllowed() {
+  // Generic per-IP sliding-window limiter, tracked in this tenant's DO. Fails open
+  // (availability > lockout). Hoisted — callable from routes above this definition.
+  async function rlAllowed(prefix, max, windowMs) {
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     try {
       const r = await liveDO(env, subdomain, '/rl', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: 'auth:' + ip, max: 10, windowMs: 600000 }),
+        body: JSON.stringify({ key: prefix + ':' + ip, max, windowMs }),
       });
       return (await r.json()).allowed !== false;
     } catch (e) { return true; }
   }
+  // Brute-force guard for the password endpoints: 10 attempts / 10 min / IP. Each attempt
+  // also burns 100k PBKDF2 iterations of OUR cpu — as much a cost cap as a security one.
+  function authAllowed() { return rlAllowed('auth', 10, 600000); }
 
   // ---- creator self-service auth (Phase 2): claim a handle + password login → signed session ----
   if (path === '/auth/claim' && request.method === 'POST') {
@@ -1752,11 +1902,94 @@ async function callsApi(creds, method, path, body) {
 function html(content, status = 200) {
   return new Response(content, {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      // The SPA is one inline <script>/<style>, so 'unsafe-inline' stays — the win here is
+      // blocking foreign script/object injection, framing, and base/form hijacks. Media and
+      // avatars load cross-node (https:), upload previews use blob:, chat may use wss:.
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src https: data: blob:; media-src https: data: blob:; connect-src https: wss:; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+    },
   });
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ============================================================
+// SEO / SHARE-UNFURL
+// ============================================================
+// The app is a JS black box to link-unfurlers and non-JS crawlers, so the server
+// injects real OG/Twitter meta into <head> and a <noscript> body they can read.
+// Used for both the node page (/) and per-post permalinks (/p/<id>).
+
+function absUrl(origin, u) {
+  if (!u) return null;
+  return u.startsWith('http') ? u : origin + u;
+}
+
+function buildSeo({ origin, subdomain, profile, feed, post }) {
+  const name = profile.displayName || subdomain.split('.')[0];
+  const nodeDesc = (profile.bio || name + ' on Social Node — a sovereign social network').slice(0, 300);
+  const avatar = absUrl(origin, profile.avatarUrl) || origin + '/icon.svg';
+  const tags = [];
+  const tag  = (p, c) => tags.push('<meta property="' + p + '" content="' + escapeHtml(c) + '">');
+  const ntag = (n, c) => tags.push('<meta name="' + n + '" content="' + escapeHtml(c) + '">');
+  let title, desc, canonical, noscript;
+  if (post) {
+    const text = [post.title, post.body, post.transcript].filter(Boolean).join(' — ');
+    title = (post.title || (post.body || '').slice(0, 70) || 'A post') + ' — ' + name;
+    desc = (text || nodeDesc).slice(0, 300);
+    canonical = origin + '/p/' + post.id;
+    const media = absUrl(origin, post.mediaUrl);
+    if (post.type === 'video' && media) {
+      // No poster frames in storage — og:video carries the unfurl (Discord/Telegram/WhatsApp
+      // render the mp4 inline), avatar stands in as og:image.
+      tag('og:type', 'video.other');
+      tag('og:video', media);
+      tag('og:video:secure_url', media);
+      tag('og:video:type', post.mediaContentType || 'video/mp4');
+      tag('og:image', avatar);
+      ntag('twitter:card', 'summary');
+    } else if (post.type === 'photo' && media) {
+      tag('og:type', 'article');
+      tag('og:image', media);
+      ntag('twitter:card', 'summary_large_image');
+    } else {
+      tag('og:type', 'article');
+      tag('og:image', avatar);
+      ntag('twitter:card', 'summary');
+    }
+    noscript = '<h1>' + escapeHtml(post.title || name) + '</h1>'
+      + (post.body ? '<p>' + escapeHtml(post.body) + '</p>' : '')
+      + (post.transcript ? '<p>' + escapeHtml(post.transcript) + '</p>' : '')
+      + '<p><time datetime="' + escapeHtml(post.createdAt || '') + '">' + escapeHtml((post.createdAt || '').slice(0, 10)) + '</time></p>'
+      + '<p>By <a href="/">' + escapeHtml(name) + '</a> (' + escapeHtml(subdomain) + ')</p>';
+  } else {
+    title = name === subdomain.split('.')[0] ? subdomain : name + ' — ' + subdomain;
+    desc = nodeDesc;
+    canonical = origin + '/';
+    tag('og:type', 'profile');
+    tag('og:image', avatar);
+    ntag('twitter:card', 'summary');
+    const items = (feed || []).slice(0, 50).map(i =>
+      '<li><a href="/p/' + escapeHtml(i.id) + '">'
+      + escapeHtml(i.title || (i.body || '').slice(0, 80) || (i.createdAt || '').slice(0, 10) || 'post')
+      + '</a></li>').join('');
+    noscript = '<h1>' + escapeHtml(name) + '</h1>'
+      + (profile.bio ? '<p>' + escapeHtml(profile.bio) + '</p>' : '')
+      + (items ? '<ul>' + items + '</ul>' : '');
+  }
+  tag('og:title', title);
+  tag('og:description', desc);
+  tag('og:url', canonical);
+  tag('og:site_name', 'Social Node');
+  ntag('twitter:title', title);
+  ntag('twitter:description', desc);
+  const head = '<title>' + escapeHtml(title) + '</title>\n'
+    + '<meta name="description" content="' + escapeHtml(desc) + '">\n'
+    + '<link rel="canonical" href="' + escapeHtml(canonical) + '">\n'
+    + tags.join('\n');
+  return { head, noscript: '<noscript>' + noscript + '</noscript>', postId: post ? post.id : '' };
 }
 
 // ============================================================
@@ -1840,7 +2073,9 @@ function renderUnclaimed(subdomain) {
 </body></html>`;
 }
 
-function renderApp({ identity, subdomain }) {
+function renderApp({ identity, subdomain, seo }) {
+  const s = seo || {}; // absent in tests/harness — fall back to the plain title
+  const seoHead = s.head || ('<title>' + escapeHtml(subdomain) + '</title>');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1850,7 +2085,7 @@ function renderApp({ identity, subdomain }) {
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
-<title>${escapeHtml(subdomain)}</title>
+${seoHead}
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
@@ -1888,7 +2123,8 @@ input, textarea { font: inherit; }
 /* Media fill */
 .card-video .c-media,
 .card-photo .c-media { position: absolute; inset: 0; }
-.card-video .c-media video { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* contain, not cover — full frame at its real aspect ratio; top-anchored so the letterbox space is always at the bottom */
+.card-video .c-media video { width: 100%; height: 100%; object-fit: contain; object-position: top center; background: #000; display: block; }
 .card-photo .c-media img  { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 /* Gradient scrim */
@@ -2240,6 +2476,13 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
   position: absolute; bottom: 5px; left: 6px;
   font-size: 13px; text-shadow: 0 1px 4px rgba(0,0,0,0.8);
 }
+.profile-grid-item.sel { outline: 3px solid #FE2C55; outline-offset: -3px; opacity: 0.75; }
+.profile-grid-item.sel::after {
+  content: '✓'; position: absolute; top: 6px; left: 6px;
+  width: 22px; height: 22px; border-radius: 50%; background: #FE2C55;
+  color: #fff; font-size: 13px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
 .grid-del {
   position: absolute; top: 4px; right: 4px;
   width: 24px; height: 24px; border-radius: 50%;
@@ -2332,6 +2575,7 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
 </style>
 </head>
 <body>
+${s.noscript || ''}
 
 <div id="stage">
   <div id="panel-a" class="panel"></div>
@@ -2342,7 +2586,6 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
 <div class="heart-burst" id="heartBurst">❤️</div>
 
 <!-- Progress bar (post position) -->
-<div class="progress-segs" id="progressSegs"></div>
 
 <!-- First-visit hint (pointer-events:none — swipes pass through) -->
 <div id="swipeHint" style="display:none;position:fixed;inset:0;z-index:80;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;flex-direction:column;gap:16px;pointer-events:none">
@@ -2496,6 +2739,31 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
     <input id="liveChatInput" placeholder="Say something…" style="flex:1;background:rgba(255,255,255,0.15);border:none;border-radius:20px;padding:8px 16px;color:#fff;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')liveSendChat()">
     <button onclick="liveSendChat()" style="background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:20px;padding:8px 16px;font-size:14px">Send</button>
   </div>
+</div>
+
+<!-- Bulk-select action bar (own profile grid) -->
+<div id="selBar" style="display:none;position:fixed;bottom:0;left:0;right:0;z-index:120;background:rgba(18,18,18,0.97);border-top:1px solid rgba(255,255,255,0.1);padding:12px 16px calc(max(env(safe-area-inset-bottom),12px)) 16px;gap:10px;align-items:center">
+  <button class="btn-secondary" style="flex:1" onclick="toggleSelMode()">Cancel</button>
+  <button id="selDeleteBtn" class="submit-btn" style="flex:2;margin:0;background:#FE2C55" onclick="bulkDelete()" disabled>Delete (0)</button>
+</div>
+
+<!-- My algorithm — viewer-tunable feed ranking (all on-device) -->
+<div class="modal" id="algoModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">My Algorithm</div>
+    <button class="modal-close" onclick="closeAlgo()">×</button>
+  </div>
+  <p style="font-size:12px;color:rgba(255,255,255,0.5);line-height:1.5;margin-bottom:14px">
+    Ranking runs on your device, on your data. Nothing leaves your phone.
+  </p>
+  <div class="field"><label>My taste (creators you watch most)</label>
+    <input type="range" id="algoTaste" min="0" max="100" style="width:100%"></div>
+  <div class="field"><label>Recency (newest posts first)</label>
+    <input type="range" id="algoRecent" min="0" max="100" style="width:100%"></div>
+  <div class="field"><label>Discovery (shuffle in surprises)</label>
+    <input type="range" id="algoFresh" min="0" max="100" style="width:100%"></div>
+  <button class="submit-btn" onclick="applyAlgo()">Apply</button>
+  <button class="btn-secondary" style="margin-top:10px;width:100%" onclick="resetAffinity()">Reset my taste data</button>
 </div>
 
 <!-- TikTok import — opened from the profile sheet (z 110), so needs a higher z -->
@@ -2716,6 +2984,7 @@ const SELF_SUBDOMAIN = '${escapeHtml(subdomain)}';
 const SELF_KEY       = '${escapeHtml(identity.publicKey.slice(0, 8))}';
 const SELF_PUBKEY    = '${escapeHtml(identity.publicKey)}';
 const NETWORK_ROOT_HOST = '${escapeHtml(NETWORK_ROOT_HOST)}';
+const PERMALINK_POST = '${escapeHtml(s.postId || '')}'; // set when served from /p/<id> — boot lands on that post
 let isMember = false;
 
 const nodeGraph = [{
@@ -2847,6 +3116,7 @@ async function initNetwork() {
         feed: null, postIndex: 0, loaded: false, loading: false });
     }
   } catch(e) {}
+  rankFeed(); // initial order: affinity + jitter (feeds/live not loaded yet — re-rank via the knobs)
   updateIndicators();
   refreshJoinButton();
 }
@@ -2864,6 +3134,56 @@ async function requestJoin() {
     else showToast(r.error || 'Request failed');
   } catch(e) { showToast('Request failed'); }
 }
+
+// ── FEED ALGORITHM v0 — runs on-device, data stays in localStorage, user-tunable ──
+let _dwellKey = null, _dwellStart = 0;
+function algoPrefs() { try { return JSON.parse(localStorage.getItem('algoPrefs')) || {}; } catch(e) { return {}; } }
+function setAlgoPref(k, v) { const p = algoPrefs(); p[k] = v; localStorage.setItem('algoPrefs', JSON.stringify(p)); }
+function affinityMap() { try { return JSON.parse(localStorage.getItem('affinity')) || {}; } catch(e) { return {}; } }
+// dwell = seconds you actually spent on a creator's posts (capped per view, decays as it grows)
+function recordDwell() {
+  if (!_dwellKey || !_dwellStart) return;
+  const sec = Math.min((Date.now() - _dwellStart) / 1000, 60);
+  _dwellStart = 0;
+  if (sec < 0.5) return; // instant skips don't count
+  const a = affinityMap();
+  a[_dwellKey] = Math.min((a[_dwellKey] || 0) + sec, 600);
+  localStorage.setItem('affinity', JSON.stringify(a));
+}
+function startDwell(sub) { recordDwell(); _dwellKey = sub; _dwellStart = Date.now(); }
+function scoreNode(n) {
+  const p = algoPrefs();
+  const aff = Math.log1p(affinityMap()[n.subdomain] || 0) / Math.log1p(600); // 0..1
+  const newest = n.feed && n.feed[0] && Date.parse(n.feed[0].createdAt) || 0;
+  const rec = newest ? Math.max(0, 1 - (Date.now() - newest) / (14 * 86400000)) : 0.3; // unknown = neutral
+  const live = n.liveStatus && n.liveStatus.active ? 2 : 0; // live jumps the queue
+  return live + (p.taste ?? 0.5) * aff + (p.recent ?? 0.5) * rec + (p.fresh ?? 0.3) * Math.random();
+}
+// Re-orders everything after slot 0 (the node you arrived on). Keeps your current card stable.
+function rankFeed() {
+  if (nodeGraph.length < 3) return;
+  const cur = nodeGraph[nodeIndex];
+  const head = nodeGraph[0];
+  const rest = nodeGraph.slice(1);
+  rest.sort((x, y) => scoreNode(y) - scoreNode(x));
+  nodeGraph.splice(0, nodeGraph.length, head, ...rest);
+  nodeIndex = Math.max(0, nodeGraph.indexOf(cur));
+}
+function openAlgo() {
+  const p = algoPrefs();
+  document.getElementById('algoTaste').value = Math.round((p.taste ?? 0.5) * 100);
+  document.getElementById('algoRecent').value = Math.round((p.recent ?? 0.5) * 100);
+  document.getElementById('algoFresh').value = Math.round((p.fresh ?? 0.3) * 100);
+  document.getElementById('algoModal').classList.add('show');
+}
+function closeAlgo() { document.getElementById('algoModal').classList.remove('show'); }
+function applyAlgo() {
+  setAlgoPref('taste', document.getElementById('algoTaste').value / 100);
+  setAlgoPref('recent', document.getElementById('algoRecent').value / 100);
+  setAlgoPref('fresh', document.getElementById('algoFresh').value / 100);
+  rankFeed(); updateIndicators(); closeAlgo(); toast('Feed re-ranked');
+}
+function resetAffinity() { localStorage.removeItem('affinity'); rankFeed(); updateIndicators(); toast('Taste data cleared'); }
 
 function preloadAdjacent() {
   [-1,1].forEach(d => { const i = nodeIndex+d; if (i>=0&&i<nodeGraph.length) loadNode(nodeGraph[i]); });
@@ -3678,6 +3998,7 @@ function renderCurrent() {
   const node = nodeGraph[nodeIndex];
   const item = node.feed?.[node.postIndex];
   markSeen(item?.id); // record this post as seen for unseen-first ordering on return visits
+  startDwell(node.subdomain); // feeds the on-device affinity map
 
   // Disconnect previous live viewer if leaving a live card
   if (liveCardViewer) { liveCardViewer.cleanup(); liveCardViewer = null; stopLiveChatPoll(); }
@@ -3742,17 +4063,8 @@ function showVideoIcon(v, icon) {
 function deactivateVideos(p) { p.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime=0; }); }
 
 // ── INDICATORS ────────────────────────────────────────────────
-function updateIndicators() {
-  const node    = nodeGraph[nodeIndex];
-  const feedLen = node.feed?.length || 0;
-  const segsEl  = document.getElementById('progressSegs');
-  if (feedLen <= 1) { segsEl.innerHTML = ''; }
-  else {
-    segsEl.innerHTML = Array.from({length: Math.min(feedLen, 14)}, (_,i) =>
-      \`<div class="prog-seg\${i === node.postIndex ? ' active' : ''}"></div>\`
-    ).join('');
-  }
-}
+// progress segments removed by user request (the white lines up top) — kept as a no-op since many callers remain
+function updateIndicators() {}
 
 // ── LIKE ──────────────────────────────────────────────────────
 function postBase(node) { return (node && node.subdomain !== SELF_SUBDOMAIN) ? 'https://' + node.subdomain : ''; }
@@ -4007,6 +4319,7 @@ function openProfile(subdomain) {
 }
 
 function closeProfile() {
+  exitSelMode();
   document.getElementById('profileSheet').classList.remove('show');
   resumeFeedVideos();
 }
@@ -4044,15 +4357,15 @@ function renderProfileBody(data, subdomain) {
   const gridHtml = (data.feed || []).map(item => {
     const gridDel = isOwn ? \`<button class="grid-del" onclick="event.stopPropagation();deleteFromGrid('\${esc(item.id)}')">×</button>\` : '';
     if (item.type === 'video' && item.mediaUrl)
-      return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
+      return \`<div class="profile-grid-item" data-id="\${esc(item.id)}" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
         <video disableremoteplayback x-webkit-airplay="deny" data-src="\${esc(pabs(item.mediaUrl))}" preload="metadata" muted playsinline></video>
         <div class="grid-type-icon">▶</div>\${gridDel}
       </div>\`;
     if (item.type === 'photo' && item.mediaUrl)
-      return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
+      return \`<div class="profile-grid-item" data-id="\${esc(item.id)}" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
         <img src="\${esc(pabs(item.mediaUrl))}" loading="lazy" alt="">\${gridDel}
       </div>\`;
-    return \`<div class="profile-grid-item" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
+    return \`<div class="profile-grid-item" data-id="\${esc(item.id)}" onclick="openProfilePost('\${esc(subdomain)}','\${esc(item.id)}')">
       <div class="profile-grid-text" style="background:\${grad}">\${esc((item.title||item.body||'').slice(0,40))}</div>\${gridDel}
     </div>\`;
   }).join('');
@@ -4066,6 +4379,8 @@ function renderProfileBody(data, subdomain) {
   const blocked = getBlocked().includes(subdomain);
   const blockBtn = !isOwn ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleBlock('\${esc(subdomain)}')">\${blocked ? 'Unblock' : 'Block'}</button>\` : '';
   const importBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openImport()">📥 Import from TikTok</button>\` : '';
+  const algoBtn = subdomain === SELF_SUBDOMAIN ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openAlgo()">🎛 My algorithm</button>\` : '';
+  const selBtn = (isOwn && isCreator && (data.postCount || 0) > 0) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleSelMode()">☑️ Select posts</button>\` : '';
 
   document.getElementById('profileBody').innerHTML = \`
     <div class="profile-hero">
@@ -4083,7 +4398,7 @@ function renderProfileBody(data, subdomain) {
         </div>
       </div>
       \${bio ? \`<div class="profile-bio">\${esc(bio)}</div>\` : ''}
-      \${joinBtn}\${adBtn}\${hostBtn}\${importBtn}\${blockBtn}
+      \${joinBtn}\${adBtn}\${hostBtn}\${importBtn}\${algoBtn}\${selBtn}\${blockBtn}
     </div>
     <div class="profile-grid">\${gridHtml || '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3);grid-column:1/-1">No posts yet</div>'}</div>
   \`;
@@ -4107,7 +4422,48 @@ function lazyLoadGridVideos(root) {
   vids.forEach(v => io.observe(v));
 }
 
+// ── BULK SELECT + DELETE (own profile grid) ──────────────────
+let _selMode = false;
+const _selIds = new Set();
+function toggleSelMode() {
+  _selMode = !_selMode;
+  _selIds.clear();
+  document.getElementById('selBar').style.display = _selMode ? 'flex' : 'none';
+  document.querySelectorAll('.profile-grid-item.sel').forEach(el => el.classList.remove('sel'));
+  updateSelBar();
+}
+function exitSelMode() { if (_selMode) toggleSelMode(); }
+function toggleSelect(id) {
+  if (_selIds.has(id)) _selIds.delete(id); else _selIds.add(id);
+  const el = document.querySelector('.profile-grid-item[data-id="' + id + '"]');
+  if (el) el.classList.toggle('sel', _selIds.has(id));
+  updateSelBar();
+}
+function updateSelBar() {
+  const b = document.getElementById('selDeleteBtn');
+  if (b) { b.textContent = 'Delete (' + _selIds.size + ')'; b.disabled = !_selIds.size; }
+}
+async function bulkDelete() {
+  const n = _selIds.size;
+  if (!n) return;
+  if (!confirm('Delete ' + n + ' post' + (n === 1 ? '' : 's') + '? Media is removed too. This cannot be undone.')) return;
+  try {
+    const res = await fetch('/admin/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ ids: Array.from(_selIds) }),
+    });
+    if (!res.ok) { toast('delete failed'); return; }
+    toast(n + ' deleted');
+    exitSelMode();
+    nodeGraph[0].loaded = false; nodeGraph[0].feed = null;
+    delete _profileCache[SELF_SUBDOMAIN];
+    await loadNode(nodeGraph[0]);
+    loadProfileData(SELF_SUBDOMAIN).then(d => renderProfileBody(d, SELF_SUBDOMAIN));
+  } catch(e) { toast('delete failed'); }
+}
+
 function openProfilePost(subdomain, postId) {
+  if (_selMode) { toggleSelect(postId); return; }
   // Navigate to that node+post in feed
   closeProfile();
   const idx = nodeGraph.findIndex(n => n.subdomain === subdomain);
@@ -4240,13 +4596,16 @@ function parseTikTokExport(data, basePath) {
     if (typeof link === 'string' && link.startsWith('http') && date) {
       const p = path.toLowerCase();
       const owns = p.includes('video') || p.includes('post');
-      const theirs = p.includes('like') || p.includes('favorite') || p.includes('share') || p.includes('brows') || p.includes('watch') || p.includes('comment');
+      // reposts/likes/favorites/etc are OTHER people's videos (and tiktok.com page links, not media)
+      const theirs = p.includes('like') || p.includes('favorite') || p.includes('share') || p.includes('brows') || p.includes('watch') || p.includes('comment') || p.includes('repost') || p.includes('deleted');
       if (owns && !theirs && !seen[link]) {
         seen[link] = 1;
+        // TikTok exports the literal string 'N/A' when a caption isn't included
+        const clean = v => { const s = String(v || '').trim(); return (s === 'N/A' || s.toLowerCase() === 'none') ? '' : s; };
         out.push({
           url: link,
           createdAt: tiktokDateToIso(date),
-          title: String(o.Title || o.Desc || o.Description || o.Caption || o.title || '').slice(0, 300),
+          title: (clean(o.Title) || clean(o.Desc) || clean(o.Description) || clean(o.Caption) || clean(o.AddYoursText)).slice(0, 300),
           likes: o.Likes || o.likes || '',
         });
       }
@@ -5146,6 +5505,7 @@ function commitSwipe() {
     inactivePanel().style.zIndex     = '1';
     inactivePanel().innerHTML        = '';
 
+    startDwell(nodeGraph[nodeIndex].subdomain);
     activateVideos(activePanel());
     refreshCurrentInteractions();
     preloadAdjacent();
@@ -5190,6 +5550,7 @@ function closeTopOverlay() {
   if (vis('streamHistoryModal')) { closeStreamHistory(); return true; }
   if (vis('creatorsModal')) { closeCreators(); return true; }
   if (vis('importModal')) { closeImport(); return true; }
+  if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }
   if (document.getElementById('liveModal').style.display === 'flex') {
     if (vis('prerollSheet')) { closePrerollSheet(); return true; }
@@ -5203,8 +5564,9 @@ function closeTopOverlay() {
     ['unlockModal', closeUnlock], ['publishModal', closePublish],
     ['prerollSheet', closePrerollSheet], ['earningsSheet', () => shut('earningsSheet')],
     ['inboxSheet', closeInbox], ['editProfileSheet', closeEditProfile],
-    ['profileSheet', closeProfile],
   ];
+  if (_selMode) { exitSelMode(); return true; } // back leaves select mode before closing the profile
+  order.push(['profileSheet', closeProfile]);
   for (const pair of order) { if (vis(pair[0])) { pair[1](); return true; } }
   return false;
 }
@@ -5221,6 +5583,13 @@ window.addEventListener('popstate', () => {
 (async () => {
   await restoreCreator();
   await loadNode(nodeGraph[0]);
+  // Permalink deep-link: served from /p/<id> — land on that post (overrides the
+  // unseen-first index), then clean the URL back to / (keeps the back-nav sentinel).
+  if (PERMALINK_POST && nodeGraph[0].feed) {
+    const pi = nodeGraph[0].feed.findIndex(p => p && p.id === PERMALINK_POST);
+    if (pi >= 0) nodeGraph[0].postIndex = pi;
+    history.replaceState({ sn: 1 }, '', '/');
+  }
   renderCurrent();
   updateIndicators();
   initNetwork();

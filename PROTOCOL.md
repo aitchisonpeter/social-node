@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.5.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.6.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -37,10 +37,10 @@ The node's posts, newest first. No params returns the full feed; `limit` (max 10
 Post shape:
 ```json
 { "id": "<uuid>", "type": "writing|photo|video|live", "title": "", "body": "",
-  "mediaUrl": "/media/<key>|null", "mediaContentType": "...", "importedFrom": "native",
-  "createdAt": "...", "authorPublicKey": "..." }
+  "mediaUrl": "/media/<key>|null", "mediaContentType": "...", "transcript": "",
+  "importedFrom": "native", "createdAt": "...", "authorPublicKey": "..." }
 ```
-`mediaUrl` is **origin-relative** — prefix it with the owning node's origin.
+`mediaUrl` is **origin-relative** — prefix it with the owning node's origin. `transcript` (added 0.6.0) is optional searchable text for media posts — captions/OCR, ≤5000 chars; it feeds the post's SEO description and crawler body.
 
 ### `GET /profile.json`
 ```json
@@ -60,6 +60,14 @@ The signed network registry (any member serves it; the root is canonical; edge-c
 
 ### `GET /media/<key>`
 The node's media (R2-backed). Supports `Range`/206, `ETag`, and edge caching. Safe for direct `<img>`/`<video>` use.
+
+### Web surface (added 0.6.0)
+For link sharing and crawlers — these serve HTML/text, not JSON:
+
+- `GET /p/<post id>` — **canonical permalink** for a post. Serves the app with post-specific OpenGraph/Twitter meta (videos unfurl as `og:video`) and a `<noscript>` body for crawlers; deleted/unknown ids 302 to `/`. Link to posts with this.
+- `GET /` — node-level meta (profile bio, avatar) + a crawler-readable list of recent post links.
+- `GET /robots.txt` — allows all, disallows `/admin/` and `/auth/`, points at the sitemap.
+- `GET /sitemap.xml` — homepage + every `/p/<id>` URL with `lastmod`.
 
 ---
 
@@ -102,7 +110,7 @@ Chat lives and dies with the stream: history (last 100 messages) is only served 
 3. `POST /live/tracks` `{ "subscriberSessionId", "tracks": [ { "location": "remote", "sessionId": "<publisherSessionId>", "trackName": "<from trackNames>" }... ] }` → Calls answer (SDP offer inside if renegotiation required)
 4. `POST /live/renegotiate` `{ "subscriberSessionId", "sessionDescription" }` to complete.
 
-(These mint Calls sessions on the node operator's account — they're public by design so anyone can watch; operators should rate-limit `/live/subscribe` at the WAF.)
+(These mint Calls sessions on the node operator's account — they're public by design so anyone can watch. Since 0.6.0 the node rate-limits `/live/subscribe`, `/live/tracks`, and `/live/renegotiate` per IP — expect `429` if you hammer them.)
 
 ### Broadcasting
 Creator-auth only — see [Admin](#admin-endpoints). OBS/Larix can ingest via **WHIP** at `POST /live/whip?token=<creator token>` (or `Authorization: Bearer`); end the stream with the WHIP `DELETE`.
@@ -151,7 +159,7 @@ Public auth endpoints (rate-limited 10/10min/IP):
 
 For host dashboards and creator portals. All take `Authorization: Bearer`. *(master)* = host master token only.
 
-**Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType }` → `{ published: <post> }`; `POST /admin/upload` (multipart, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); `POST /admin/delete` `{ id }`; `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
+**Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType, transcript? }` → `{ published: <post> }`; `POST /admin/upload` (multipart, max 256MB, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); `POST /admin/delete` `{ id }` or `{ ids: [...] }` (bulk, max 500); `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
 
 **Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute).
 
@@ -165,7 +173,9 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 
 ## Legacy / do not build on
 
-`/protocol/announce`, `/protocol/peers`, `/.well-known/peers.json`, `/.well-known/source.json`, `/admin/inherit` — pre-registry bootstrap mechanics, kept for compatibility. They will be removed.
+`/.well-known/peers.json`, `/.well-known/source.json`, `/admin/inherit` — pre-registry bootstrap mechanics, kept for compatibility. They will be removed.
+
+**Removed in 0.6.0:** `/protocol/announce` and `/protocol/peers` (unauthenticated pre-registry bootstrap) now return 404. Membership is the signed registry, full stop.
 
 ## Versioning
 
