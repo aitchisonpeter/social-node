@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.7.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.8.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -102,8 +102,7 @@ Live streaming is WebRTC via Cloudflare Realtime (Calls) — sub-second latency,
 ### State & presence
 - `GET /live/status.json` → `{ "active": false, "viewers": 0 }` or
   `{ "active": true, "publisherSessionId": "...", "trackNames": [...], "startedAt": "...", "via": "browser|whip", "viewers": 2 }`
-- `GET /live/who.json` → `{ "viewers": [ { "name", "sid", "role": "viewer|broadcaster", "muted": false }... ] }`
-  With creator auth the response also includes `mutedList` (the moderation list).
+- `GET /live/who.json` *(creator auth required as of 0.8.0 — who's-in-the-room names are the broadcaster's moderation data, not public)* → `{ "viewers": [ { "name", "sid", "role", "muted" }... ], "mutedList": [...] }`. Unauthenticated → `401`; the viewer COUNT stays public via `status.json`/WS.
 
 ### Chat
 Chat lives and dies with the stream: history (last 100 messages) is only served while live, and is cleared when the stream ends.
@@ -176,7 +175,7 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 
 **Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType, transcript? }` → `{ published: <post> }`; `POST /admin/upload` (multipart, max 256MB, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); `POST /admin/delete` `{ id }` or `{ ids: [...] }` (bulk, max 500); `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
 
-**Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute).
+**Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end).
 
 **Revenue** — `GET/POST /admin/preroll` *(master — the ad config is worker-wide)*; `GET /admin/preroll.json`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
 

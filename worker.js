@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.7.0';
+const PROTOCOL_VERSION = '0.8.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -74,6 +74,8 @@ export class LiveRoom extends DurableObject {
           status,
           // chat belongs to the live stream — joiners after it ended get a clean slate
           chat: status.active ? await this.recentChat() : [],
+          // broadcaster's text/image overlay (stream-scoped, like chat) so joiners see it
+          overlay: status.active ? ((await this.ctx.storage.get('overlay')) || null) : null,
           viewers: this.viewerCount(),
         }));
       } catch {}
@@ -105,8 +107,24 @@ export class LiveRoom extends DurableObject {
         lastViewers: this.viewerCount(),
       });
       await this.ctx.storage.put('chat', []); // fresh chat per stream
+      // overlay deliberately NOT cleared here — broadcasters stage it before going live;
+      // it clears on stream END (stream-scoped on the way out, not the way in)
       this.broadcast({ t: 'live', status: await this.statusObj() });
       return Response.json({ ok: true });
+    }
+
+    // broadcaster's text/image overlay — stored for joiners, broadcast to live viewers.
+    // txt/img are placement objects {x,y,s} (screen-fraction coords + scale), sanitized
+    // at the worker route. Auth happens there too; the DO trusts its caller.
+    if (seg === 'overlay' && request.method === 'POST') {
+      const { text, imageUrl, txt, img } = await request.json().catch(() => ({}));
+      const overlay = (text || imageUrl)
+        ? { text: text || '', imageUrl: imageUrl || '', txt: txt || null, img: img || null }
+        : null;
+      if (overlay) await this.ctx.storage.put('overlay', overlay);
+      else await this.ctx.storage.delete('overlay');
+      this.broadcast({ t: 'overlay', overlay });
+      return Response.json({ ok: true, overlay });
     }
 
     if (seg === 'heartbeat' && request.method === 'POST') {
@@ -127,6 +145,7 @@ export class LiveRoom extends DurableObject {
         await this.ctx.storage.put('session', s);
         if (wasActive) await this.finalizeSession(s, Date.now());
       }
+      await this.ctx.storage.delete('overlay');
       this.broadcast({ t: 'ended' });
       return Response.json({ ok: true });
     }
@@ -461,6 +480,13 @@ export class LiveRoom extends DurableObject {
   async webSocketMessage(ws, message) {
     let data;
     try { data = JSON.parse(message); } catch { return; }
+    // a guest who picks a display name mid-stream tells us — the connection attachment
+    // is what the broadcaster's viewer list reads, so keep it current
+    if (data.t === 'name') {
+      const nm = String(data.name || '').slice(0, 30);
+      if (nm) { const att = ws.deserializeAttachment() || {}; att.name = nm; ws.serializeAttachment(att); }
+      return;
+    }
     if (data.t === 'chat') {
       // light per-connection throttle to blunt spam (anonymous WS)
       if (!this._rate) this._rate = new WeakMap();
@@ -469,6 +495,9 @@ export class LiveRoom extends DurableObject {
       if (now - last < CHAT_MIN_GAP_MS) return;
       this._rate.set(ws, now);
       const att = ws.deserializeAttachment() || {};
+      // chat carries the freshest name — sync the attachment so the viewer list matches
+      const nm = String(data.name || '').slice(0, 30);
+      if (nm && nm !== att.name) { att.name = nm; ws.serializeAttachment(att); }
       const muted = (await this.ctx.storage.get('muted')) || {};
       if (att.sid && muted[att.sid]) return; // shadow-mute: silently dropped
       await this.addChat(data.text, data.name || att.name, att.sid);
@@ -1309,10 +1338,11 @@ async function handleRequest(request, storage, env, ctx) {
 
   // ---- live: public viewer list (names + sids of connected sockets) ----
   if (path === '/live/who.json') {
+    // who's-in-the-room is the broadcaster's moderation view — viewers only get the count
+    // (via WS/status.json). Names of people in a room are not public data.
+    if (!(await checkAuth(request))) return jsonCors({ error: 'unauthorized' }, 401);
     const r = await liveDO(env, subdomain, '/who');
-    const data = await r.json();
-    if (!(await checkAuth(request))) delete data.mutedList; // moderation list is creator-only
-    return jsonCors(data);
+    return jsonCors(await r.json());
   }
 
   // ---- live: public chat (DO-backed; WS is preferred, these are fallbacks) ----
@@ -1586,6 +1616,28 @@ async function handleRequest(request, storage, env, ctx) {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const body = await request.text();
     const r = await liveDO(env, subdomain, '/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
+
+  // ---- live: admin — broadcast overlay (text/image drawn over the stream client-side;
+  // the WebRTC video track is untouched, so latency stays sub-second) ----
+  if (path === '/admin/live/overlay' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const text = String(b.text || '').slice(0, 120);
+    let imageUrl = String(b.imageUrl || '').slice(0, 300);
+    // own-node media or https only — nothing else reaches viewers' DOM as an img src
+    if (imageUrl && !imageUrl.startsWith('/media/') && !imageUrl.startsWith('https://')) imageUrl = '';
+    // placement = {x,y} screen fractions + scale, clamped so nothing renders off-screen or absurd
+    const place = (o) => (o && typeof o === 'object') ? {
+      x: Math.min(Math.max(Number(o.x) || 0.5, 0), 1),
+      y: Math.min(Math.max(Number(o.y) || 0.5, 0), 1),
+      s: Math.min(Math.max(Number(o.s) || 1, 0.2), 4),
+    } : null;
+    const r = await liveDO(env, subdomain, '/overlay', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, imageUrl, txt: place(b.txt), img: place(b.img) }),
+    });
     return json(await r.json().catch(() => ({})), r.status);
   }
 
@@ -2350,13 +2402,8 @@ body.creator .card-del { display: flex; }
   display: flex; align-items: center; justify-content: center;
   font-size: 19px; font-weight: 800; color: #fff;
 }
-.avatar-follow {
-  position: absolute; bottom: -9px; left: 50%; transform: translateX(-50%);
-  width: 22px; height: 22px; border-radius: 50%;
-  background: #FE2C55; border: 2px solid #000;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 14px; font-weight: 800; color: #fff; line-height: 1;
-}
+/* Live overlay edit mode (broadcaster): show the elements are grabbable */
+.ov-edit { outline: 1.5px dashed rgba(255,255,255,0.55); outline-offset: 4px; cursor: grab; }
 
 /* Like icon */
 .like-icon { font-size: 30px; transition: transform 0.12s; display: block; }
@@ -2817,6 +2864,14 @@ ${s.noscript || ''}
   <video disableremoteplayback x-webkit-airplay="deny" id="livePreview"   autoplay muted     playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1;transform:scaleX(-1)"></video>
   <video disableremoteplayback x-webkit-airplay="deny" id="liveViewVideo" autoplay playsinline style="display:none;position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1"></video>
 
+  <!-- Broadcaster's text/image overlay — rendered client-side over the stream (z above video,
+       below ad/controls). Elements are centered on {x,y} screen fractions; the broadcaster
+       drags/pinches them in place (layer z is raised while editing so they're grabbable). -->
+  <div id="liveOverlayLayer" style="display:none;position:absolute;inset:0;z-index:6;pointer-events:none;overflow:hidden">
+    <img id="liveOverlayImg" alt="" draggable="false" style="display:none;position:absolute;transform:translate(-50%,-50%);width:30vw;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,0.5);touch-action:none">
+    <div id="liveOverlayText" style="display:none;position:absolute;transform:translate(-50%,-50%);width:max-content;max-width:86vw;text-align:center;font-size:19px;font-weight:700;color:#fff;text-shadow:0 1px 5px rgba(0,0,0,0.85);line-height:1.35;word-wrap:break-word;touch-action:none"></div>
+  </div>
+
   <!-- Pre-roll sponsor ad overlay (covers the stream until the ad finishes) -->
   <div id="prerollOverlay" style="display:none;position:absolute;inset:0;z-index:30;background:#000">
     <video disableremoteplayback x-webkit-airplay="deny" id="prerollVideo" playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000"></video>
@@ -2842,6 +2897,7 @@ ${s.noscript || ''}
     </div>
     <div style="display:flex;gap:8px">
       <button id="liveBtnPreroll" onclick="openPrerollSheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🎬 Sponsor Ad</button>
+      <button onclick="openOverlaySheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🖼 Overlay</button>
       <button onclick="openStreamHistory()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">📊 Past streams</button>
     </div>
     <div id="liveStatusMsg" style="font-size:13px;color:rgba(255,255,255,0.7);text-align:center"></div>
@@ -2918,6 +2974,29 @@ ${s.noscript || ''}
     <div id="importErrors" style="font-size:12px;color:#FE2C55;margin-top:10px;max-height:25vh;overflow-y:auto"></div>
     <button class="btn-secondary" id="importCancelBtn" style="margin-top:12px" onclick="_importCancel=true">Cancel</button>
   </div>
+</div>
+
+<!-- Live stream overlay editor (broadcaster) — opened from inside #liveModal (z 100) -->
+<div class="modal" id="overlayModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Stream overlay</div>
+    <button class="modal-close" onclick="closeOverlaySheet()">×</button>
+  </div>
+  <div class="field"><label>Text (shows above chat)</label>
+    <input type="text" id="ovText" maxlength="120" placeholder="e.g. Merch drops Friday — link in bio" autocomplete="off"></div>
+  <div class="field"><label>Image (corner badge)</label>
+    <input type="file" id="ovFile" accept="image/*" style="display:none" onchange="onOverlayPick(this)">
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn-secondary" style="flex:1" onclick="document.getElementById('ovFile').click()">Choose image…</button>
+      <div id="ovPreview" style="width:52px;height:52px;border-radius:8px;background:rgba(255,255,255,0.08);overflow:hidden;flex-shrink:0"></div>
+    </div>
+  </div>
+  <button class="submit-btn" id="ovApplyBtn" onclick="applyOverlay()">Show overlay</button>
+  <button class="btn-secondary" style="margin-top:10px;width:100%" onclick="clearOverlay()">Clear overlay</button>
+  <p style="margin-top:12px;font-size:12px;color:rgba(255,255,255,0.4);line-height:1.6">
+    Viewers see this over your stream instantly. Once it's up, <strong>drag</strong> the text or image
+    to move it and <strong>pinch</strong> to resize — viewers follow along. Clears when the stream ends.
+  </p>
 </div>
 
 <!-- Report content — public moderation flag, goes to the node operator + network root -->
@@ -3186,6 +3265,22 @@ function firstUnseenIndex(feed) {
   const i = feed.findIndex(it => it && it.id && !seenSet.has(it.id));
   return i === -1 ? 0 : i;
 }
+// Does this creator have anything the viewer hasn't watched? Drives skip-on-swipe.
+function hasUnseen(node) {
+  if (!node.loaded) return true;                      // not loaded yet — can't call it drained
+  if (!node.feed || !node.feed.length) return false;  // unreachable or empty
+  if (node.feed.some(it => it && it.id && !seenSet.has(it.id))) return true;
+  return node.feed.length < (node.feedTotal || 0);    // deeper pages may be unwatched
+}
+// Where to land when arriving at a creator: stay put if the resume post is still fresh,
+// otherwise jump to their first unseen post; fully-drained keeps the resume position.
+function landingIndex(t) {
+  if (!t.feed || !t.feed.length) return t.postIndex || 0;
+  const cur = t.feed[t.postIndex];
+  if (cur && cur.id && !seenSet.has(cur.id)) return t.postIndex;
+  const fu = t.feed.findIndex(it => it && it.id && !seenSet.has(it.id));
+  return fu >= 0 ? fu : (t.postIndex || 0);
+}
 
 // ── AVATAR ────────────────────────────────────────────────────
 function avatarGrad(sub) {
@@ -3238,6 +3333,16 @@ async function loadNode(node) {
     node.feedTotal = fd.total ?? node.feed.length;
     node.displayName = fd.displayName || '';
     node.avatarUrl = fd.avatarUrl ? (fd.avatarUrl.startsWith('http') ? fd.avatarUrl : (node.url || '') + fd.avatarUrl) : null;
+    // hunt deeper pages while everything loaded is already seen — otherwise a fully-seen
+    // first page strands the viewer on post 0 forever ("same videos every session")
+    while (node.feed.length < (node.feedTotal || 0)
+           && node.feed.every(it => !it || !it.id || seenSet.has(it.id))) {
+      const more = await fetch(node.url + '/.well-known/feed.json?limit=' + FEED_PAGE + '&offset=' + node.feed.length).then(r => r.json());
+      const items = more.items || [];
+      if (!items.length) break;
+      items.forEach(it => node.feed.push(it));
+      node.feedTotal = more.total ?? node.feedTotal;
+    }
     node.postIndex = firstUnseenIndex(node.feed); // land on first unseen post (runs once — loadNode guards on loaded)
   } catch(e) { node.feed = null; }
   node.loaded = true; node.loading = false;
@@ -3398,33 +3503,41 @@ class LiveSocket {
   constructor(subdomain, role, opts) {
     this.opts = opts || {};
     this.role = role;
+    this.host = subdomain === SELF_SUBDOMAIN ? location.host : subdomain;
     this.chat = [];
     this.closed = false;
-    const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    const host = subdomain === SELF_SUBDOMAIN ? location.host : subdomain;
-    const name = displayName() || 'viewer';
-    this.url = wsScheme + host + '/live/ws?role=' + role + '&name=' + encodeURIComponent(name) + '&vid=' + encodeURIComponent(getViewerId());
     this.connect();
   }
   connect() {
     if (this.closed) return;
-    try { this.ws = new WebSocket(this.url); } catch(e) { return; }
+    // URL built per attempt so reconnects carry the CURRENT display name
+    const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const name = displayName() || 'viewer';
+    const url = wsScheme + this.host + '/live/ws?role=' + this.role + '&name=' + encodeURIComponent(name) + '&vid=' + encodeURIComponent(getViewerId());
+    try { this.ws = new WebSocket(url); } catch(e) { return; }
     this.ws.onmessage = e => this.onMsg(e);
     this.ws.onclose = () => { if (!this.closed) setTimeout(() => this.connect(), 2000); };
     this.ws.onerror = () => {};
+  }
+  rename(name) {
+    if (this.ws && this.ws.readyState === 1) { try { this.ws.send(JSON.stringify({ t: 'name', name })); } catch(e) {} }
   }
   onMsg(e) {
     let d; try { d = JSON.parse(e.data); } catch { return; }
     if (d.t === 'init') {
       this.chat = d.chat || []; this.renderChat(); this.setViewers(d.viewers);
       if (d.status?.active) this.opts.onLive?.(d.status);
+      this.opts.onOverlay?.(d.overlay || null);
     } else if (d.t === 'chat') {
       this.chat.push(d.msg); if (this.chat.length > 100) this.chat.shift(); this.renderChat();
     } else if (d.t === 'viewers') {
       this.setViewers(d.viewers);
     } else if (d.t === 'live') {
       this.opts.onLive?.(d.status);
+    } else if (d.t === 'overlay') {
+      this.opts.onOverlay?.(d.overlay || null);
     } else if (d.t === 'ended') {
+      this.opts.onOverlay?.(null);
       this.opts.onEnded?.();
     }
   }
@@ -3509,7 +3622,173 @@ function onLiveTap() {
     viewerCountId: 'liveViewerCount',
     canMod: isBroadcaster,
     onEnded: () => { if (!isBroadcaster) { setLiveStatus('Stream ended'); } },
+    // overlay images are origin-relative on the STREAMING node — prefix for remote viewers
+    onOverlay: ov => renderLiveOverlay(ov, node.subdomain === SELF_SUBDOMAIN ? '' : 'https://' + node.subdomain),
   });
+  setOverlayEditable(isBroadcaster); // broadcaster can drag/pinch the overlay in place
+}
+
+// ── LIVE OVERLAY (broadcaster text/image over the stream) ────
+// Placement = {x,y} as screen fractions (element centered there) + scale s. The
+// broadcaster drags/pinches the elements on their own preview; positions ride along
+// with the overlay broadcast so viewers see the same proportional placement.
+const OV_DEFAULTS = { img: { x: 0.82, y: 0.20, s: 1 }, txt: { x: 0.5, y: 0.60, s: 1 } };
+let _ovCurrent = null; // latest overlay state (broadcaster gestures mutate it in place)
+let _ovBase = '';      // media origin of the streaming node (for relative imageUrls)
+function renderLiveOverlay(ov, base) {
+  _ovCurrent = ov;
+  if (base !== undefined) _ovBase = base || '';
+  const layer = document.getElementById('liveOverlayLayer');
+  const img = document.getElementById('liveOverlayImg');
+  const txt = document.getElementById('liveOverlayText');
+  const has = ov && (ov.text || ov.imageUrl);
+  layer.style.display = has ? 'block' : 'none';
+  if (!has) { img.style.display = 'none'; img.removeAttribute('src'); txt.style.display = 'none'; return; }
+  if (ov.imageUrl) {
+    const want = ov.imageUrl.startsWith('http') ? ov.imageUrl : _ovBase + ov.imageUrl;
+    if (img.dataset.srcSet !== want) { img.dataset.srcSet = want; img.src = want; }
+    const p = ov.img || OV_DEFAULTS.img;
+    img.style.left  = (p.x * 100) + '%';
+    img.style.top   = (p.y * 100) + '%';
+    img.style.width = (30 * p.s) + 'vw';
+    img.style.display = 'block';
+  } else { img.style.display = 'none'; img.removeAttribute('src'); delete img.dataset.srcSet; }
+  if (ov.text) {
+    const p = ov.txt || OV_DEFAULTS.txt;
+    txt.textContent = ov.text;
+    txt.style.left = (p.x * 100) + '%';
+    txt.style.top  = (p.y * 100) + '%';
+    txt.style.fontSize = (19 * p.s) + 'px';
+    txt.style.display = 'block';
+  } else { txt.style.display = 'none'; }
+}
+// Broadcaster edit mode: elements become grabbable; layer rises above chat/panel so
+// a badge parked over them can still be picked back up.
+function setOverlayEditable(on) {
+  document.getElementById('liveOverlayLayer').style.zIndex = on ? '25' : '6';
+  for (const id of ['liveOverlayImg', 'liveOverlayText']) {
+    const el = document.getElementById(id);
+    el.style.pointerEvents = on ? 'auto' : 'none';
+    el.classList.toggle('ov-edit', on);
+  }
+}
+function ovPlace(key) {
+  if (!_ovCurrent) return null;
+  if (!_ovCurrent[key]) _ovCurrent[key] = { x: OV_DEFAULTS[key].x, y: OV_DEFAULTS[key].y, s: OV_DEFAULTS[key].s };
+  return _ovCurrent[key];
+}
+let _ovPersistT = null;
+function ovPersistSoon() { // one POST per settled gesture, not per move event
+  clearTimeout(_ovPersistT);
+  _ovPersistT = setTimeout(() => { if (_ovCurrent) setOverlayOnServer(_ovCurrent).catch(() => {}); }, 350);
+}
+function ovDist(t) { return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) || 1; }
+function ovAttachGestures(id, key) {
+  const el = document.getElementById(id);
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  let drag = null, pinch = null;
+  el.addEventListener('touchstart', e => {
+    const p = ovPlace(key); if (!p) return;
+    e.preventDefault(); e.stopPropagation();
+    if (e.touches.length >= 2) { pinch = { d0: ovDist(e.touches), s0: p.s }; drag = null; }
+    else drag = { x0: e.touches[0].clientX, y0: e.touches[0].clientY, px: p.x, py: p.y };
+  }, { passive: false });
+  el.addEventListener('touchmove', e => {
+    const p = ovPlace(key); if (!p) return;
+    e.preventDefault(); e.stopPropagation();
+    if (pinch && e.touches.length >= 2) {
+      p.s = clamp(pinch.s0 * (ovDist(e.touches) / pinch.d0), 0.2, 4);
+    } else if (drag && e.touches.length === 1) {
+      p.x = clamp(drag.px + (e.touches[0].clientX - drag.x0) / window.innerWidth, 0.03, 0.97);
+      p.y = clamp(drag.py + (e.touches[0].clientY - drag.y0) / window.innerHeight, 0.03, 0.97);
+    }
+    renderLiveOverlay(_ovCurrent);
+  }, { passive: false });
+  el.addEventListener('touchend', e => {
+    if (e.touches.length === 0) { if (drag || pinch) ovPersistSoon(); drag = pinch = null; }
+    else if (e.touches.length === 1 && pinch) {
+      // pinch released down to one finger — hand off into a drag without a lift
+      pinch = null;
+      const p = ovPlace(key);
+      drag = { x0: e.touches[0].clientX, y0: e.touches[0].clientY, px: p.x, py: p.y };
+    }
+  });
+  // desktop conveniences: mouse drag + wheel to resize
+  el.addEventListener('mousedown', e => {
+    const p = ovPlace(key); if (!p) return;
+    e.preventDefault();
+    const m = { x0: e.clientX, y0: e.clientY, px: p.x, py: p.y };
+    const mv = ev => {
+      p.x = clamp(m.px + (ev.clientX - m.x0) / window.innerWidth, 0.03, 0.97);
+      p.y = clamp(m.py + (ev.clientY - m.y0) / window.innerHeight, 0.03, 0.97);
+      renderLiveOverlay(_ovCurrent);
+    };
+    const up = () => { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); ovPersistSoon(); };
+    document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+  });
+  el.addEventListener('wheel', e => {
+    const p = ovPlace(key); if (!p) return;
+    e.preventDefault();
+    p.s = clamp(p.s * (e.deltaY < 0 ? 1.08 : 0.92), 0.2, 4);
+    renderLiveOverlay(_ovCurrent); ovPersistSoon();
+  }, { passive: false });
+}
+ovAttachGestures('liveOverlayImg', 'img');
+ovAttachGestures('liveOverlayText', 'txt');
+let _ovImageUrl = '';
+function openOverlaySheet() {
+  // editing a live overlay: seed the sheet from current state so re-applying keeps the image
+  if (_ovCurrent) {
+    document.getElementById('ovText').value = _ovCurrent.text || '';
+    if (_ovCurrent.imageUrl && !_ovImageUrl) {
+      _ovImageUrl = _ovCurrent.imageUrl;
+      const u = _ovCurrent.imageUrl.startsWith('http') ? _ovCurrent.imageUrl : _ovBase + _ovCurrent.imageUrl;
+      document.getElementById('ovPreview').innerHTML = \`<img src="\${esc(u)}" style="width:100%;height:100%;object-fit:cover">\`;
+    }
+  }
+  document.getElementById('overlayModal').classList.add('show');
+}
+function closeOverlaySheet() {
+  document.getElementById('overlayModal').classList.remove('show');
+}
+async function onOverlayPick(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const btn = document.getElementById('ovApplyBtn');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const fd = new FormData(); fd.append('file', file);
+    const res = await fetch('/admin/upload', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token }, body: fd });
+    const data = await res.json();
+    _ovImageUrl = data.url;
+    document.getElementById('ovPreview').innerHTML = \`<img src="\${esc(data.url)}" style="width:100%;height:100%;object-fit:cover">\`;
+  } catch(e) { toast('Upload failed'); }
+  btn.disabled = false; btn.textContent = 'Show overlay';
+}
+async function setOverlayOnServer(ov) {
+  const r = await fetch('/admin/live/overlay', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: JSON.stringify({ text: ov.text || '', imageUrl: ov.imageUrl || '', txt: ov.txt || null, img: ov.img || null }),
+  });
+  if (!r.ok) throw new Error(r.status);
+}
+async function applyOverlay() {
+  const text = document.getElementById('ovText').value.trim();
+  if (!text && !_ovImageUrl) { toast('Add text or an image first'); return; }
+  // keep existing placements when re-applying (editing text mid-stream shouldn't reset layout)
+  const ov = { text, imageUrl: _ovImageUrl, txt: _ovCurrent?.txt || null, img: _ovCurrent?.img || null };
+  try {
+    await setOverlayOnServer(ov);
+    toast('Overlay is live — drag to move, pinch to resize');
+    closeOverlaySheet();
+  } catch(e) { toast('Could not set overlay'); }
+}
+async function clearOverlay() {
+  _ovImageUrl = '';
+  document.getElementById('ovText').value = '';
+  document.getElementById('ovPreview').innerHTML = '';
+  try { await setOverlayOnServer({ text: '', imageUrl: '' }); toast('Overlay cleared'); } catch(e) {}
+  closeOverlaySheet();
 }
 
 function closeLiveModal() {
@@ -3530,6 +3809,8 @@ function closeLiveModal() {
   if (preview.srcObject) { preview.srcObject.getTracks().forEach(t => t.stop()); preview.srcObject = null; }
   const viewVid = document.getElementById('liveViewVideo');
   viewVid.srcObject = null;
+  renderLiveOverlay(null);
+  setOverlayEditable(false);
   if (liveBroadcaster) { liveBroadcaster.cleanup(); liveBroadcaster = null; }
   if (liveViewer) { liveViewer.cleanup(); liveViewer = null; }
   if (liveSocket) { liveSocket.close(); liveSocket = null; }
@@ -4030,7 +4311,6 @@ function renderSidebar(node, item) {
   const avInner  = node.avatarUrl
     ? \`<img src="\${esc(node.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
     : esc(letter);
-  const followEl = isSelf ? '' : \`<div class="avatar-follow">+</div>\`;
   const liked    = item ? isLiked(item.id) : false;
   const likeClr  = liked ? 'filter:none;color:#FE2C55' : 'filter:grayscale(0.2)';
   const id       = item ? esc(item.id) : '';
@@ -4040,7 +4320,6 @@ function renderSidebar(node, item) {
     <div class="sidebar-item">
       <div class="avatar-wrap" onclick="openProfile('\${sub}')" style="cursor:pointer">
         <div class="avatar-circle" style="background:\${grad};overflow:hidden">\${avInner}</div>
-        \${followEl}
       </div>
     </div>
     <div class="sidebar-item">
@@ -4302,6 +4581,7 @@ function saveName() {
   const v = document.getElementById('nameInput').value.trim().slice(0, 30);
   if (!v) return;
   localStorage.setItem('guestName', v);
+  if (liveSocket) liveSocket.rename(v); // already in a live room — update the broadcaster's viewer list
   document.getElementById('nameModal').classList.remove('show');
   if (_namePromiseResolve) { _namePromiseResolve(v); _namePromiseResolve = null; }
 }
@@ -4460,9 +4740,14 @@ function showHeartBurst(x, y) {
 // ── SHARE ─────────────────────────────────────────────────────
 async function onShare() {
   const node = nodeGraph[nodeIndex];
-  const url  = node.url || window.location.origin;
+  const base = node.url || window.location.origin;
+  // share the POST you're on — /p/<id> permalinks carry the OG meta, so the link
+  // unfurls with the actual video/photo. Falls back to the node URL on empty cards.
+  const item = node.feed?.[node.postIndex];
+  const url   = item?.id ? base + '/p/' + item.id : base;
+  const title = item?.title || node.displayName || node.subdomain;
   try {
-    if (navigator.share) await navigator.share({ title: node.subdomain, url });
+    if (navigator.share) await navigator.share({ title, url });
     else { await navigator.clipboard.writeText(url); toast('link copied'); }
   } catch(e) {}
 }
@@ -4866,14 +5151,15 @@ function liveChatBase() {
   return (node && node.subdomain !== SELF_SUBDOMAIN) ? 'https://' + node.subdomain : '';
 }
 async function openLiveViewers() {
+  // who's-here is the HOST's moderation view — viewers see only the count on the badge
+  const node = nodeGraph[nodeIndex];
+  const canMod = isCreator && (!node || node.subdomain === SELF_SUBDOMAIN);
+  if (!canMod) return;
   document.getElementById('liveViewersModal').classList.add('show');
   const body = document.getElementById('liveViewersBody');
   body.textContent = 'Loading…';
-  const node = nodeGraph[nodeIndex];
-  const canMod = isCreator && (!node || node.subdomain === SELF_SUBDOMAIN);
   try {
-    // auth only when moderating our own room (same-origin); the viewer list itself is public
-    const d = await fetch(liveChatBase() + '/live/who.json', canMod ? { headers: { 'Authorization': 'Bearer ' + token } } : {}).then(r => r.json());
+    const d = await fetch(liveChatBase() + '/live/who.json', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
     const list = d.viewers || [];
     const row = (name, tag, right) =>
       '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">' +
@@ -5600,14 +5886,47 @@ function onTouchEnd() {
   committed ? commitSwipe() : cancelGesture();
 }
 
+let _caughtUpToasted = false; // "all caught up" nudge — once per session
+// Viewing history (this session): every post you swipe AWAY from, in order. Down-swipe
+// walks back through it like a browser back button — across creators, exact posts.
+const _viewHistory = [];
+
 function prepareIncoming(dx, dy) {
   const node     = nodeGraph[nodeIndex];
   const feedLen  = node.feed?.length || 0;
   let dir = null, nextNI = nodeIndex, nextPI = node.postIndex;
 
   if (G.axis === 'y') {
-    if (dy < 0 && nodeIndex < nodeGraph.length - 1) { dir = 'up';   nextNI = nodeIndex + 1; nextPI = nodeGraph[nextNI].postIndex; }
-    else if (dy > 0 && nodeIndex > 0)               { dir = 'down'; nextNI = nodeIndex - 1; nextPI = nodeGraph[nextNI].postIndex; }
+    if (dy < 0 && nodeGraph.length > 1) {
+      // forward swipe is UNSEEN-SEEKING: the next creator (wrapping past the end) who
+      // still has something you haven't watched; fully-drained creators are skipped.
+      let target = -1;
+      for (let k = 1; k < nodeGraph.length; k++) {
+        const cand = (nodeIndex + k) % nodeGraph.length;
+        if (hasUnseen(nodeGraph[cand])) { target = cand; break; }
+      }
+      if (target === -1) {
+        // nothing new anywhere — fall back to plain next/wrap so the feed never dead-ends
+        target = (nodeIndex + 1) % nodeGraph.length;
+        if (!_caughtUpToasted) { _caughtUpToasted = true; toast("You're all caught up — nothing new right now"); }
+      }
+      dir = 'up'; nextNI = target; nextPI = landingIndex(nodeGraph[target]);
+    }
+    else if (dy > 0) {
+      // back through VIEWING HISTORY — the exact post you came from, even if seen.
+      // Stale entries (blocked/unreachable creators) are skipped and dropped on commit.
+      for (let i = _viewHistory.length - 1; i >= 0; i--) {
+        const h = _viewHistory[i];
+        const ni = nodeGraph.findIndex(n => n.subdomain === h.sub);
+        if (ni < 0 || !nodeGraph[ni].feed || !nodeGraph[ni].feed.length) continue;
+        if (ni === nodeIndex && Math.min(h.pi, nodeGraph[ni].feed.length - 1) === node.postIndex) continue; // already here
+        dir = 'down'; nextNI = ni;
+        nextPI = Math.min(h.pi, nodeGraph[ni].feed.length - 1);
+        G.histIdx = i;
+        break;
+      }
+      // no usable history → boundary rubber-band (dir stays null)
+    }
   } else {
     if      (dx < 0 && node.postIndex < feedLen - 1) { dir = 'left';  nextPI = node.postIndex + 1; }
     else if (dx > 0 && node.postIndex > 0)            { dir = 'right'; nextPI = node.postIndex - 1; }
@@ -5624,9 +5943,11 @@ function prepareIncoming(dx, dy) {
   const targetNode = nodeGraph[nextNI];
   if (!targetNode.loaded && !targetNode.loading) {
     loadNode(targetNode).then(() => {
-      // refresh inactive panel if gesture still live
+      // refresh inactive panel if gesture still live — and re-aim at the first unseen
+      // post now that the feed (and seen-state) is actually known
       if (G.active && G.dir === dir) {
-        inactivePanel().innerHTML = renderCard(targetNode, nextPI);
+        G.nextPostIdx = landingIndex(targetNode);
+        inactivePanel().innerHTML = renderCard(targetNode, G.nextPostIdx);
       }
     });
   }
@@ -5681,8 +6002,18 @@ function commitSwipe() {
   activePanel().style.transform   = \`translate(\${exitX}px,\${exitY}px)\`;
   inactivePanel().style.transform = 'translate(0,0)';
 
-  // commit state
-  nodeGraph[nodeIndex].postIndex = G.nextPostIdx; // may be same node
+  // commit state — only the DESTINATION node's postIndex may change. Writing it to the
+  // outgoing node too (the old first line here) clobbered that node's position with the
+  // target's on every vertical swipe, so swiping back always "forgot" where you were.
+  const outNode = nodeGraph[nodeIndex];
+  if (G.dir === 'down') {
+    // consumed a history entry — truncate it (and any stale ones above it); going back
+    // must not itself create history, or down-down would ping-pong between two posts
+    _viewHistory.length = G.histIdx;
+  } else if (outNode.feed && outNode.feed[outNode.postIndex]) {
+    _viewHistory.push({ sub: outNode.subdomain, pi: outNode.postIndex });
+    if (_viewHistory.length > 200) _viewHistory.shift();
+  }
   nodeIndex = G.nextNodeIdx;
   nodeGraph[nodeIndex].postIndex = G.nextPostIdx;
 
@@ -5709,6 +6040,9 @@ function commitSwipe() {
     maybeShowFeedAd();
     prefetchUpcoming();
     const cur = nodeGraph[nodeIndex];
+    // every swiped-to post counts as seen — renderCurrent only covers boot/load paths,
+    // so without this the unseen-tracking missed everything watched via swiping
+    markSeen(cur.feed?.[cur.postIndex]?.id);
     if (cur.feed && cur.postIndex >= cur.feed.length - 5) loadMorePosts(cur);
   }, 290);
 }
@@ -5747,6 +6081,7 @@ function closeTopOverlay() {
   if (vis('creatorsModal')) { closeCreators(); return true; }
   if (vis('importModal')) { closeImport(); return true; }
   if (vis('reportModal')) { closeReport(); return true; }
+  if (vis('overlayModal')) { closeOverlaySheet(); return true; }
   if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }
   if (document.getElementById('liveModal').style.display === 'flex') {
