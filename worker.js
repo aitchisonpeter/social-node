@@ -3707,6 +3707,7 @@ function ovAttachGestures(id, key) {
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
   let drag = null, pinch = null;
   el.addEventListener('touchstart', e => {
+    if (!el.classList.contains('ov-edit')) return; // viewers tap the link, only the host drags
     const p = ovPlace(key); if (!p) return;
     e.preventDefault(); e.stopPropagation();
     if (e.touches.length >= 2) { pinch = { d0: ovDist(e.touches), s0: p.s }; drag = null; }
@@ -3734,6 +3735,7 @@ function ovAttachGestures(id, key) {
   });
   // desktop conveniences: mouse drag + wheel to resize
   el.addEventListener('mousedown', e => {
+    if (!el.classList.contains('ov-edit')) return;
     const p = ovPlace(key); if (!p) return;
     e.preventDefault();
     const m = { x0: e.clientX, y0: e.clientY, px: p.x, py: p.y };
@@ -3746,6 +3748,7 @@ function ovAttachGestures(id, key) {
     document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
   });
   el.addEventListener('wheel', e => {
+    if (!el.classList.contains('ov-edit')) return;
     const p = ovPlace(key); if (!p) return;
     e.preventDefault();
     p.s = clamp(p.s * (e.deltaY < 0 ? 1.08 : 0.92), 0.2, 4);
