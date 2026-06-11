@@ -2838,6 +2838,9 @@ body.creator .card-del { display: flex; }
   vertical-align: 1px; margin-right: 4px; letter-spacing: 0.5px;
 }
 .sub-badge.host { background: linear-gradient(135deg,#20D5EC,#2C7BFE); }
+/* lounge @mentions: styled token + a ping wash on messages that mention YOU */
+.mention { color: #20D5EC; font-weight: 600; }
+.lounge-ping { background: rgba(254,44,85,0.1); border-left: 2px solid #FE2C55; }
 .live-viewer-badge {
   position: absolute; top: max(env(safe-area-inset-top),12px); right: 12px;
   background: rgba(0,0,0,0.5); border-radius: 16px;
@@ -3452,6 +3455,15 @@ ${s.noscript || ''}
   </div>
 </div>
 
+<!-- Profile actions menu (☰ on the stats row) -->
+<div class="modal" id="profileMenuModal">
+  <div class="modal-header">
+    <div class="modal-title">Menu</div>
+    <button class="modal-close" onclick="closeProfileMenu()">×</button>
+  </div>
+  <div id="profileMenuList"></div>
+</div>
+
 <!-- Edit profile sheet -->
 <div class="edit-profile-sheet" id="editProfileSheet">
   <div class="modal-header">
@@ -3534,6 +3546,17 @@ ${s.noscript || ''}
     <button onclick="closeInbox()" style="background:none;color:#fff;font-size:22px;width:36px;height:36px;display:flex;align-items:center;justify-content:center">←</button>
     <div class="inbox-title">Inbox</div>
     <button onclick="markInboxRead()" style="font-size:13px;color:rgba(255,255,255,0.4)">Mark read</button>
+  </div>
+  <!-- pinned lounge door — the creator's way into their subscriber space -->
+  <div id="inboxLoungeRow" style="display:none;padding:12px 16px;border-bottom:0.5px solid rgba(255,255,255,0.1);cursor:pointer" onclick="openLounge(SELF_SUBDOMAIN)">
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="font-size:24px">💬</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:15px;font-weight:600">Subscriber lounge <span id="inboxLoungeNew" style="display:none;background:#FE2C55;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;vertical-align:2px"></span></div>
+        <div id="inboxLoungePreview" style="font-size:13px;color:rgba(255,255,255,0.45);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Your space with your subscribers</div>
+      </div>
+      <div style="color:rgba(255,255,255,0.3)">›</div>
+    </div>
   </div>
   <div class="inbox-list" id="inboxList">
     <div class="inbox-empty"><div class="inbox-empty-icon">💬</div>No notifications yet</div>
@@ -4558,10 +4581,10 @@ async function runPrerollThenView(subdomain) {
   prerollActive = !!ad;
   if (ad) { const lv = document.getElementById('liveViewVideo'); if (lv) lv.muted = true; }
   startLiveViewer(subdomain);
-  if (ad) { reportImpression(subdomain, 'live'); await playPreroll(ad, base, vid); }
+  if (ad) await playPreroll(ad, base, vid, subdomain); // impression reports from inside, only if the creative renders
 }
 
-function playPreroll(ad, base, vid) {
+function playPreroll(ad, base, vid, host) {
   return new Promise(resolve => {
     const overlay = document.getElementById('prerollOverlay');
     const video   = document.getElementById('prerollVideo');
@@ -4576,13 +4599,16 @@ function playPreroll(ad, base, vid) {
       sp.innerHTML = (ad.sponsorName ? '<strong>' + esc(ad.sponsorName) + '</strong>' : '') + (ad.clickUrl ? ' &nbsp;Learn more ›' : '');
     } else { sp.style.display = 'none'; }
 
-    overlay.style.display = 'block';
+    // BLACK-SCREEN FIX: load the creative invisibly; the overlay only appears once it can
+    // render. A slow/broken ad skips straight to the stream with no black flash.
+    video.preload = 'auto';
     video.src = ad.mediaUrl.startsWith('http') ? ad.mediaUrl : base + ad.mediaUrl;
 
-    let done = false;
+    let done = false, begun = false, guard = null;
     const finish = () => {
       if (done) return; done = true;
-      clearTimeout(guard);
+      if (guard) clearTimeout(guard);
+      clearTimeout(loadGuard);
       overlay.style.display = 'none';
       try { video.pause(); } catch {}
       video.src = '';
@@ -4598,9 +4624,12 @@ function playPreroll(ad, base, vid) {
           if (b) b.style.display = 'flex';
         });
       }
-      fetch(base + '/live/preroll/seen', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }),
-      }).catch(() => {});
+      // only bill the sponsor when the creative actually rendered
+      if (begun) {
+        fetch(base + '/live/preroll/seen', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }),
+        }).catch(() => {});
+      }
       resolve();
     };
     const tick = () => { cd.textContent = 'Stream starts in ' + Math.max(0, Math.ceil(dur - (video.currentTime || 0))) + '…'; };
@@ -4613,15 +4642,26 @@ function playPreroll(ad, base, vid) {
     video.ontimeupdate = tick;
     video.onended = finish;
     video.onerror = finish; // if the creative fails to load, don't trap the viewer
-    const guard = setTimeout(finish, (dur + 4) * 1000); // safety net if 'ended' never fires
-    // don't make the viewer stare at a black screen: if the creative hasn't started in 5s, skip to the stream
-    const startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) finish(); }, 5000);
-    video.onplaying = () => clearTimeout(startGuard);
+    // creative not renderable in 5s → no ad, straight to the stream (never shown black)
+    const loadGuard = setTimeout(() => { if (!begun) finish(); }, 5000);
 
-    // We arrived here via the user's "Live" tap, so unmuted autoplay should be allowed;
-    // fall back to muted if the browser still blocks it.
-    video.muted = false;
-    video.play().catch(() => { video.muted = true; video.play().catch(finish); });
+    const begin = () => {
+      if (begun || done) return;
+      begun = true;
+      clearTimeout(loadGuard);
+      reportImpression(host, 'live'); // root-verified count — only for creatives that render
+      tick();
+      overlay.style.display = 'block';
+      guard = setTimeout(finish, (dur + 4) * 1000); // safety net if 'ended' never fires
+      const startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) finish(); }, 4000);
+      video.onplaying = () => clearTimeout(startGuard);
+      // We arrived here via the user's "Live" tap, so unmuted autoplay should be allowed;
+      // fall back to muted if the browser still blocks it.
+      video.muted = false;
+      video.play().catch(() => { video.muted = true; video.play().catch(finish); });
+    };
+    video.oncanplay = begin;
+    if (video.readyState >= 3) begin(); // cache hit — canplay may not re-fire
   });
 }
 
@@ -4675,48 +4715,67 @@ function maybeShowFeedAd() {
 }
 
 function showFeedAd(ad, base, host) {
+  // BLACK-SCREEN FIX: the overlay only appears once the creative can actually render.
+  // The video loads invisibly first; a slow or broken ad means NO interruption at all
+  // (previously the overlay went black immediately and a watchdog bailed 4s later —
+  // the viewer experienced "an ad that's just a black screen").
+  if (_feedAdShowing) return;
   _feedAdShowing = true; _swipesSinceAd = 0;
   _feedAdCategory = ad.category || 'general';
-  localStorage.setItem('lastAdAt', String(Date.now()));
   _feedAdClickUrl = ad.clickUrl || ''; _feedAdBase = base;
   const ov = document.getElementById('feedAdOverlay');
   const video = document.getElementById('feedAdVideo');
   const sp = document.getElementById('feedAdSponsor');
   const cd = document.getElementById('feedAdCountdown');
-  pauseFeedVideos();
-  if (ad.sponsorName || ad.clickUrl) {
-    sp.style.display = 'block';
-    sp.innerHTML = (ad.sponsorName ? '<strong>' + esc(ad.sponsorName) + '</strong>' : '') + (ad.clickUrl ? ' &nbsp;Learn more ›' : '');
-  } else sp.style.display = 'none';
-  document.getElementById('feedAdSkip').style.display = 'none';
-  cd.style.display = 'block'; cd.textContent = '5…';
-  ov.style.display = 'block';
+  video.onended = null; video.onerror = null; video.onplaying = null; video.oncanplay = null;
+  video.preload = 'auto';
   video.src = ad.mediaUrl.startsWith('http') ? ad.mediaUrl : base + ad.mediaUrl;
-  let elapsed = 0;
-  video._timer = setInterval(() => {
-    elapsed++;
-    if (elapsed >= 5) {
-      cd.style.display = 'none';
-      document.getElementById('feedAdSkip').style.display = 'block';
-      clearInterval(video._timer); video._timer = null;
-    } else cd.textContent = (5 - elapsed) + '…';
-  }, 1000);
-  video.onended = skipFeedAd;
-  video.onerror = skipFeedAd; // never trap the viewer behind a broken creative
-  // a hung media fetch leaves play() pending forever — countdown over a black screen.
-  // If nothing has rendered within 4s, bail out instead of pretending an ad ran.
-  video._startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) skipFeedAd(); }, 4000);
-  video._counted = false;
-  video.onplaying = () => {
-    if (video._startGuard) { clearTimeout(video._startGuard); video._startGuard = null; }
-    if (video._counted) return;
-    video._counted = true;
-    // impression counts only when the creative actually renders (was: on display)
-    fetch(base + '/live/preroll/seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: getViewerId() }) }).catch(() => {});
-    reportImpression(host, 'feed');
+
+  let begun = false;
+  const abort = () => { if (begun) return; _feedAdShowing = false; video.oncanplay = null; video.onerror = null; video.src = ''; };
+  // creative not renderable in 6s → silently drop it; the viewer never knew an ad was due
+  video._loadGuard = setTimeout(abort, 6000);
+  video.onerror = () => { clearTimeout(video._loadGuard); begun ? skipFeedAd() : abort(); };
+
+  const begin = () => {
+    if (begun || !_feedAdShowing) return;
+    begun = true;
+    clearTimeout(video._loadGuard);
+    localStorage.setItem('lastAdAt', String(Date.now()));
+    pauseFeedVideos();
+    if (ad.sponsorName || ad.clickUrl) {
+      sp.style.display = 'block';
+      sp.innerHTML = (ad.sponsorName ? '<strong>' + esc(ad.sponsorName) + '</strong>' : '') + (ad.clickUrl ? ' &nbsp;Learn more ›' : '');
+    } else sp.style.display = 'none';
+    document.getElementById('feedAdSkip').style.display = 'none';
+    cd.style.display = 'block'; cd.textContent = '5…';
+    ov.style.display = 'block';
+    let elapsed = 0;
+    video._timer = setInterval(() => {
+      elapsed++;
+      if (elapsed >= 5) {
+        cd.style.display = 'none';
+        document.getElementById('feedAdSkip').style.display = 'block';
+        clearInterval(video._timer); video._timer = null;
+      } else cd.textContent = (5 - elapsed) + '…';
+    }, 1000);
+    video.onended = skipFeedAd;
+    // even a ready creative can wedge on play() (autoplay policy edge) — last-resort guard
+    video._startGuard = setTimeout(() => { if ((video.currentTime || 0) === 0) skipFeedAd(); }, 4000);
+    video._counted = false;
+    video.onplaying = () => {
+      if (video._startGuard) { clearTimeout(video._startGuard); video._startGuard = null; }
+      if (video._counted) return;
+      video._counted = true;
+      // impression counts only when the creative actually renders
+      fetch(base + '/live/preroll/seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: getViewerId() }) }).catch(() => {});
+      reportImpression(host, 'feed');
+    };
+    video.muted = false;
+    video.play().catch(() => { video.muted = true; video.play().catch(skipFeedAd); });
   };
-  video.muted = false;
-  video.play().catch(() => { video.muted = true; video.play().catch(skipFeedAd); });
+  video.oncanplay = begin;
+  if (video.readyState >= 3) begin(); // already buffered (cache hit) — canplay may not re-fire
 }
 
 function skipFeedAd() {
@@ -5264,6 +5323,44 @@ function loungeConnect() {
 function setLoungeMembers(n) {
   if (typeof n === 'number') document.getElementById('loungeMembers').textContent = '👥 ' + n;
 }
+// Names I answer to in this room (guest name, or the creator's display name + handle).
+function loungeMyNames() {
+  const out = [];
+  const raw = displayName();
+  if (raw) {
+    out.push(raw);
+    const mapped = commenterInfo(raw);
+    if (mapped) out.push(mapped.display);
+  }
+  return out.filter(Boolean).map(s => s.toLowerCase());
+}
+// Wrap @<known name> tokens in styled spans. Names can contain spaces, so we match
+// against the actual participant names (longest first) instead of guessing word edges.
+function loungeRichText(text, names) {
+  let html = esc(text);
+  for (const n of names) {
+    const tag = '@' + esc(n);
+    const low = () => html.toLowerCase();
+    let idx = low().indexOf(tag.toLowerCase());
+    if (idx === -1) continue;
+    let out = '', pos = 0;
+    while (idx !== -1) {
+      out += html.slice(pos, idx) + '<span class="mention">' + html.substr(idx, tag.length) + '</span>';
+      pos = idx + tag.length;
+      idx = low().indexOf(tag.toLowerCase(), pos);
+    }
+    html = out + html.slice(pos);
+  }
+  return html;
+}
+function mentionName(el) {
+  const n = el.getAttribute('data-name') || '';
+  if (!n) return;
+  const input = document.getElementById('loungeInput');
+  const cur = input.value;
+  input.value = (cur && !cur.endsWith(' ') ? cur + ' ' : cur) + '@' + n + ' ';
+  input.focus();
+}
 function renderLounge() {
   const box = document.getElementById('loungeList');
   if (!box) return;
@@ -5272,20 +5369,33 @@ function renderLounge() {
     return;
   }
   const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  // mentionable = everyone who has spoken (their SHOWN names), longest first so
+  // "@Sam Smith" wins over "@Sam"
+  const nameSet = {};
+  for (const m of _lounge.msgs) {
+    const who = commenterInfo(m.name);
+    nameSet[who ? who.display : (m.name || 'viewer')] = 1;
+  }
+  const knownNames = Object.keys(nameSet).sort((a, b) => b.length - a.length);
+  const mine = loungeMyNames();
+  const myRaw = (displayName() || '').toLowerCase();
   box.innerHTML = _lounge.msgs.map(m => {
     const badge = m.creator ? '<span class="sub-badge host">HOST</span>' : '<span class="sub-badge">SUB</span>';
     const who = commenterInfo(m.name);
     const shown = who ? who.display : (m.name || 'viewer');
+    const lowText = (m.text || '').toLowerCase();
+    const pingsMe = (m.name || '').toLowerCase() !== myRaw && mine.some(n => lowText.includes('@' + n));
     // push is DELIBERATE: the creator taps 📣 on one of their own messages
     const push = (_lounge.creatorMode && m.creator)
       ? '<button onclick="pushLoungeMsg(this)" data-text="' + esc(m.text) + '" style="background:none;font-size:15px;padding:0 6px;align-self:center" title="Push to subscribers">📣</button>'
       : '';
-    return '<div class="inbox-notif" style="cursor:default"><div class="inbox-notif-body">'
-      + '<div class="inbox-notif-text">' + badge + '<strong>' + esc(shown) + '</strong> ' + esc(m.text) + '</div>'
+    return '<div class="inbox-notif' + (pingsMe ? ' lounge-ping' : '') + '" style="cursor:default"><div class="inbox-notif-body">'
+      + '<div class="inbox-notif-text">' + badge + '<strong data-name="' + esc(shown) + '" onclick="mentionName(this)" style="cursor:pointer">' + esc(shown) + '</strong> ' + loungeRichText(m.text, knownNames) + '</div>'
       + '<div class="inbox-notif-time">' + timeAgo(m.at) + '</div>'
       + '</div>' + push + '</div>';
   }).join('');
   if (stick) box.scrollTop = box.scrollHeight;
+  localStorage.setItem('loungeSeen:' + _lounge.host, String(Date.now())); // feeds the inbox unread chip
 }
 function sendLounge() {
   const input = document.getElementById('loungeInput');
@@ -5490,6 +5600,16 @@ function closeProfile() {
   resumeFeedVideos();
 }
 
+// ☰ menu on the profile stats row — holds every action that used to be a pill
+let _profileMenuHtml = '';
+function openProfileMenu() {
+  document.getElementById('profileMenuList').innerHTML = _profileMenuHtml || '<div style="padding:20px;text-align:center;color:rgba(255,255,255,0.3)">Nothing here</div>';
+  document.getElementById('profileMenuModal').classList.add('show');
+}
+function closeProfileMenu() {
+  document.getElementById('profileMenuModal').classList.remove('show');
+}
+
 async function loadProfileData(subdomain) {
   if (_profileCache[subdomain] && Date.now() - _profileCache[subdomain].ts < 30000)
     return _profileCache[subdomain].data;
@@ -5536,21 +5656,25 @@ function renderProfileBody(data, subdomain) {
     </div>\`;
   }).join('');
 
+  // Two standalone pills max: Join-network (rare onboarding CTA) and Subscribe (the
+  // viewer's main CTA). Everything else lives in the ☰ menu on the stats row.
   const joinBtn = isOwn ? \`<button id="joinNetworkBtn" class="profile-connect-btn" style="display:\${isCreator && !isMember ? 'block' : 'none'};background:#20D5EC" onclick="requestJoin()">Join the network</button>\` : '';
-  const hostBtn = (isOwn && isHost) ? \`<button class="profile-connect-btn" style="background:#20D5EC" onclick="openCreators()">Manage creators</button>\` : '';
+  const subBtn = !isOwn ? \`<button class="profile-connect-btn" id="profileSubBtn" style="background:rgba(255,255,255,0.12)" onclick="onSubBtn('\${esc(subdomain)}')">⭐ Subscribe</button>\` : '';
+
+  const blocked = getBlocked().includes(subdomain);
+  const items = [];
   // Host configures the node-wide ad + sees the ledger; a hosted creator with a share %
   // gets a read-only earnings view; everyone else gets nothing.
-  const adBtn = (isOwn && isHost) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openPrerollSheet()">💰 Node ad &amp; revenue</button>\`
-              : (isOwn && data.adsEnabled) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openEarnings()">💰 Your earnings</button>\` : '';
-  const blocked = getBlocked().includes(subdomain);
-  const blockBtn = !isOwn ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleBlock('\${esc(subdomain)}')">\${blocked ? 'Unblock' : 'Block'}</button>\` : '';
-  // viewers: ⭐ Subscribe → ⏳ Requested → 💬 lounge (state set async by refreshSubBtn);
-  // the creator gets a direct door to their own lounge
-  const subBtn = !isOwn ? \`<button class="profile-connect-btn" id="profileSubBtn" style="background:rgba(255,255,255,0.12)" onclick="onSubBtn('\${esc(subdomain)}')">⭐ Subscribe</button>\` : '';
-  const loungeBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openLounge('\${esc(subdomain)}')">💬 Subscriber lounge</button>\` : '';
-  const importBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openImport()">📥 Import from TikTok</button>\` : '';
-  const algoBtn = subdomain === SELF_SUBDOMAIN ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openAlgo()">🎛 My algorithm</button>\` : '';
-  const selBtn = (isOwn && isCreator && (data.postCount || 0) > 0) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleSelMode()">☑️ Select posts</button>\` : '';
+  if (isOwn && isHost) items.push(['💰 Node ad &amp; revenue', 'openPrerollSheet()']);
+  else if (isOwn && data.adsEnabled) items.push(['💰 Your earnings', 'openEarnings()']);
+  if (isOwn && isHost) items.push(['👥 Manage creators', 'openCreators()']);
+  if (isOwn && isCreator) items.push(['📥 Import from TikTok', 'openImport()']);
+  if (subdomain === SELF_SUBDOMAIN) items.push(['🎛 My algorithm', 'openAlgo()']);
+  if (isOwn && isCreator && (data.postCount || 0) > 0) items.push(['☑️ Select posts', 'toggleSelMode()']);
+  if (!isOwn) items.push([(blocked ? '🚫 Unblock' : '🚫 Block'), \`toggleBlock('\${esc(subdomain)}')\`]);
+  _profileMenuHtml = items.map(it =>
+    \`<button class="profile-connect-btn" style="display:block;width:100%;background:rgba(255,255,255,0.08);text-align:left;margin:0 0 8px" onclick="closeProfileMenu();\${it[1]}">\${it[0]}</button>\`
+  ).join('') + \`<a href="\${pbase}/legal" target="_blank" onclick="closeProfileMenu()" style="display:block;text-align:center;margin-top:8px;font-size:12px;color:rgba(255,255,255,0.4);text-decoration:underline">Policies &amp; reporting</a>\`;
 
   document.getElementById('profileBody').innerHTML = \`
     <div class="profile-hero">
@@ -5566,10 +5690,13 @@ function renderProfileBody(data, subdomain) {
           <div class="profile-stat-n">\${data.networkSize ?? data.peerCount ?? 0}</div>
           <div class="profile-stat-l">Network</div>
         </div>
+        <div class="profile-stat" onclick="openProfileMenu()" style="cursor:pointer">
+          <div class="profile-stat-n">☰</div>
+          <div class="profile-stat-l">Menu</div>
+        </div>
       </div>
       \${bio ? \`<div class="profile-bio">\${esc(bio)}</div>\` : ''}
-      \${joinBtn}\${adBtn}\${hostBtn}\${loungeBtn}\${importBtn}\${algoBtn}\${selBtn}\${subBtn}\${blockBtn}
-      <a href="\${pbase}/legal" target="_blank" style="display:inline-block;margin-top:12px;font-size:12px;color:rgba(255,255,255,0.4);text-decoration:underline">Policies &amp; reporting</a>
+      \${joinBtn}\${subBtn}
     </div>
     <div class="profile-grid">\${gridHtml || '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3);grid-column:1/-1">No posts yet</div>'}</div>
   \`;
@@ -6051,6 +6178,7 @@ async function onInboxTap() {
   if (!isCreator) { onCreateTap(); return; }
   document.getElementById('inboxSheet').classList.add('show');
   pauseFeedVideos();
+  refreshInboxLoungeRow(); // async, fills the pinned lounge door
   document.getElementById('inboxList').innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;padding:60px;color:rgba(255,255,255,0.3)">Loading…</div>';
   try {
@@ -6062,6 +6190,32 @@ async function onInboxTap() {
     document.getElementById('inboxList').innerHTML =
       '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3)">Could not load inbox</div>';
   }
+}
+
+// The lounge lives under Inbox: a pinned row with last-message preview and an
+// unread count since the creator's last visit (tracked locally).
+function loungeSeenKey() { return 'loungeSeen:' + SELF_SUBDOMAIN; }
+async function refreshInboxLoungeRow() {
+  const row = document.getElementById('inboxLoungeRow');
+  if (!row) return;
+  row.style.display = 'block';
+  try {
+    const d = await fetch('/lounge/history.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: '{}',
+    }).then(r => r.json());
+    const msgs = d.messages || [];
+    const seen = +localStorage.getItem(loungeSeenKey()) || 0;
+    const unread = msgs.filter(m => Date.parse(m.at) > seen).length;
+    const last = msgs[msgs.length - 1];
+    const prev = document.getElementById('inboxLoungePreview');
+    if (last) prev.textContent = (last.name || 'viewer') + ': ' + last.text;
+    else prev.textContent = 'Your space with your subscribers';
+    const chip = document.getElementById('inboxLoungeNew');
+    if (unread > 0) { chip.style.display = 'inline-block'; chip.textContent = unread > 99 ? '99+' : unread + ' new'; }
+    else chip.style.display = 'none';
+  } catch(e) {}
 }
 
 function closeInbox() {
@@ -6795,6 +6949,7 @@ function closeTopOverlay() {
   if (vis('creatorsModal')) { closeCreators(); return true; }
   if (vis('importModal')) { closeImport(); return true; }
   if (vis('reportModal')) { closeReport(); return true; }
+  if (vis('profileMenuModal')) { closeProfileMenu(); return true; }
   if (vis('overlayModal')) { closeOverlaySheet(); return true; }
   if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }
