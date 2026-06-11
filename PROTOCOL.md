@@ -90,8 +90,38 @@ The escalation ingest: `{ "host", "postId", "reason", "details" }`. Non-root nod
 
 - `GET /post/likes?postId=&vid=` → `{ "count": 5, "liked": true }` (`liked` reflects the given `vid`)
 - `POST /post/like` `{ "postId", "vid", "liked": true|false }` → `{ "count", "liked" }` — idempotent per `vid`
-- `GET /post/comments?postId=` → `{ "comments": [ { "id", "name", "text", "at" }... ] }`
-- `POST /post/comment` `{ "postId", "text", "name" }` → `{ "ok": true, "comment": {...} }` (creator deletes via admin)
+- `GET /post/comments?postId=` → `{ "comments": [ { "id", "name", "text", "at", "sub"? }... ] }` (`sub: true` = verified subscriber, added 0.9.0)
+- `POST /post/comment` `{ "postId", "text", "name", "subToken"? }` → `{ "ok": true, "comment": {...} }` (creator deletes via admin; a valid active `subToken` stamps the comment `sub: true` — the badge is verified server-side, never client-claimed)
+
+---
+
+## Subscribers (added 0.9.0)
+
+Creator-approved membership for viewers — no account, same device-bound trust model as creator tokens: the plaintext subscriber token lives only on the viewer's device, the node stores its SHA-256. Active subscribers get a server-verified badge in live chat + comments, access to the creator's **lounge** (a persistent chat room), and may opt into creator-triggered Web Push.
+
+### Requesting
+- `POST /sub/request` `{ "name", "vid", "token"? }` → `{ "ok": true, "status": "pending", "token": "<shown once>" }` — rate-limited 5/10min/IP. The request lands in the creator's inbox; approval flips the token live. Passing an existing `token` is idempotent: it echoes the current standing instead of duplicating (`{ "ok": true, "status": "pending|active" }`).
+- `POST /sub/status` `{ "token" }` → `{ "status": "none|pending|active", "name", "push": bool }` — `none` means the token is dead (declined/removed); clients should discard it.
+
+### Lounge
+Persistent per-creator chat room — unlike live chat it never resets. Access = active subscriber token OR creator auth.
+
+- **WebSocket** `GET /lounge/ws?sub=<token>|auth=<creator credential>&name=&vid=` — upgrade required; non-members get `403`. Credentials ride query params (browsers can't set WS headers); the worker strips them before the room sees the connection. Server messages:
+  - `{ "t": "init", "lounge": [<msg>...], "members": n }` (last 300 messages)
+  - `{ "t": "chat", "msg": { "id", "name", "text", "sid", "at", "sub": true | "creator": true } }`
+  - `{ "t": "members", "members": n }`
+
+  Client→server: `{ "t": "chat", "text" }` (per-connection throttle; live-chat shadow-mutes apply here too).
+- `POST /lounge/history.json` `{ "token" | "auth" }` → `{ "messages": [...] }` (POST so tokens stay out of URLs/logs).
+
+### Web Push (opt-in)
+Standards-track Web Push: VAPID + RFC 8291 `aes128gcm` payload encryption. The VAPID key is **per worker** (all tenants of a worker share it — a browser origin allows only one push subscription with one `applicationServerKey`).
+
+- `GET /sub/vapid.json` → `{ "key": "<base64url P-256 public key>" }` — feed it to `pushManager.subscribe`.
+- `POST /sub/push` `{ "token", "subscription": <PushSubscription.toJSON()> }` — active subscribers only.
+- `POST /sub/push/clear` `{ "token" }` — stop pushes for this subscriber.
+
+Pushes are **deliberate**: nothing fires automatically. The creator pushes a specific lounge message (see Admin); the encrypted payload is `{ "host", "name", "text", "url" }`. Dead subscriptions (push service 404/410) are pruned on send.
 
 ---
 
@@ -107,14 +137,14 @@ Live streaming is WebRTC via Cloudflare Realtime (Calls) — sub-second latency,
 ### Chat
 Chat lives and dies with the stream: history (last 100 messages) is only served while live, and is cleared when the stream ends.
 
-- **WebSocket** `GET /live/ws?role=viewer|broadcaster&name=<display>&vid=<vid>` — upgrade required. Server messages:
+- **WebSocket** `GET /live/ws?role=viewer|broadcaster&name=<display>&vid=<vid>[&sub=<subscriber token>]` — upgrade required. A valid active `sub` token (verified and stripped at the worker, 0.9.0) stamps that connection's chat messages `sub: true`. Server messages:
   - `{ "t": "init", "status": {...}, "chat": [<msg>...], "viewers": n }`
-  - `{ "t": "chat", "msg": { "id", "name", "text", "sid", "at" } }`
+  - `{ "t": "chat", "msg": { "id", "name", "text", "sid", "at", "sub"? } }`
   - `{ "t": "viewers", "viewers": n }`
   - `{ "t": "live", "status": {...} }` / `{ "t": "ended" }`
 
   Client→server: `{ "t": "chat", "text": "...", "name": "..." }` (per-connection throttle applies).
-- **HTTP fallback**: `GET /live/chat.json` → `{ "messages": [...] }`; `POST /live/chat` `{ "text", "name", "vid" }` (per-IP throttled, 429 on spam).
+- **HTTP fallback**: `GET /live/chat.json` → `{ "messages": [...] }`; `POST /live/chat` `{ "text", "name", "vid", "subToken"? }` (per-IP throttled, 429 on spam).
 
 `sid` is a short hash of the sender's `vid` — stable enough to moderate, useless to impersonate. Muted senders are shadow-muted: their sends are silently dropped server-side.
 
@@ -180,6 +210,8 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 **Revenue** — `GET/POST /admin/preroll` *(master — the ad config is worker-wide)*; `GET /admin/preroll.json`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
 
 **Tenants & onboarding** *(all master)* — `GET /admin/provisioned`; `POST /admin/provision` / `/admin/unprovision` `{ host }`; `POST /admin/creator/mint-claim` `{ host }` → one-time claim code + URL; `POST /admin/creator/mint-token` / `/clear-token` `{ host }`.
+
+**Subscribers (added 0.9.0)** — `GET /admin/subs.json` → `{ subscribers: [ { id, name, status, requestedAt, approvedAt, push }... ] }`; `POST /admin/sub/approve` `{ subId }`; `POST /admin/sub/decline` `{ subId }` (declines a pending request OR removes an existing subscriber — the entry, its token, and any push registration die together); `POST /admin/lounge/push` `{ text ≤180 }` → `{ ok, sent, failed }` — Web-Push the text to every opted-in subscriber (rate-limited 2/min; prunes dead push subscriptions).
 
 **Network (root operator)** — `GET /admin/registry.json`; `POST /admin/registry/approve|deny|remove`; `GET /admin/inbox.json`; `POST /admin/request-join` (any member-to-be).
 

@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.8.0';
+const PROTOCOL_VERSION = '0.9.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -63,9 +63,11 @@ export class LiveRoom extends DurableObject {
       const name = (url.searchParams.get('name') || 'viewer').slice(0, 30);
       // sid = short hash of the client's viewer id — stable mute target that doesn't expose the raw vid
       const sid = await this.sidOf(url.searchParams.get('vid') || '');
+      // subok is set by the WORKER after verifying the subscriber token — the DO never sees tokens
+      const sub = url.searchParams.get('subok') === '1';
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ role, name, sid });
+      server.serializeAttachment({ role, name, sid, sub });
       this.ctx.acceptWebSocket(server);
       try {
         const status = await this.statusObj();
@@ -82,6 +84,35 @@ export class LiveRoom extends DurableObject {
       await this.sampleViewers();
       this.broadcastViewers();
       return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ---- subscriber lounge: persistent room, same DO, room-scoped sockets ----
+    // Unlike live chat (which resets per stream), the lounge never resets — it's the
+    // creator's standing space for approved subscribers. Access control happens at the
+    // worker route (active sub token or creator auth); the DO trusts its caller.
+    if (seg === 'lounge-ws') {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return new Response('expected websocket', { status: 426 });
+      }
+      const name = (url.searchParams.get('name') || 'viewer').slice(0, 30);
+      const sid = await this.sidOf(url.searchParams.get('vid') || '');
+      const role = url.searchParams.get('lrole') === 'creator' ? 'creator' : 'sub';
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.serializeAttachment({ room: 'lounge', role, name, sid, sub: role !== 'creator' });
+      this.ctx.acceptWebSocket(server);
+      try {
+        server.send(JSON.stringify({
+          t: 'init',
+          lounge: (await this.ctx.storage.get('lounge')) || [],
+          members: this.loungeCount(),
+        }));
+      } catch {}
+      this.broadcast({ t: 'members', members: this.loungeCount() }, 'lounge');
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    if (seg === 'lounge') {
+      return Response.json({ messages: (await this.ctx.storage.get('lounge')) || [] });
     }
 
     if (seg === 'status') {
@@ -162,7 +193,8 @@ export class LiveRoom extends DurableObject {
       for (const ws of this.ctx.getWebSockets()) {
         try {
           const a = ws.deserializeAttachment() || {};
-          people.push({ name: a.name || 'viewer', sid: a.sid || '', role: a.role || 'viewer', muted: !!(a.sid && muted[a.sid]) });
+          if (a.room === 'lounge') continue; // lounge members aren't stream viewers
+          people.push({ name: a.name || 'viewer', sid: a.sid || '', role: a.role || 'viewer', sub: !!a.sub, muted: !!(a.sid && muted[a.sid]) });
         } catch {}
       }
       return Response.json({
@@ -196,11 +228,11 @@ export class LiveRoom extends DurableObject {
         return Response.json({ error: 'slow down' }, { status: 429 });
       }
       this._httpRate.set(ip, now);
-      const { text, name, vid } = await request.json().catch(() => ({}));
+      const { text, name, vid, sub } = await request.json().catch(() => ({}));
       const sid = await this.sidOf(vid || '');
       const muted = (await this.ctx.storage.get('muted')) || {};
       if (sid && muted[sid]) return Response.json({ ok: true }); // shadow-mute: silently dropped
-      const msg = await this.addChat(text, name, sid);
+      const msg = await this.addChat(text, name, sid, !!sub); // sub verified at the worker route
       return Response.json(msg ? { ok: true } : { error: 'empty' }, { status: msg ? 200 : 400 });
     }
 
@@ -292,8 +324,8 @@ export class LiveRoom extends DurableObject {
       return Response.json({ comments: await this.commentsGet(url.searchParams.get('postId') || '') });
     }
     if (seg === 'comment' && request.method === 'POST') {
-      const { postId, text, name } = await request.json().catch(() => ({}));
-      const c = await this.commentAdd(postId, text, name);
+      const { postId, text, name, sub } = await request.json().catch(() => ({}));
+      const c = await this.commentAdd(postId, text, name, !!sub); // sub verified at the worker route
       return Response.json(c ? { ok: true, comment: c } : { error: 'empty' }, { status: c ? 200 : 400 });
     }
     if (seg === 'comment-del' && request.method === 'POST') {
@@ -324,13 +356,14 @@ export class LiveRoom extends DurableObject {
     return (await this.ctx.storage.get('cmt:' + postId)) || [];
   }
 
-  async commentAdd(postId, text, name) {
+  async commentAdd(postId, text, name, sub) {
     if (!postId || !text || !String(text).trim()) return null;
     const c = {
       id: crypto.randomUUID(),
       name: String(name || 'viewer').slice(0, 30),
       text: String(text).slice(0, 300),
       at: new Date().toISOString(),
+      ...(sub ? { sub: true } : {}),
     };
     const list = (await this.ctx.storage.get('cmt:' + postId)) || [];
     list.push(c);
@@ -449,7 +482,7 @@ export class LiveRoom extends DurableObject {
     return [...new Uint8Array(d)].slice(0, 6).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
-  async addChat(text, name, sid) {
+  async addChat(text, name, sid, sub) {
     if (!text || !String(text).trim()) return null;
     const msg = {
       id: crypto.randomUUID(),
@@ -457,6 +490,7 @@ export class LiveRoom extends DurableObject {
       name: String(name || 'viewer').slice(0, 30),
       sid: sid || '',
       at: new Date().toISOString(),
+      ...(sub ? { sub: true } : {}),
     };
     const chat = (await this.ctx.storage.get('chat')) || [];
     chat.push(msg);
@@ -466,11 +500,43 @@ export class LiveRoom extends DurableObject {
     return msg;
   }
 
-  broadcast(obj) {
+  // room defaults to 'live' so every pre-lounge caller is unchanged; lounge traffic
+  // never leaks to stream viewers and vice versa.
+  broadcast(obj, room) {
     const data = JSON.stringify(obj);
+    const want = room || 'live';
     for (const ws of this.ctx.getWebSockets()) {
+      let r = 'live';
+      try { r = (ws.deserializeAttachment() || {}).room || 'live'; } catch {}
+      if (r !== want) continue;
       try { ws.send(data); } catch {}
     }
+  }
+
+  loungeCount() {
+    let n = 0;
+    for (const ws of this.ctx.getWebSockets()) {
+      try { if (ws.deserializeAttachment()?.room === 'lounge') n++; } catch {}
+    }
+    return n;
+  }
+
+  async addLounge(text, att) {
+    if (!text || !String(text).trim()) return null;
+    const msg = {
+      id: crypto.randomUUID(),
+      text: String(text).slice(0, 300),
+      name: String(att.name || 'viewer').slice(0, 30),
+      sid: att.sid || '',
+      at: new Date().toISOString(),
+      ...(att.role === 'creator' ? { creator: true } : { sub: true }),
+    };
+    const lounge = (await this.ctx.storage.get('lounge')) || [];
+    lounge.push(msg);
+    if (lounge.length > 300) lounge.splice(0, lounge.length - 300);
+    await this.ctx.storage.put('lounge', lounge);
+    this.broadcast({ t: 'chat', msg }, 'lounge');
+    return msg;
   }
 
   broadcastViewers() {
@@ -499,13 +565,23 @@ export class LiveRoom extends DurableObject {
       const nm = String(data.name || '').slice(0, 30);
       if (nm && nm !== att.name) { att.name = nm; ws.serializeAttachment(att); }
       const muted = (await this.ctx.storage.get('muted')) || {};
-      if (att.sid && muted[att.sid]) return; // shadow-mute: silently dropped
-      await this.addChat(data.text, data.name || att.name, att.sid);
+      if (att.sid && muted[att.sid] && att.role !== 'creator') return; // shadow-mute: silently dropped
+      if (att.room === 'lounge') {
+        await this.addLounge(data.text, att);
+        return;
+      }
+      await this.addChat(data.text, data.name || att.name, att.sid, !!att.sub);
     }
   }
 
   async webSocketClose(ws, code, reason) {
     try { ws.close(code, reason); } catch {}
+    let room = 'live';
+    try { room = (ws.deserializeAttachment() || {}).room || 'live'; } catch {}
+    if (room === 'lounge') {
+      this.broadcast({ t: 'members', members: this.loungeCount() }, 'lounge');
+      return;
+    }
     await this.sampleViewers();
     this.broadcastViewers();
   }
@@ -629,6 +705,97 @@ async function makeSession(identity, host, days = 30) {
   const payload = btoa(JSON.stringify({ h: host, exp: Math.floor(Date.now() / 1000) + days * 86400 }));
   return payload + '.' + (await sign(identity.privateKey, payload));
 }
+// ============================================================
+// WEB PUSH  (VAPID + RFC 8291 aes128gcm payload encryption)
+// ============================================================
+// The VAPID keypair is per WORKER (global store), deliberately NOT per tenant: a browser
+// origin can hold only ONE push subscription with ONE applicationServerKey, so every
+// tenant served by this worker must present the same key or subscribing to a second
+// creator from the same origin would throw. Separate sovereign workers have their own
+// key — subscribing to creators on two different workers from one origin is a known v1
+// limit (the client surfaces it).
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(str) {
+  str = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  const bin = atob(str);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}
+async function ensureVapid(gstore) {
+  let v = await gstore.get('vapid');
+  if (v && v.pub && v.privJwk) return v;
+  const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  v = {
+    pub: b64url(new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey))),
+    privJwk: await crypto.subtle.exportKey('jwk', kp.privateKey),
+    at: new Date().toISOString(),
+  };
+  await gstore.set('vapid', v);
+  return v;
+}
+async function vapidJwt(vapid, audience, subject) {
+  const te = new TextEncoder();
+  const enc = o => b64url(te.encode(JSON.stringify(o)));
+  const signing = enc({ typ: 'JWT', alg: 'ES256' }) + '.' +
+    enc({ aud: audience, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject });
+  const key = await crypto.subtle.importKey('jwk', vapid.privJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, te.encode(signing)));
+  return signing + '.' + b64url(sig); // WebCrypto emits raw r||s — exactly what JWS wants
+}
+// RFC 8291 encryption (single record, aes128gcm content coding). asKeyPair/saltOverride
+// exist ONLY so the test harness can pin the RFC's Appendix-A vector.
+async function webPushEncrypt(p256dhB64, authB64, plaintext, asKeyPair, saltOverride) {
+  const te = new TextEncoder();
+  const uaPub = b64urlDecode(p256dhB64);        // 65-byte uncompressed P-256 point
+  const authSecret = b64urlDecode(authB64);     // 16-byte shared auth secret
+  const asKp = asKeyPair || await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey('raw', asKp.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', uaPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const ecdh = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, asKp.privateKey, 256));
+  const hkdf = async (salt, ikm, info, len) => {
+    const k = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info }, k, len * 8));
+  };
+  const keyInfo = new Uint8Array([...te.encode('WebPush: info\0'), ...uaPub, ...asPub]);
+  const ikm = await hkdf(authSecret, ecdh, keyInfo, 32);
+  const salt = saltOverride || crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(salt, ikm, te.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hkdf(salt, ikm, te.encode('Content-Encoding: nonce\0'), 12);
+  const padded = new Uint8Array([...te.encode(plaintext), 2]); // 0x02 = last-record delimiter
+  const key = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, padded));
+  const header = new Uint8Array(16 + 4 + 1 + 65); // salt | rs | idlen | keyid(as_public)
+  header.set(salt, 0);
+  new DataView(header.buffer).setUint32(16, 4096);
+  header[20] = 65;
+  header.set(asPub, 21);
+  return new Uint8Array([...header, ...ct]);
+}
+// Returns the push service's HTTP status; 404/410 mean the subscription is dead.
+async function sendWebPush(vapid, subscription, payloadObj, subject) {
+  const aud = new URL(subscription.endpoint).origin;
+  const jwt = await vapidJwt(vapid, aud, subject);
+  const body = await webPushEncrypt(subscription.keys.p256dh, subscription.keys.auth, JSON.stringify(payloadObj));
+  const r = await fetch(subscription.endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'vapid t=' + jwt + ', k=' + vapid.pub,
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      'TTL': '86400',
+      'Urgency': 'normal',
+    },
+    body,
+  });
+  return r.status;
+}
+
 async function verifySession(identity, host, tokenStr) {
   const dot = tokenStr.indexOf('.');
   if (dot < 0) return false;
@@ -1106,6 +1273,97 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors({ ok: true });
   }
 
+  // ---- subscribers (creator-approved, device-bound token) ----
+  // A viewer asks to subscribe → the request lands in the creator's inbox → approval
+  // turns the device token live. Active subscribers get a server-verified badge in live
+  // chat + comments, lounge access, and may opt into creator-triggered pushes.
+  if (path === '/sub/request' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    // idempotent re-ask: a device that already holds a token learns its standing instead of duplicating
+    const existing = await verifySubToken(b.token || '');
+    if (existing) return jsonCors({ ok: true, status: existing.status });
+    if (!(await rlAllowed('subreq', 5, 600000))) return jsonCors({ error: 'rate limited' }, 429);
+    const name = String(b.name || '').trim().slice(0, 30) || 'viewer';
+    const subs = await getSubs();
+    // pending-flood cap: keep at most 200 unapproved requests, oldest dropped
+    const pending = Object.entries(subs).filter(([, s]) => s.status === 'pending');
+    if (pending.length >= 200) {
+      pending.sort((a, b2) => (a[1].requestedAt < b2[1].requestedAt ? -1 : 1));
+      delete subs[pending[0][0]];
+    }
+    const subId = crypto.randomUUID();
+    const token = randomTokenHex();
+    subs[subId] = { name, tokenHash: await sha256hex(token), status: 'pending', requestedAt: new Date().toISOString() };
+    await storage.set('subs', subs);
+    const notifs = (await storage.get('inbox:notifications')) || [];
+    notifs.unshift({ id: crypto.randomUUID(), type: 'sub_request', subId, name, at: new Date().toISOString(), read: false });
+    if (notifs.length > 100) notifs.splice(100);
+    await storage.set('inbox:notifications', notifs);
+    return jsonCors({ ok: true, status: 'pending', token });
+  }
+  if (path === '/sub/status' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const s = await verifySubToken(b.token || '');
+    return jsonCors(s ? { status: s.status, name: s.name, push: !!s.push } : { status: 'none' });
+  }
+  // Web Push opt-in: the browser's PushSubscription is stored on the subscriber record.
+  if (path === '/sub/vapid.json') {
+    return jsonCors({ key: (await ensureVapid(gstore)).pub });
+  }
+  if (path === '/sub/push' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const s = await activeSub(b.token || '');
+    if (!s) return jsonCors({ error: 'subscribers only' }, 403);
+    const p = b.subscription || {};
+    const okShape = p.endpoint && String(p.endpoint).startsWith('https://') && String(p.endpoint).length < 1024 &&
+      p.keys && typeof p.keys.p256dh === 'string' && p.keys.p256dh.length < 200 &&
+      typeof p.keys.auth === 'string' && p.keys.auth.length < 64;
+    if (!okShape) return jsonCors({ error: 'bad subscription' }, 400);
+    const subs = await getSubs();
+    if (!subs[s.id]) return jsonCors({ error: 'unknown subscriber' }, 404);
+    subs[s.id].push = { endpoint: p.endpoint, keys: { p256dh: p.keys.p256dh, auth: p.keys.auth } };
+    subs[s.id].pushAt = new Date().toISOString();
+    await storage.set('subs', subs);
+    return jsonCors({ ok: true });
+  }
+  if (path === '/sub/push/clear' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const s = await verifySubToken(b.token || '');
+    if (!s) return jsonCors({ error: 'unknown token' }, 403);
+    const subs = await getSubs();
+    if (subs[s.id]) { delete subs[s.id].push; delete subs[s.id].pushAt; await storage.set('subs', subs); }
+    return jsonCors({ ok: true });
+  }
+
+  // ---- lounge: persistent subscribers-only room (DO-backed, WS-first) ----
+  if (path === '/lounge/ws') {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('expected websocket', { status: 426 });
+    }
+    // browsers can't set headers on a WS — creator auth and sub tokens ride query params.
+    // The worker strips them and forwards clean flags; the DO never sees credentials.
+    const wsUrl = new URL(request.url);
+    const subTok = wsUrl.searchParams.get('sub') || '';
+    const authTok = wsUrl.searchParams.get('auth') || '';
+    wsUrl.searchParams.delete('sub');
+    wsUrl.searchParams.delete('auth');
+    const isCreatorConn = authTok ? await checkAuth(request, authTok) : false;
+    if (!isCreatorConn && !(await activeSub(subTok))) {
+      return new Response('subscribers only', { status: 403 });
+    }
+    wsUrl.searchParams.set('lrole', isCreatorConn ? 'creator' : 'sub');
+    wsUrl.pathname = '/lounge-ws';
+    return liveStub(env, subdomain).fetch(new Request(wsUrl, request));
+  }
+  if (path === '/lounge/history.json' && request.method === 'POST') {
+    // POST so the sub token travels in the body, not in cacheable/loggable URLs
+    const b = await request.json().catch(() => ({}));
+    const ok = (await checkAuth(request)) || (b.auth && await checkAuth(request, b.auth)) || (await activeSub(b.token || ''));
+    if (!ok) return jsonCors({ error: 'subscribers only' }, 403);
+    const r = await liveDO(env, subdomain, '/lounge');
+    return jsonCors(await r.json());
+  }
+
   // ---- public profile ----
   if (path === '/profile.json') {
     const profile = (await storage.get('profile')) || {};
@@ -1155,6 +1413,34 @@ async function handleRequest(request, storage, env, ctx) {
   function isMaster(req) {
     const auth = req.headers.get('Authorization') || '';
     return auth.startsWith('Bearer ') && !!env.ADMIN_TOKEN && ctEq(auth.slice(7), env.ADMIN_TOKEN);
+  }
+
+  // ---- subscriber token verification (device-bound, hash-only at rest) ----
+  // `subs` blob per tenant: { [subId]: {name, status:'pending'|'active', tokenHash,
+  // requestedAt, approvedAt?, push?} }. Same trust model as creator tokens: the plaintext
+  // lives only on the subscriber's device; we keep the SHA-256.
+  async function getSubs() { return (await storage.get('subs')) || {}; }
+  async function verifySubToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const subs = await getSubs();
+    const h = await sha256hex(token.slice(0, 128));
+    for (const id of Object.keys(subs)) {
+      if (subs[id].tokenHash && ctEq(h, subs[id].tokenHash)) return { id, ...subs[id] };
+    }
+    return null;
+  }
+  async function activeSub(token) {
+    const s = await verifySubToken(token);
+    return s && s.status === 'active' ? s : null;
+  }
+  // Mark the inbox card resolved once the creator acted on it (mirrors resolveJoinRequest).
+  async function resolveSubRequest(subId, resolution) {
+    const notifs = (await storage.get('inbox:notifications')) || [];
+    let changed = false;
+    for (const n of notifs) {
+      if (n.type === 'sub_request' && n.subId === subId && !n.resolved) { n.resolved = resolution; changed = true; }
+    }
+    if (changed) await storage.set('inbox:notifications', notifs);
   }
 
   // ---- admin: verify token ----
@@ -1327,7 +1613,12 @@ async function handleRequest(request, storage, env, ctx) {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
-    return liveStub(env, subdomain).fetch(request);
+    // subscriber badge: verify the token HERE, forward a clean subok flag (the DO trusts its caller)
+    const wsUrl = new URL(request.url);
+    const subTok = wsUrl.searchParams.get('sub') || '';
+    wsUrl.searchParams.delete('sub');
+    if (subTok && (await activeSub(subTok))) wsUrl.searchParams.set('subok', '1');
+    return liveStub(env, subdomain).fetch(new Request(wsUrl, request));
   }
 
   // ---- live: public status (DO-backed; includes viewer count) ----
@@ -1351,8 +1642,9 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(await r.json());
   }
   if (path === '/live/chat' && request.method === 'POST') {
-    const body = await request.text();
-    const r = await liveDO(env, subdomain, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Chat-Ip': request.headers.get('CF-Connecting-IP') || '' }, body });
+    const b = await request.json().catch(() => ({}));
+    const sub = !!(await activeSub(b.subToken || ''));
+    const r = await liveDO(env, subdomain, '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Chat-Ip': request.headers.get('CF-Connecting-IP') || '' }, body: JSON.stringify({ text: b.text, name: b.name, vid: b.vid, sub }) });
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
@@ -1428,8 +1720,9 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(await r.json());
   }
   if (path === '/post/comment' && request.method === 'POST') {
-    const body = await request.text();
-    const r = await liveDO(env, subdomain, '/comment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const b = await request.json().catch(() => ({}));
+    const sub = !!(await activeSub(b.subToken || ''));
+    const r = await liveDO(env, subdomain, '/comment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: b.postId, text: b.text, name: b.name, sub }) });
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
@@ -1675,6 +1968,72 @@ async function handleRequest(request, storage, env, ctx) {
     const body = await request.text();
     const r = await liveDO(env, subdomain, '/comment-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return json(await r.json());
+  }
+
+  // ---- admin: subscribers (approve / decline / list) ----
+  if (path === '/admin/sub/approve' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const { subId } = await request.json().catch(() => ({}));
+    const subs = await getSubs();
+    if (!subId || !subs[subId]) return json({ error: 'unknown subscriber' }, 404);
+    subs[subId].status = 'active';
+    subs[subId].approvedAt = new Date().toISOString();
+    await storage.set('subs', subs);
+    await resolveSubRequest(subId, 'approved');
+    return json({ ok: true });
+  }
+  // Decline a pending request OR remove an existing subscriber — either way the entry
+  // (and with it the device token + any push subscription) is gone.
+  if (path === '/admin/sub/decline' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const { subId } = await request.json().catch(() => ({}));
+    const subs = await getSubs();
+    if (!subId || !subs[subId]) return json({ error: 'unknown subscriber' }, 404);
+    delete subs[subId];
+    await storage.set('subs', subs);
+    await resolveSubRequest(subId, 'declined');
+    return json({ ok: true });
+  }
+  if (path === '/admin/subs.json') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const subs = await getSubs();
+    return json({ subscribers: Object.entries(subs).map(([id, s]) => ({
+      id, name: s.name, status: s.status, requestedAt: s.requestedAt, approvedAt: s.approvedAt || null, push: !!s.push,
+    })) });
+  }
+
+  // ---- admin: push a lounge message to opted-in subscribers ----
+  // Push is DELIBERATE: nothing fires automatically. The creator taps 📣 on one of their
+  // own lounge messages and exactly that text goes out. Self-rate-limited (2/min) so a
+  // fat finger can't strafe everyone's lock screen.
+  if (path === '/admin/lounge/push' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    if (!(await rlAllowed('loungepush', 2, 60000))) return json({ error: 'pushing too fast — wait a minute' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const text = String(b.text || '').trim().slice(0, 180);
+    if (!text) return json({ error: 'text required' }, 400);
+    const subs = await getSubs();
+    const targets = Object.entries(subs).filter(([, s]) => s.status === 'active' && s.push);
+    if (!targets.length) return json({ ok: true, sent: 0, failed: 0, note: 'no subscribers have push enabled' });
+    const vapid = await ensureVapid(gstore);
+    const profile = (await storage.get('profile')) || {};
+    const payload = {
+      host: subdomain,
+      name: profile.displayName || subdomain.split('.')[0],
+      text,
+      url: 'https://' + subdomain + '/',
+    };
+    let sent = 0, failed = 0, changed = false;
+    for (const [id, s] of targets) {
+      try {
+        const status = await sendWebPush(vapid, s.push, payload, 'https://' + subdomain);
+        if (status === 404 || status === 410) { delete subs[id].push; delete subs[id].pushAt; changed = true; failed++; }
+        else if (status >= 200 && status < 300) sent++;
+        else failed++;
+      } catch (e) { failed++; }
+    }
+    if (changed) await storage.set('subs', subs);
+    return json({ ok: true, sent, failed });
   }
 
   // ---- admin: pre-roll sponsor ad config ----
@@ -2214,6 +2573,27 @@ self.addEventListener('fetch', e => {
     fetch(e.request).catch(() => caches.match(e.request))
   );
 });
+// Web Push — payload is RFC 8291-encrypted JSON {host, name, text, url} sent only when
+// a creator deliberately pushes a lounge message to opted-in subscribers.
+self.addEventListener('push', e => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) {}
+  e.waitUntil(self.registration.showNotification(d.name || 'Social Node', {
+    body: d.text || 'New message',
+    icon: '/icon.svg',
+    badge: '/icon.svg',
+    tag: 'sn-' + (d.host || 'push'),
+    data: { url: d.url || '/' },
+  }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/';
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+    for (const c of list) { if (c.url === url && 'focus' in c) return c.focus(); }
+    return clients.openWindow(url);
+  }));
+});
 `;
 }
 
@@ -2451,6 +2831,13 @@ body.creator .card-del { display: flex; }
   font-size: 13px; color: #fff; width: fit-content; max-width: 80%;
 }
 .live-chat-msg strong { color: #FE2C55; }
+/* subscriber badge — server-verified, shown in live chat, comments, and the lounge */
+.sub-badge {
+  display: inline-block; background: linear-gradient(135deg,#FE2C55,#FF7A45);
+  color: #fff; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
+  vertical-align: 1px; margin-right: 4px; letter-spacing: 0.5px;
+}
+.sub-badge.host { background: linear-gradient(135deg,#20D5EC,#2C7BFE); }
 .live-viewer-badge {
   position: absolute; top: max(env(safe-area-inset-top),12px); right: 12px;
   background: rgba(0,0,0,0.5); border-radius: 16px;
@@ -3167,6 +3554,23 @@ ${s.noscript || ''}
   </div>
 </div>
 
+<!-- Subscriber lounge — persistent per-creator chat space (subscribers + the creator) -->
+<div class="inbox-sheet" id="loungeSheet">
+  <div class="inbox-header">
+    <button onclick="closeLounge()" style="background:none;color:#fff;font-size:22px;width:36px;height:36px;display:flex;align-items:center;justify-content:center">←</button>
+    <div class="inbox-title" id="loungeTitle">Lounge</div>
+    <div style="display:flex;align-items:center;gap:4px">
+      <span id="loungeMembers" style="font-size:12px;color:rgba(255,255,255,0.5)"></span>
+      <button id="loungeBell" onclick="toggleLoungePush()" title="Push notifications" style="background:none;font-size:18px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;opacity:0.4">🔔</button>
+    </div>
+  </div>
+  <div class="inbox-list" id="loungeList"></div>
+  <div style="display:flex;gap:8px;padding:10px 12px calc(max(env(safe-area-inset-bottom),10px) + 4px);border-top:0.5px solid rgba(255,255,255,0.1)">
+    <input id="loungeInput" placeholder="Message the lounge…" maxlength="300" style="flex:1;background:rgba(255,255,255,0.08);border:none;border-radius:20px;padding:10px 16px;color:#fff;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')sendLounge()">
+    <button onclick="sendLounge()" style="background:#FE2C55;border:none;color:#fff;border-radius:20px;padding:10px 18px;font-size:14px;font-weight:600">Send</button>
+  </div>
+</div>
+
 <!-- Publish modal -->
 <div class="modal" id="publishModal">
   <div class="modal-header">
@@ -3510,6 +3914,7 @@ class LiveSocket {
   constructor(subdomain, role, opts) {
     this.opts = opts || {};
     this.role = role;
+    this.sub = subdomain; // canonical host — keys the subscriber token
     this.host = subdomain === SELF_SUBDOMAIN ? location.host : subdomain;
     this.chat = [];
     this.closed = false;
@@ -3520,7 +3925,9 @@ class LiveSocket {
     // URL built per attempt so reconnects carry the CURRENT display name
     const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const name = displayName() || 'viewer';
-    const url = wsScheme + this.host + '/live/ws?role=' + this.role + '&name=' + encodeURIComponent(name) + '&vid=' + encodeURIComponent(getViewerId());
+    const stok = subTokenFor(this.sub);
+    const url = wsScheme + this.host + '/live/ws?role=' + this.role + '&name=' + encodeURIComponent(name) + '&vid=' + encodeURIComponent(getViewerId())
+      + (stok ? '&sub=' + encodeURIComponent(stok) : '');
     try { this.ws = new WebSocket(url); } catch(e) { return; }
     this.ws.onmessage = e => this.onMsg(e);
     this.ws.onclose = () => { if (!this.closed) setTimeout(() => this.connect(), 2000); };
@@ -3559,7 +3966,8 @@ class LiveSocket {
         ? ' data-sid="' + esc(m.sid) + '" data-name="' + esc(m.name) + '" onclick="modMuteTap(this)" style="cursor:pointer"'
         : '';
       const who = commenterInfo(m.name);
-      return '<div class="live-chat-msg"' + mod + '><strong>' + esc(who ? who.display : m.name) + '</strong> ' + esc(m.text) + '</div>';
+      const badge = m.sub ? '<span class="sub-badge">SUB</span>' : '';
+      return '<div class="live-chat-msg"' + mod + '>' + badge + '<strong>' + esc(who ? who.display : m.name) + '</strong> ' + esc(m.text) + '</div>';
     }).join('');
     if (stick) box.scrollTop = box.scrollHeight;
   }
@@ -3889,7 +4297,7 @@ async function liveSendChat() {
   await fetch(base + '/live/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, name, vid: getViewerId() }),
+    body: JSON.stringify({ text, name, vid: getViewerId(), subToken: node ? subTokenFor(node.subdomain) : '' }),
   }).catch(() => {});
 }
 
@@ -3905,7 +4313,7 @@ function startLiveChatPoll(subdomain) {
         const box = document.getElementById('liveChatBox');
         if (box) {
           box.innerHTML = msgs.map(m =>
-            \`<div class="live-chat-msg"><strong>\${esc(m.name)}</strong> \${esc(m.text)}</div>\`
+            \`<div class="live-chat-msg">\${m.sub ? '<span class="sub-badge">SUB</span>' : ''}<strong>\${esc(m.name)}</strong> \${esc(m.text)}</div>\`
           ).join('');
           box.scrollTop = box.scrollHeight;
         }
@@ -4672,7 +5080,7 @@ function renderComments(list) {
     return \`<div class="inbox-notif" style="cursor:default">
       <div class="inbox-notif-avatar" style="background:\${grad};overflow:hidden">\${avInner}</div>
       <div class="inbox-notif-body">
-        <div class="inbox-notif-text"><strong>\${esc(shown)}</strong> \${esc(c.text)}</div>
+        <div class="inbox-notif-text">\${c.sub ? '<span class="sub-badge">SUB</span>' : ''}<strong>\${esc(shown)}</strong> \${esc(c.text)}</div>
         <div class="inbox-notif-time">\${timeAgo(c.at)}</div>
       </div>
       \${del}
@@ -4689,7 +5097,7 @@ async function submitComment() {
   try {
     await fetch(commentsBase() + '/post/comment', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ postId: _commentsCtx.postId, text, name }),
+      body: JSON.stringify({ postId: _commentsCtx.postId, text, name, subToken: subTokenFor(_commentsCtx.subdomain) }),
     });
     loadComments();
   } catch(e) { showToast('Failed'); }
@@ -4702,6 +5110,270 @@ async function deleteComment(id) {
     });
     loadComments();
   } catch(e) {}
+}
+
+// ── SUBSCRIBERS ───────────────────────────────────────────────
+// Device-bound subscriber tokens, keyed by creator host (mirrors the vid/guestName
+// model — no account). The plaintext token lives ONLY here; nodes store a hash.
+// Creator approval flips it live; the badge in chat/comments is server-verified.
+function subTokens() { try { return JSON.parse(localStorage.getItem('subTokens') || '{}'); } catch(e) { return {}; } }
+function subTokenFor(host) { return subTokens()[host] || ''; }
+function setSubTokenFor(host, tok) {
+  const m = subTokens();
+  if (tok) m[host] = tok; else delete m[host];
+  localStorage.setItem('subTokens', JSON.stringify(m));
+}
+let _subStatus = {};   // host → 'none' | 'pending' | 'active' (session cache)
+let _subPush = {};     // host → push registered server-side
+function subBase(host) { return host === SELF_SUBDOMAIN ? '' : 'https://' + host; }
+
+async function subStatusFor(host, force) {
+  if (!force && _subStatus[host] !== undefined) return _subStatus[host];
+  const tok = subTokenFor(host);
+  if (!tok) { _subStatus[host] = 'none'; return 'none'; }
+  try {
+    const d = await fetch(subBase(host) + '/sub/status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: tok }),
+    }).then(r => r.json());
+    _subStatus[host] = d.status || 'none';
+    _subPush[host] = !!d.push;
+    if (_subStatus[host] === 'none') setSubTokenFor(host, ''); // declined/removed — the token is dead
+  } catch(e) { _subStatus[host] = 'none'; } // unreachable → act as none this session, keep the token
+  return _subStatus[host];
+}
+
+async function requestSubscribe(host) {
+  const name = await ensureName();
+  if (!name) return; // guest cancelled the name prompt
+  try {
+    const d = await fetch(subBase(host) + '/sub/request', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, vid: getViewerId(), token: subTokenFor(host) }),
+    }).then(r => r.json());
+    if (d.error) { showToast(d.error === 'rate limited' ? 'Too many requests — try again later' : d.error); return; }
+    if (d.token) setSubTokenFor(host, d.token);
+    if (d.status) _subStatus[host] = d.status;
+    showToast(d.status === 'active' ? 'You are a subscriber ⭐' : 'Request sent — waiting for approval');
+    refreshSubBtn(host);
+  } catch(e) { showToast('Could not reach the node'); }
+}
+
+function onSubBtn(host) {
+  const st = _subStatus[host] || 'none';
+  if (st === 'active') { openLounge(host); return; }
+  if (st === 'pending') { showToast('Waiting for the creator to approve you'); return; }
+  requestSubscribe(host);
+}
+
+async function refreshSubBtn(host) {
+  if (!document.getElementById('profileSubBtn')) return;
+  const st = await subStatusFor(host);
+  const btn = document.getElementById('profileSubBtn'); // profile may have re-rendered during the fetch
+  if (!btn) return;
+  if (st === 'active') { btn.textContent = '💬 Subscriber lounge'; btn.style.background = '#20D5EC'; }
+  else if (st === 'pending') { btn.textContent = '⏳ Subscription requested'; }
+  else { btn.textContent = '⭐ Subscribe'; }
+}
+
+async function approveSub(subId) {
+  try {
+    const r = await fetch('/admin/sub/approve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ subId }),
+    });
+    if (!r.ok) throw new Error('failed');
+    showToast('Subscriber approved ⭐');
+    onInboxTap();
+  } catch(e) { showToast('Approve failed'); }
+}
+async function declineSub(subId) {
+  try {
+    await fetch('/admin/sub/decline', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ subId }),
+    });
+    showToast('Request declined');
+    onInboxTap();
+  } catch(e) {}
+}
+
+// ── SUBSCRIBER LOUNGE ─────────────────────────────────────────
+// Persistent per-creator chat space. Unlike live chat (stream-scoped) the lounge never
+// resets. Subscribers + the creator only; WS with auto-reconnect, history rides init.
+let _lounge = { host: '', ws: null, msgs: [], creatorMode: false };
+
+function openLounge(host) {
+  _lounge.host = host;
+  _lounge.creatorMode = isCreator && host === SELF_SUBDOMAIN;
+  _lounge.msgs = [];
+  const who = commenterInfo(host);
+  document.getElementById('loungeTitle').textContent = (who ? who.display : host.split('.')[0]) + ' — Lounge';
+  document.getElementById('loungeMembers').textContent = '';
+  document.getElementById('loungeList').innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:center;padding:50px;color:rgba(255,255,255,0.3)">Connecting…</div>';
+  document.getElementById('loungeSheet').classList.add('show');
+  pauseFeedVideos();
+  loungeConnect();
+  refreshLoungeBell();
+}
+function closeLounge() {
+  document.getElementById('loungeSheet').classList.remove('show');
+  if (_lounge.ws) { _lounge.ws.closed = true; try { _lounge.ws.sock.close(); } catch(e) {} _lounge.ws = null; }
+  resumeFeedVideos();
+}
+function loungeConnect() {
+  if (_lounge.ws) { _lounge.ws.closed = true; try { _lounge.ws.sock.close(); } catch(e) {} }
+  const holder = { closed: false, sock: null };
+  _lounge.ws = holder;
+  const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const wsHost = _lounge.host === SELF_SUBDOMAIN ? location.host : _lounge.host;
+  // browsers can't set WS headers — creds ride the query; the worker strips them
+  const cred = _lounge.creatorMode
+    ? 'auth=' + encodeURIComponent(token || '')
+    : 'sub=' + encodeURIComponent(subTokenFor(_lounge.host));
+  const url = wsScheme + wsHost + '/lounge/ws?' + cred
+    + '&name=' + encodeURIComponent(displayName() || 'viewer')
+    + '&vid=' + encodeURIComponent(getViewerId());
+  let sock;
+  try { sock = new WebSocket(url); } catch(e) { return; }
+  holder.sock = sock;
+  sock.onopen = () => { holder.opened = true; _lounge.fails = 0; };
+  sock.onmessage = e => {
+    let d; try { d = JSON.parse(e.data); } catch(e2) { return; }
+    if (d.t === 'init') { _lounge.msgs = d.lounge || []; renderLounge(); setLoungeMembers(d.members); }
+    else if (d.t === 'chat') { _lounge.msgs.push(d.msg); if (_lounge.msgs.length > 300) _lounge.msgs.shift(); renderLounge(); }
+    else if (d.t === 'members') setLoungeMembers(d.members);
+  };
+  sock.onclose = () => {
+    if (holder.closed) return;
+    // a connection that never opened is likely a 403 (access revoked) — don't hammer forever
+    if (!holder.opened) {
+      _lounge.fails = (_lounge.fails || 0) + 1;
+      if (_lounge.fails >= 3) {
+        document.getElementById('loungeList').innerHTML =
+          '<div class="inbox-empty"><div class="inbox-empty-icon">🚪</div>Could not join the lounge — your subscription may have been removed</div>';
+        _subStatus[_lounge.host] = undefined; // force a fresh status check next time
+        return;
+      }
+    }
+    setTimeout(() => { if (_lounge.ws === holder) loungeConnect(); }, 2500);
+  };
+  sock.onerror = () => {};
+}
+function setLoungeMembers(n) {
+  if (typeof n === 'number') document.getElementById('loungeMembers').textContent = '👥 ' + n;
+}
+function renderLounge() {
+  const box = document.getElementById('loungeList');
+  if (!box) return;
+  if (!_lounge.msgs.length) {
+    box.innerHTML = '<div class="inbox-empty"><div class="inbox-empty-icon">💬</div>Quiet in here — say something</div>';
+    return;
+  }
+  const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  box.innerHTML = _lounge.msgs.map(m => {
+    const badge = m.creator ? '<span class="sub-badge host">HOST</span>' : '<span class="sub-badge">SUB</span>';
+    const who = commenterInfo(m.name);
+    const shown = who ? who.display : (m.name || 'viewer');
+    // push is DELIBERATE: the creator taps 📣 on one of their own messages
+    const push = (_lounge.creatorMode && m.creator)
+      ? '<button onclick="pushLoungeMsg(this)" data-text="' + esc(m.text) + '" style="background:none;font-size:15px;padding:0 6px;align-self:center" title="Push to subscribers">📣</button>'
+      : '';
+    return '<div class="inbox-notif" style="cursor:default"><div class="inbox-notif-body">'
+      + '<div class="inbox-notif-text">' + badge + '<strong>' + esc(shown) + '</strong> ' + esc(m.text) + '</div>'
+      + '<div class="inbox-notif-time">' + timeAgo(m.at) + '</div>'
+      + '</div>' + push + '</div>';
+  }).join('');
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+function sendLounge() {
+  const input = document.getElementById('loungeInput');
+  const text = input.value.trim();
+  if (!text) return;
+  const s = _lounge.ws && _lounge.ws.sock;
+  if (!s || s.readyState !== 1) { showToast('Reconnecting — try again in a moment'); return; }
+  s.send(JSON.stringify({ t: 'chat', text }));
+  input.value = '';
+}
+async function pushLoungeMsg(btn) {
+  const text = btn.getAttribute('data-text') || '';
+  if (!text) return;
+  if (!confirm('Push this message to every subscriber with notifications on? "' + text.slice(0, 80) + '"')) return;
+  try {
+    const d = await fetch('/admin/lounge/push', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ text }),
+    }).then(r => r.json());
+    if (d.error) { showToast(d.error); return; }
+    showToast(d.sent ? '📣 Pushed to ' + d.sent + ' subscriber' + (d.sent === 1 ? '' : 's') : 'No subscribers have push on yet');
+  } catch(e) { showToast('Push failed'); }
+}
+
+// ── PUSH OPT-IN (Web Push) ────────────────────────────────────
+function b64ToU8(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}
+function b64FromBuf(buf) {
+  const a = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+  return btoa(s).replace(/[+]/g, '-').replace(/[/]/g, '_').replace(/=+$/, '');
+}
+function refreshLoungeBell() {
+  const bell = document.getElementById('loungeBell');
+  if (!bell) return;
+  if (_lounge.creatorMode) { bell.style.display = 'none'; return; } // the creator sends pushes, doesn't get them
+  bell.style.display = 'flex';
+  bell.style.opacity = _subPush[_lounge.host] ? '1' : '0.4';
+  bell.title = _subPush[_lounge.host] ? 'Push is ON — tap to turn off' : 'Get pushed when the creator pings subscribers';
+}
+async function toggleLoungePush() {
+  const host = _lounge.host;
+  if (_lounge.creatorMode || !host) return;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    showToast('Push needs the installed app — Add to Home Screen first'); return;
+  }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if (_subPush[host]) {
+      // off = the node stops sending; the browser-level subscription stays (other nodes may use it)
+      await fetch(subBase(host) + '/sub/push/clear', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: subTokenFor(host) }),
+      });
+      _subPush[host] = false; refreshLoungeBell(); showToast('Push off for this creator');
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { showToast('Notifications are blocked in your browser settings'); return; }
+    const vap = await fetch(subBase(host) + '/sub/vapid.json').then(r => r.json());
+    let pushSub = await reg.pushManager.getSubscription();
+    if (pushSub) {
+      // one push channel per browser origin — it must match THIS node's VAPID key
+      const cur = pushSub.options && pushSub.options.applicationServerKey;
+      if (cur && b64FromBuf(cur) !== vap.key) {
+        showToast('This device already gets pushes from another node — one node per device for now');
+        return;
+      }
+    } else {
+      pushSub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToU8(vap.key) });
+    }
+    const d = await fetch(subBase(host) + '/sub/push', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: subTokenFor(host), subscription: pushSub.toJSON() }),
+    }).then(r => r.json());
+    if (d.error) { showToast(d.error); return; }
+    _subPush[host] = true; refreshLoungeBell();
+    showToast('🔔 On — the creator can ping you');
+  } catch(e) {
+    showToast('Could not enable push: ' + (e && e.message ? e.message : 'unknown'));
+  }
 }
 
 // ── REPORT CONTENT ────────────────────────────────────────────
@@ -4872,6 +5544,10 @@ function renderProfileBody(data, subdomain) {
               : (isOwn && data.adsEnabled) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openEarnings()">💰 Your earnings</button>\` : '';
   const blocked = getBlocked().includes(subdomain);
   const blockBtn = !isOwn ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleBlock('\${esc(subdomain)}')">\${blocked ? 'Unblock' : 'Block'}</button>\` : '';
+  // viewers: ⭐ Subscribe → ⏳ Requested → 💬 lounge (state set async by refreshSubBtn);
+  // the creator gets a direct door to their own lounge
+  const subBtn = !isOwn ? \`<button class="profile-connect-btn" id="profileSubBtn" style="background:rgba(255,255,255,0.12)" onclick="onSubBtn('\${esc(subdomain)}')">⭐ Subscribe</button>\` : '';
+  const loungeBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openLounge('\${esc(subdomain)}')">💬 Subscriber lounge</button>\` : '';
   const importBtn = (isOwn && isCreator) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openImport()">📥 Import from TikTok</button>\` : '';
   const algoBtn = subdomain === SELF_SUBDOMAIN ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="openAlgo()">🎛 My algorithm</button>\` : '';
   const selBtn = (isOwn && isCreator && (data.postCount || 0) > 0) ? \`<button class="profile-connect-btn" style="background:rgba(255,255,255,0.12)" onclick="toggleSelMode()">☑️ Select posts</button>\` : '';
@@ -4892,12 +5568,13 @@ function renderProfileBody(data, subdomain) {
         </div>
       </div>
       \${bio ? \`<div class="profile-bio">\${esc(bio)}</div>\` : ''}
-      \${joinBtn}\${adBtn}\${hostBtn}\${importBtn}\${algoBtn}\${selBtn}\${blockBtn}
+      \${joinBtn}\${adBtn}\${hostBtn}\${loungeBtn}\${importBtn}\${algoBtn}\${selBtn}\${subBtn}\${blockBtn}
       <a href="\${pbase}/legal" target="_blank" style="display:inline-block;margin-top:12px;font-size:12px;color:rgba(255,255,255,0.4);text-decoration:underline">Policies &amp; reporting</a>
     </div>
     <div class="profile-grid">\${gridHtml || '<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.3);grid-column:1/-1">No posts yet</div>'}</div>
   \`;
   lazyLoadGridVideos(document.getElementById('profileBody'));
+  if (!isOwn) refreshSubBtn(subdomain); // async — fills in Requested / lounge state
 }
 
 // Grid videos only fetch their metadata/thumbnail when scrolled near the viewport —
@@ -5405,6 +6082,7 @@ function renderInbox(notifs) {
     let text = '';
     if (n.type === 'peer_connected') text = \`<strong>@\${esc(handle)}</strong> connected to your node\`;
     else if (n.type === 'join_request') text = \`<strong>@\${esc(handle)}</strong> wants to join your network\`;
+    else if (n.type === 'sub_request') text = \`<span class="sub-badge">SUB</span><strong>\${esc(n.name || 'viewer')}</strong> wants to subscribe\`;
     else if (n.type === 'report') {
       const rl = { csam: 'Child sexual abuse material', ncii: 'Non-consensual intimate images', hate: 'Hate speech / incitement', harassment: 'Harassment or threats', copyright: 'Copyright infringement', defamation: 'Defamation', other: 'Other' };
       text = \`<strong style="color:#FE2C55">⚑ Content report</strong> on <strong>@\${esc(handle)}</strong> — \${rl[n.reason] || 'Other'}\`;
@@ -5427,8 +6105,18 @@ function renderInbox(notifs) {
       <button onclick="event.stopPropagation();denyJoin('\${esc(n.publicKey)}')" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px">Deny</button>
     </div>\`;
     }
-    return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" onclick="openProfile('\${esc(n.subdomain)}')">
-      <div class="inbox-notif-avatar" style="background:\${grad}">\${esc(handle[0]?.toUpperCase() || '?')}</div>
+    if (n.type === 'sub_request') {
+      if (n.resolved === 'approved') actions = '<div style="margin-top:6px;font-size:13px;color:#20D5EC">✓ Approved — they have the badge + lounge</div>';
+      else if (n.resolved === 'declined') actions = '<div style="margin-top:6px;font-size:13px;color:rgba(255,255,255,0.4)">Declined</div>';
+      else actions = \`<div style="display:flex;gap:8px;margin-top:8px">
+      <button onclick="event.stopPropagation();approveSub('\${esc(n.subId)}')" style="background:#FE2C55;border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px;font-weight:600">Approve</button>
+      <button onclick="event.stopPropagation();declineSub('\${esc(n.subId)}')" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px">Decline</button>
+    </div>\`;
+    }
+    const letter = (handle || n.name || '?')[0];
+    const click = n.subdomain ? \`openProfile('\${esc(n.subdomain)}')\` : '';
+    return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" onclick="\${click}">
+      <div class="inbox-notif-avatar" style="background:\${grad}">\${esc(letter.toUpperCase())}</div>
       <div class="inbox-notif-body">
         <div class="inbox-notif-text">\${text}</div>
         <div class="inbox-notif-time">\${timeAgo(n.at)}</div>
@@ -6118,6 +6806,7 @@ function closeTopOverlay() {
     closeLiveModal(); return true;
   }
   const order = [
+    ['loungeSheet', closeLounge],
     ['commentsSheet', closeComments], ['searchModal', () => shut('searchModal')],
     ['unlockModal', closeUnlock], ['publishModal', closePublish],
     ['prerollSheet', closePrerollSheet], ['earningsSheet', () => shut('earningsSheet')],
