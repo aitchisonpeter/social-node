@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.10.0';
+const PROTOCOL_VERSION = '0.11.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -241,54 +241,91 @@ export class LiveRoom extends DurableObject {
       return Response.json({ messages: status.active ? await this.recentChat() : [] });
     }
 
-    // ---- pre-roll ad frequency cap + counters ----
+    // ---- ad frequency cap + counters (per surface) ----
+    // surface 'feed' (default) = the node-run in-feed interstitial; keeps the ORIGINAL
+    // storage keys (adseen/adImpressions/adClicks) so the host's rev-share ledger
+    // continues unbroken. surface 'live' = the creator's own pre-roll — separate grace
+    // window and separate counters, so feed-ad views never suppress (or inflate) the
+    // creator's sponsor numbers.
     if (seg === 'ad-allowed') {
-      return Response.json({ allowed: await this.adAllowed(url.searchParams.get('vid') || '') });
+      const surface = url.searchParams.get('surface') === 'live' ? 'live' : 'feed';
+      return Response.json({ allowed: await this.adAllowed(url.searchParams.get('vid') || '', surface) });
     }
     if (seg === 'ad-seen' && request.method === 'POST') {
-      const { vid } = await request.json().catch(() => ({}));
-      await this.adSeen(vid, request.headers.get('X-Real-Ip') || '');
+      const { vid, surface, bill } = await request.json().catch(() => ({}));
+      await this.adSeen(vid, request.headers.get('X-Real-Ip') || '', surface === 'live' ? 'live' : 'feed', bill !== false);
       return Response.json({ ok: true });
     }
     if (seg === 'ad-click' && request.method === 'POST') {
-      const c = (await this.ctx.storage.get('adClicks')) || 0;
-      await this.ctx.storage.put('adClicks', c + 1);
+      const { surface } = await request.json().catch(() => ({}));
+      const key = surface === 'live' ? 'ladClicks' : 'adClicks';
+      const c = (await this.ctx.storage.get(key)) || 0;
+      await this.ctx.storage.put(key, c + 1);
       return Response.json({ ok: true });
     }
     if (seg === 'ad-stats') {
+      const live = url.searchParams.get('surface') === 'live';
       return Response.json({
-        impressions: (await this.ctx.storage.get('adImpressions')) || 0,
-        clicks: (await this.ctx.storage.get('adClicks')) || 0,
+        impressions: (await this.ctx.storage.get(live ? 'ladImpressions' : 'adImpressions')) || 0,
+        clicks: (await this.ctx.storage.get(live ? 'ladClicks' : 'adClicks')) || 0,
       });
     }
 
     // ---- verified impression measurement (root-side; DO named 'measure:<host>') ----
     // The viewed node's own meter pays creators; THESE deduped counts face advertisers.
     if (seg === 'm-imp' && request.method === 'POST') {
-      const { vid } = await request.json().catch(() => ({}));
+      const b = await request.json().catch(() => ({}));
+      const vid = b.vid;
       if (!vid) return Response.json({ error: 'vid required' }, { status: 400 });
+      // surfaces dedupe + count independently: the live pre-roll and the feed ad have
+      // DIFFERENT owners (creator's sponsor vs node host) — one must never mask the other
+      const surface = b.surface === 'live' ? 'live' : 'feed';
       const ip = request.headers.get('X-Real-Ip') || 'unknown';
       const now = Date.now();
       const seen = (await this.ctx.storage.get('m:seen')) || {};
-      // one verified impression per viewer AND per IP per grace window
-      if (now - (seen['v:' + vid] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
-      if (now - (seen['i:' + ip] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
-      seen['v:' + vid] = now; seen['i:' + ip] = now;
+      // one verified impression per viewer AND per IP per grace window (per surface)
+      if (now - (seen['v:' + surface + ':' + vid] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
+      if (now - (seen['i:' + surface + ':' + ip] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
+      seen['v:' + surface + ':' + vid] = now; seen['i:' + surface + ':' + ip] = now;
       for (const k of Object.keys(seen)) if (now - seen[k] > PREROLL_GRACE_MS * 4) delete seen[k];
       await this.ctx.storage.put('m:seen', seen);
       const day = new Date().toISOString().slice(0, 10);
-      const days = (await this.ctx.storage.get('m:days')) || {};
-      days[day] = (days[day] || 0) + 1;
-      const dayKeys = Object.keys(days).sort();
-      while (dayKeys.length > 30) delete days[dayKeys.shift()];
-      await this.ctx.storage.put('m:days', days);
+      // combined buckets keep the pre-0.11 stats.json shape; per-surface buckets feed
+      // the sponsor dashboard
+      for (const dk of ['m:days', 'm:days:' + surface]) {
+        const days = (await this.ctx.storage.get(dk)) || {};
+        days[day] = (days[day] || 0) + 1;
+        const dayKeys = Object.keys(days).sort();
+        while (dayKeys.length > 30) delete days[dayKeys.shift()];
+        await this.ctx.storage.put(dk, days);
+      }
       await this.ctx.storage.put('m:total', ((await this.ctx.storage.get('m:total')) || 0) + 1);
+      await this.ctx.storage.put('m:total:' + surface, ((await this.ctx.storage.get('m:total:' + surface)) || 0) + 1);
+      return Response.json({ ok: true });
+    }
+    // verified clicks: same root-side dedup idea, one counted click per viewer per window
+    if (seg === 'm-click' && request.method === 'POST') {
+      const b = await request.json().catch(() => ({}));
+      if (!b.vid) return Response.json({ error: 'vid required' }, { status: 400 });
+      const surface = b.surface === 'live' ? 'live' : 'feed';
+      const now = Date.now();
+      const seen = (await this.ctx.storage.get('m:seen')) || {};
+      if (now - (seen['c:' + surface + ':' + b.vid] || 0) < PREROLL_GRACE_MS) return Response.json({ ok: true, dup: true });
+      seen['c:' + surface + ':' + b.vid] = now;
+      await this.ctx.storage.put('m:seen', seen);
+      await this.ctx.storage.put('m:clicks:' + surface, ((await this.ctx.storage.get('m:clicks:' + surface)) || 0) + 1);
       return Response.json({ ok: true });
     }
     if (seg === 'm-stats') {
+      const surf = async s => ({
+        total: (await this.ctx.storage.get('m:total:' + s)) || 0,
+        days: (await this.ctx.storage.get('m:days:' + s)) || {},
+        clicks: (await this.ctx.storage.get('m:clicks:' + s)) || 0,
+      });
       return Response.json({
         total: (await this.ctx.storage.get('m:total')) || 0,
         days: (await this.ctx.storage.get('m:days')) || {},
+        surfaces: { live: await surf('live'), feed: await surf('feed') },
       });
     }
 
@@ -378,16 +415,20 @@ export class LiveRoom extends DurableObject {
     return { ok: true };
   }
 
-  async adAllowed(vid) {
+  async adAllowed(vid, surface) {
     if (!vid) return true;
-    const seen = (await this.ctx.storage.get('adseen')) || {};
+    const seen = (await this.ctx.storage.get(surface === 'live' ? 'ladseen' : 'adseen')) || {};
     return (Date.now() - (seen[vid] || 0)) > PREROLL_GRACE_MS;
   }
 
-  async adSeen(vid, ip) {
+  // bill=false records the grace window without incrementing the impression counter —
+  // used for 'intro' creatives (a theme song isn't a sponsor view).
+  async adSeen(vid, ip, surface, bill) {
     if (!vid) return;
     const now = Date.now();
-    const seen = (await this.ctx.storage.get('adseen')) || {};
+    const seenKey = surface === 'live' ? 'ladseen' : 'adseen';
+    const impKey = surface === 'live' ? 'ladImpressions' : 'adImpressions';
+    const seen = (await this.ctx.storage.get(seenKey)) || {};
     // per-IP floor (30s, softer than the per-vid window — NAT'd venues share IPs):
     // blunts curl-loop inflation of the local meter without starving real viewers
     if (ip && now - (seen['ip:' + ip] || 0) < 30000) return;
@@ -395,8 +436,8 @@ export class LiveRoom extends DurableObject {
     if (ip) seen['ip:' + ip] = now;
     // bound the map: drop entries well past the grace window
     for (const k of Object.keys(seen)) if (now - seen[k] > PREROLL_GRACE_MS * 4) delete seen[k];
-    await this.ctx.storage.put('adseen', seen);
-    await this.ctx.storage.put('adImpressions', ((await this.ctx.storage.get('adImpressions')) || 0) + 1);
+    await this.ctx.storage.put(seenKey, seen);
+    if (bill) await this.ctx.storage.put(impKey, ((await this.ctx.storage.get(impKey)) || 0) + 1);
   }
 
   async statusObj() {
@@ -1942,15 +1983,45 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
-  // ---- live: pre-roll ad gate (public) ----
-  // REVENUE MODEL: the ad slot belongs to the node being VIEWED. The worker-wide HOST ad
-  // (global 'hostad', master-set) serves on every tenant; impressions count in the viewed
-  // tenant's own ledger so the host can pay each creator their share %.
+  // ---- live: pre-roll gate (public) ----
+  // REVENUE MODEL (split 2026-06-11): the LIVE pre-roll belongs to the CREATOR being
+  // watched (per-tenant 'livead' — their own sponsor, or a theme-song intro). The node-
+  // run HOST ad (global 'hostad', master-set) now serves ONLY the in-feed surface below.
   if (path === '/live/preroll' && request.method === 'GET') {
+    // legacy per-tenant 'preroll' (pre-rev-share deploys) doubles as the migration seed
+    const cfg = (await storage.get('livead')) || (await storage.get('preroll'));
+    if (!cfg || !cfg.enabled || !cfg.mediaUrl) return jsonCors({ show: false });
+    const vid = url.searchParams.get('vid') || '';
+    const r = await liveDO(env, subdomain, '/ad-allowed?surface=live&vid=' + encodeURIComponent(vid));
+    const { allowed } = await r.json();
+    if (!allowed) return jsonCors({ show: false });
+    return jsonCors({ show: true, ad: {
+      kind: cfg.kind === 'intro' ? 'intro' : 'sponsor',
+      mediaUrl: cfg.mediaUrl,
+      sponsorName: cfg.sponsorName || '',
+      clickUrl: cfg.clickUrl || '',
+      durationSec: cfg.durationSec || 15,
+      category: cfg.category || 'general',
+    }});
+  }
+  if (path === '/live/preroll/seen' && request.method === 'POST') {
+    const { vid, bill } = await request.json().catch(() => ({}));
+    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Real-Ip': request.headers.get('CF-Connecting-IP') || '' }, body: JSON.stringify({ vid, surface: 'live', bill }) });
+    return jsonCors({ ok: true });
+  }
+  if (path === '/live/preroll/click' && request.method === 'POST') {
+    await liveDO(env, subdomain, '/ad-click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ surface: 'live' }) });
+    return jsonCors({ ok: true });
+  }
+
+  // ---- feed: in-feed interstitial ad (public) — the NODE's ad slot ----
+  // Worker-wide 'hostad' serves on every tenant; impressions count in the viewed
+  // tenant's own ledger so the host can pay each creator their share %.
+  if (path === '/feed/ad' && request.method === 'GET') {
     const cfg = await gstore.get('hostad');
     if (!cfg || !cfg.enabled || !cfg.mediaUrl) return jsonCors({ show: false });
     const vid = url.searchParams.get('vid') || '';
-    const r = await liveDO(env, subdomain, '/ad-allowed?vid=' + encodeURIComponent(vid));
+    const r = await liveDO(env, subdomain, '/ad-allowed?surface=feed&vid=' + encodeURIComponent(vid));
     const { allowed } = await r.json();
     if (!allowed) return jsonCors({ show: false });
     return jsonCors({ show: true, ad: {
@@ -1961,9 +2032,13 @@ async function handleRequest(request, storage, env, ctx) {
       category: cfg.category || 'general',
     }});
   }
-  if (path === '/live/preroll/seen' && request.method === 'POST') {
+  if (path === '/feed/ad/seen' && request.method === 'POST') {
     const { vid } = await request.json().catch(() => ({}));
-    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Real-Ip': request.headers.get('CF-Connecting-IP') || '' }, body: JSON.stringify({ vid }) });
+    await liveDO(env, subdomain, '/ad-seen', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Real-Ip': request.headers.get('CF-Connecting-IP') || '' }, body: JSON.stringify({ vid, surface: 'feed' }) });
+    return jsonCors({ ok: true });
+  }
+  if (path === '/feed/ad/click' && request.method === 'POST') {
+    await liveDO(env, subdomain, '/ad-click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ surface: 'feed' }) });
     return jsonCors({ ok: true });
   }
 
@@ -1986,6 +2061,22 @@ async function handleRequest(request, storage, env, ctx) {
     });
     return jsonCors(await r.json(), r.status);
   }
+  // Root-verified clicks: clients beacon here alongside the local click count. A click
+  // is worth more than a view — sponsors get a deduped number they can't argue with.
+  if (path === '/measure/click' && request.method === 'POST') {
+    if (!isRoot(identity)) return jsonCors({ error: 'not the network root' }, 403);
+    const b = await request.json().catch(() => ({}));
+    const host = (b.host || '').trim().toLowerCase();
+    const vid = (b.vid || '').slice(0, 64);
+    if (!host || !vid) return jsonCors({ error: 'host and vid required' }, 400);
+    const members = (await gstore.get('registry:members')) || [];
+    if (!members.find(m => m.subdomain === host)) return jsonCors({ error: 'not a network member' }, 400);
+    const r = await env.LIVE_ROOM.getByName('measure:' + host).fetch('https://live.do/m-click', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vid, surface: b.surface }),
+    });
+    return jsonCors(await r.json(), r.status);
+  }
   // Public, auditable: anyone (a sponsor, a host, a skeptic) can read the verified counts.
   if (path === '/measure/stats.json') {
     if (!isRoot(identity)) return jsonCors({ error: 'not the network root' }, 403);
@@ -1994,9 +2085,15 @@ async function handleRequest(request, storage, env, ctx) {
     const r = await env.LIVE_ROOM.getByName('measure:' + host).fetch('https://live.do/m-stats');
     return jsonCors({ host, ...(await r.json()) });
   }
-  if (path === '/live/preroll/click' && request.method === 'POST') {
-    await liveDO(env, subdomain, '/ad-click', { method: 'POST' });
-    return jsonCors({ ok: true });
+  // Human-readable sponsor dashboard for a creator's LIVE pre-roll: a public page the
+  // creator hands their sponsor. Counts come from the root's deduped measurement DO
+  // ("don't grade your own homework"), refreshed every 5s — real-time during a stream.
+  if (path.startsWith('/sponsor/') && request.method === 'GET') {
+    if (!isRoot(identity)) return new Response('not the network root', { status: 403 });
+    const host = decodeURIComponent(path.slice('/sponsor/'.length)).trim().toLowerCase();
+    const members = (await gstore.get('registry:members')) || [];
+    if (!host || !members.find(m => m.subdomain === host)) return new Response('unknown creator', { status: 404 });
+    return new Response(renderSponsorPage(host), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
   // ---- post interactions: likes + comments (public) ----
@@ -2416,40 +2513,48 @@ async function handleRequest(request, storage, env, ctx) {
     return json({ ok: true, sent, failed });
   }
 
-  // ---- admin: pre-roll sponsor ad config ----
-  // The node HOST (master) chooses the ad for the whole node and collects the revenue;
-  // creators are paid via their share % (/admin/ads). One config per worker.
+  // ---- admin: in-feed sponsor ad config (node-wide, master) ----
+  // The node HOST (master) chooses the FEED ad for the whole node and collects the
+  // revenue; creators are paid via their share % (/admin/ads). One config per worker.
+  // The LIVE pre-roll is per-creator — see /admin/livead below.
   if (path === '/admin/preroll' && request.method === 'POST') {
     if (!isMaster(request)) return json({ error: 'master token required — the node host chooses the ad' }, 401);
     const b = await request.json().catch(() => ({}));
-    // Normalize the click-through URL instead of silently discarding it: people type
-    // "joescoffee.com" — prepend https:// and keep it if it parses as a real URL.
-    let clickUrl = (b.clickUrl || '').trim();
-    if (clickUrl && !/^https?:\/\//i.test(clickUrl)) clickUrl = 'https://' + clickUrl;
-    try { const u = new URL(clickUrl); if (!u.hostname.includes('.')) clickUrl = ''; } catch (e) { clickUrl = ''; }
-    const cfg = {
-      enabled: !!b.enabled,
-      mediaUrl: b.mediaUrl || null,
-      contentType: b.contentType || null,
-      sponsorName: (b.sponsorName || '').slice(0, 60),
-      clickUrl: clickUrl.slice(0, 300),
-      durationSec: Math.min(Math.max(parseInt(b.durationSec) || 15, 3), 60),
-      cpm: Math.max(0, Math.min(parseFloat(b.cpm) || 0, 1000)), // host's rate, $ per 1000 views
-      category: (b.category || 'general').trim().toLowerCase().slice(0, 30), // self-declared — mis-declaring is a membership violation
-      source: 'self', // 'self' = host's own sponsor. 'network' reserved for the network ad pool later.
-      updatedAt: new Date().toISOString(),
-    };
+    const cfg = normalizeAdCfg(b);
     await gstore.set('hostad', cfg);
     return json({ ok: true, preroll: cfg });
   }
   if (path === '/admin/preroll.json') {
     if (!isMaster(request)) return json({ error: 'master token required' }, 401);
-    // prefill fallback: pre-rev-share deploys stored the config per-tenant
-    const cfg = (await gstore.get('hostad')) || (await storage.get('preroll')) || { enabled: false };
-    const r = await liveDO(env, subdomain, '/ad-stats');
+    const cfg = (await gstore.get('hostad')) || { enabled: false };
+    const r = await liveDO(env, subdomain, '/ad-stats?surface=feed');
     const stats = await r.json();
     const earnings = +(((stats.impressions || 0) / 1000) * (cfg.cpm || 0)).toFixed(2);
     return json({ preroll: cfg, stats: { ...stats, earnings } });
+  }
+
+  // ---- admin: live pre-roll config (per-creator) ----
+  // Each creator owns the slot in front of their OWN live streams: a sponsor they
+  // sourced themselves ("Brought to you by…"), or kind:'intro' — a theme song / 15s
+  // intro clip with no sponsor and no billing. Revenue here is the creator's own
+  // arrangement with their sponsor; the node ledger doesn't touch it.
+  if (path === '/admin/livead' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const cfg = normalizeAdCfg(b);
+    cfg.kind = b.kind === 'intro' ? 'intro' : 'sponsor';
+    if (cfg.kind === 'intro') { cfg.sponsorName = ''; cfg.clickUrl = ''; cfg.cpm = 0; }
+    await storage.set('livead', cfg);
+    return json({ ok: true, livead: cfg });
+  }
+  if (path === '/admin/livead.json') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    // legacy per-tenant 'preroll' (pre-rev-share deploys) seeds the form once
+    const cfg = (await storage.get('livead')) || (await storage.get('preroll')) || { enabled: false };
+    const r = await liveDO(env, subdomain, '/ad-stats?surface=live');
+    const stats = await r.json();
+    const earnings = +(((stats.impressions || 0) / 1000) * (cfg.cpm || 0)).toFixed(2);
+    return json({ livead: cfg, stats: { ...stats, earnings }, sponsorUrl: 'https://' + NETWORK_ROOT_HOST + '/sponsor/' + subdomain });
   }
   // Host ledger: lifetime ad views per tenant × the host's CPM × each creator's share %.
   // This IS the rev-share product even before a payment rail exists: "you owe creator X $Y".
@@ -2773,6 +2878,91 @@ function html(content, status = 200) {
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Shared shape for both ad slots (host feed ad + creator live pre-roll).
+function normalizeAdCfg(b) {
+  // Normalize the click-through URL instead of silently discarding it: people type
+  // "joescoffee.com" — prepend https:// and keep it if it parses as a real URL.
+  let clickUrl = (b.clickUrl || '').trim();
+  if (clickUrl && !/^https?:\/\//i.test(clickUrl)) clickUrl = 'https://' + clickUrl;
+  try { const u = new URL(clickUrl); if (!u.hostname.includes('.')) clickUrl = ''; } catch (e) { clickUrl = ''; }
+  return {
+    enabled: !!b.enabled,
+    mediaUrl: b.mediaUrl || null,
+    contentType: b.contentType || null,
+    sponsorName: (b.sponsorName || '').slice(0, 60),
+    clickUrl: clickUrl.slice(0, 300),
+    durationSec: Math.min(Math.max(parseInt(b.durationSec) || 15, 3), 60),
+    cpm: Math.max(0, Math.min(parseFloat(b.cpm) || 0, 1000)), // $ per 1000 views
+    category: (b.category || 'general').trim().toLowerCase().slice(0, 30), // self-declared — mis-declaring is a membership violation
+    source: 'self', // 'self' = own sponsor. 'network' reserved for the network ad pool later.
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// ============================================================
+// SPONSOR DASHBOARD (root-served, public)
+// ============================================================
+// One page per creator at https://<root>/sponsor/<host> — the URL a creator hands
+// their live-stream sponsor. Numbers come from the root's measurement DO (deduped
+// per viewer AND per IP per 8-min window), polled every 5s, so a sponsor can watch
+// views tick up live during a stream without trusting the creator's own node.
+
+function renderSponsorPage(host) {
+  const h = escapeHtml(host);
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sponsor stats — ${h}</title>
+<style>
+  body{margin:0;background:#0a0a0a;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;padding:32px 16px}
+  .wrap{width:100%;max-width:520px}
+  h1{font-size:18px;font-weight:700;margin:0 0 4px}
+  .sub{font-size:13px;color:rgba(255,255,255,0.45);margin-bottom:24px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px}
+  .stat{background:rgba(255,255,255,0.06);border-radius:14px;padding:18px 16px}
+  .stat .n{font-size:30px;font-weight:800;line-height:1}
+  .stat .l{font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin-top:6px}
+  .days{background:rgba(255,255,255,0.04);border-radius:14px;padding:16px}
+  .days h2{font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin:0 0 10px;font-weight:600}
+  .day{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:rgba(255,255,255,0.8)}
+  .note{font-size:12px;color:rgba(255,255,255,0.35);line-height:1.6;margin-top:24px}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#3ddc84;margin-right:6px;animation:p 2s infinite}
+  @keyframes p{50%{opacity:0.3}}
+</style></head><body><div class="wrap">
+  <h1>Live pre-roll — ${h}</h1>
+  <div class="sub"><span class="dot"></span>network-verified counts · updates every 5s</div>
+  <div class="grid">
+    <div class="stat"><div class="n" id="vToday">–</div><div class="l">verified views today</div></div>
+    <div class="stat"><div class="n" id="vTotal">–</div><div class="l">verified views (lifetime)</div></div>
+    <div class="stat"><div class="n" id="v7">–</div><div class="l">last 7 days</div></div>
+    <div class="stat"><div class="n" id="vClicks">–</div><div class="l">verified clicks</div></div>
+  </div>
+  <div class="days"><h2>Daily views</h2><div id="dayList">loading…</div></div>
+  <div class="note">Counts are recorded by the network root, not by the creator's own server: each view is deduplicated per viewer and per IP address within an 8-minute window, and only counts when the ad video actually rendered on screen. Intro/theme clips are never counted as sponsor views. The daily breakdown keeps the most recent 30 days.</div>
+</div>
+<script>
+  async function refresh(){
+    try{
+      const d = await fetch('/measure/stats.json?host=${h}').then(r=>r.json());
+      const s = (d.surfaces && d.surfaces.live) || {total:0,days:{},clicks:0};
+      const days = s.days || {};
+      const keys = Object.keys(days).sort().reverse();
+      const today = new Date().toISOString().slice(0,10);
+      let last7 = 0;
+      keys.slice(0,7).forEach(k=>{ last7 += days[k]; });
+      document.getElementById('vToday').textContent = days[today] || 0;
+      document.getElementById('vTotal').textContent = s.total || 0;
+      document.getElementById('v7').textContent = last7;
+      document.getElementById('vClicks').textContent = s.clicks || 0;
+      document.getElementById('dayList').innerHTML = keys.length
+        ? keys.map(k=>'<div class="day"><span>'+k+'</span><span>'+days[k]+'</span></div>').join('')
+        : '<div class="day"><span>no views recorded yet</span></div>';
+    }catch(e){}
+  }
+  refresh(); setInterval(refresh, 5000);
+</script></body></html>`;
 }
 
 // ============================================================
@@ -3673,7 +3863,7 @@ ${s.noscript || ''}
       <button class="btn-secondary" id="liveBtnEnd" onclick="liveEnd()" style="display:none;min-width:120px">End Live</button>
     </div>
     <div style="display:flex;gap:8px">
-      <button id="liveBtnPreroll" onclick="openPrerollSheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🎬 Sponsor Ad</button>
+      <button id="liveBtnPreroll" onclick="openLiveAdSheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🎬 Pre-roll</button>
       <button onclick="openOverlaySheet()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">🖼 Overlay</button>
       <button onclick="openStreamHistory()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">📊 Past streams</button>
     </div>
@@ -3875,14 +4065,14 @@ ${s.noscript || ''}
   <button class="submit-btn" id="saveProfileBtn" onclick="saveProfile()">Save</button>
 </div>
 
-<!-- Pre-roll sponsor ad sheet (creator) -->
+<!-- Node feed ad sheet (host/master only) -->
 <div class="edit-profile-sheet" id="prerollSheet">
   <div class="modal-header">
-    <div class="modal-title">Pre-roll Sponsor Ad</div>
+    <div class="modal-title">Node Feed Ad</div>
     <button class="modal-close" onclick="closePrerollSheet()">×</button>
   </div>
   <p style="font-size:13px;color:rgba(255,255,255,0.5);line-height:1.5;margin-bottom:20px">
-    Your node's sponsor ad — a short clip shown before live streams and occasionally between feed posts, <strong>across every creator on this node</strong>. You collect the revenue and share it per-creator (Manage Creators → Share %). Each viewer sees it at most once per 8&nbsp;minutes.
+    Your node's sponsor ad — a short clip shown occasionally between feed posts, <strong>across every creator on this node</strong>. You collect the revenue and share it per-creator (Manage Creators → Share %). Each viewer sees it at most once per 8&nbsp;minutes. Live streams are separate: each creator runs their own pre-roll (profile menu → Live pre-roll).
   </p>
   <label style="display:flex;align-items:center;gap:10px;margin-bottom:20px;font-size:15px">
     <input type="checkbox" id="prerollEnabled" style="width:20px;height:20px"> Show pre-roll ad
@@ -3915,6 +4105,58 @@ ${s.noscript || ''}
   <div id="prerollStats" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px"></div>
   <div id="hostLedger" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px;display:none"></div>
   <button class="submit-btn" id="prerollSaveBtn" onclick="savePreroll()">Save</button>
+</div>
+
+<!-- Live pre-roll sheet (every creator — their own slot before their streams) -->
+<div class="edit-profile-sheet" id="liveAdSheet">
+  <div class="modal-header">
+    <div class="modal-title">Live Pre-roll</div>
+    <button class="modal-close" onclick="closeLiveAdSheet()">×</button>
+  </div>
+  <p style="font-size:13px;color:rgba(255,255,255,0.5);line-height:1.5;margin-bottom:20px">
+    A short clip viewers see before <strong>your</strong> live streams. Run an ad for a sponsor you bring yourself ("Brought to you by…") — or just play your theme song. Each viewer sees it at most once per 8&nbsp;minutes.
+  </p>
+  <label style="display:flex;align-items:center;gap:10px;margin-bottom:16px;font-size:15px">
+    <input type="checkbox" id="liveAdEnabled" style="width:20px;height:20px"> Show before my streams
+  </label>
+  <div style="display:flex;gap:8px;margin-bottom:20px">
+    <button id="liveAdKindSponsor" onclick="setLiveAdKind('sponsor')" style="flex:1;border:none;border-radius:10px;padding:10px;font-size:14px;font-weight:600;color:#fff;background:rgba(255,255,255,0.25)">💰 Sponsor ad</button>
+    <button id="liveAdKindIntro" onclick="setLiveAdKind('intro')" style="flex:1;border:none;border-radius:10px;padding:10px;font-size:14px;font-weight:600;color:#fff;background:rgba(255,255,255,0.08)">🎵 Intro / theme</button>
+  </div>
+  <div class="field">
+    <label>Video (≤15s)</label>
+    <div class="file-drop visible" id="liveAdDrop" onclick="document.getElementById('liveAdFile').click()">
+      <div class="file-drop-icon">🎬</div>
+      <div class="file-drop-label">tap to choose a video</div>
+      <div class="file-drop-name" id="liveAdFileName"></div>
+    </div>
+    <input type="file" id="liveAdFile" accept="video/*" style="display:none" onchange="onLiveAdFilePick(this)">
+  </div>
+  <div id="liveAdSponsorFields">
+    <div class="field">
+      <label>Sponsor name</label>
+      <input type="text" id="liveAdSponsorName" placeholder="e.g. Joe's Coffee" maxlength="60">
+    </div>
+    <div class="field">
+      <label>Click-through URL (optional)</label>
+      <input type="text" id="liveAdClickUrl" placeholder="https://…" maxlength="300">
+    </div>
+    <div class="field">
+      <label>Ad category (viewers can mute categories)</label>
+      <input type="text" id="liveAdCategory" placeholder="e.g. food, auto, fashion" maxlength="30">
+    </div>
+    <div class="field">
+      <label>Your rate — CPM ($ per 1000 views)</label>
+      <input type="text" id="liveAdCpm" inputmode="decimal" placeholder="e.g. 4.00">
+    </div>
+    <div id="liveAdStats" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px"></div>
+    <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:14px;margin-bottom:16px">
+      <div style="font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Sponsor dashboard</div>
+      <div style="font-size:13px;color:rgba(255,255,255,0.6);line-height:1.5;margin-bottom:10px">A public page with network-verified view &amp; click counts, live-updating. Send it to your sponsor — they don't have to take your word for it.</div>
+      <button onclick="copyLiveAdDash()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600">🔗 Copy dashboard link</button>
+    </div>
+  </div>
+  <button class="submit-btn" id="liveAdSaveBtn" onclick="saveLiveAd()">Save</button>
 </div>
 
 <!-- Creator earnings (hosted creators with a revenue share) -->
@@ -5021,7 +5263,7 @@ async function startLiveViewer(subdomain) {
 }
 
 // ── PRE-ROLL SPONSOR AD (viewer) ──────────────────────────────
-let _prerollClickUrl = '', _prerollBase = '';
+let _prerollClickUrl = '', _prerollBase = '', _prerollHost = '';
 
 function getViewerId() {
   let v = localStorage.getItem('vid');
@@ -5057,10 +5299,12 @@ function playPreroll(ad, base, vid, host) {
     const cd      = document.getElementById('prerollCountdown');
     const sp      = document.getElementById('prerollSponsor');
     let dur       = ad.durationSec || 15;
-    _prerollClickUrl = ad.clickUrl || '';
+    const isIntro = ad.kind === 'intro'; // creator's theme song — no sponsor, never billed
+    _prerollClickUrl = isIntro ? '' : (ad.clickUrl || '');
     _prerollBase     = base;
+    _prerollHost     = host;
 
-    if (ad.sponsorName || ad.clickUrl) {
+    if (!isIntro && (ad.sponsorName || ad.clickUrl)) {
       sp.style.display = 'block';
       sp.innerHTML = (ad.sponsorName ? '<strong>' + esc(ad.sponsorName) + '</strong>' : '') + (ad.clickUrl ? ' &nbsp;Learn more ›' : '');
     } else { sp.style.display = 'none'; }
@@ -5090,10 +5334,11 @@ function playPreroll(ad, base, vid, host) {
           if (b) b.style.display = 'flex';
         });
       }
-      // only bill the sponsor when the creative actually rendered
+      // only bill the sponsor when the creative actually rendered; an intro still
+      // records the grace window (bill:false) so it doesn't replay every rejoin
       if (begun) {
         fetch(base + '/live/preroll/seen', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid }),
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid, bill: !isIntro }),
         }).catch(() => {});
       }
       resolve();
@@ -5115,7 +5360,7 @@ function playPreroll(ad, base, vid, host) {
       if (begun || done) return;
       begun = true;
       clearTimeout(loadGuard);
-      reportImpression(host, 'live'); // root-verified count — only for creatives that render
+      if (!isIntro) reportImpression(host, 'live'); // root-verified count — only for sponsor creatives that render
       tick();
       overlay.style.display = 'block';
       guard = setTimeout(finish, (dur + 4) * 1000); // safety net if 'ended' never fires
@@ -5134,22 +5379,29 @@ function playPreroll(ad, base, vid, host) {
 function onPrerollClick() {
   if (!_prerollClickUrl.startsWith('http://') && !_prerollClickUrl.startsWith('https://')) return;
   fetch(_prerollBase + '/live/preroll/click', { method: 'POST' }).catch(() => {});
+  reportClick(_prerollHost, 'live'); // root-verified — the number a sponsor pays on
   window.open(_prerollClickUrl, '_blank', 'noopener');
 }
 
 // ── IN-FEED SPONSOR ADS ───────────────────────────────────────
-// Every AD_EVERY committed swipes, show the CURRENT creator's pre-roll ad as a skippable
-// interstitial. Reuses the same config + DO impression counters + 8-min per-viewer grace
-// window as the live pre-roll, so the creator's earnings meter covers both surfaces —
-// the node being viewed serves (and earns from) its own ad.
+// Every AD_EVERY committed swipes, show the viewed NODE's host ad (/feed/ad) as a
+// skippable interstitial. This is the node-run slot — separate from the creator-owned
+// live pre-roll — with its own DO counters + 8-min per-viewer grace window; the node
+// being viewed serves (and earns from) its own ad.
 const AD_EVERY = 10;
 const AD_MIN_GAP_MS = 150000; // global cap: at most one interstitial per 2.5 min across ALL nodes
-let _swipesSinceAd = 0, _feedAdShowing = false, _feedAdClickUrl = '', _feedAdBase = '', _feedAdCategory = '';
+let _swipesSinceAd = 0, _feedAdShowing = false, _feedAdClickUrl = '', _feedAdBase = '', _feedAdHost = '', _feedAdCategory = '';
 
-// Verified-impression beacon → the network root ("don't grade your own homework"):
+// Verified beacons → the network root ("don't grade your own homework"):
 // the viewed node's local meter pays creators; the root's deduped count faces advertisers.
 function reportImpression(host, surface) {
   fetch('https://' + NETWORK_ROOT_HOST + '/measure/impression', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ host: host || SELF_SUBDOMAIN, vid: getViewerId(), surface }),
+  }).catch(() => {});
+}
+function reportClick(host, surface) {
+  fetch('https://' + NETWORK_ROOT_HOST + '/measure/click', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ host: host || SELF_SUBDOMAIN, vid: getViewerId(), surface }),
   }).catch(() => {});
@@ -5172,7 +5424,8 @@ function maybeShowFeedAd() {
   const node = nodeGraph[nodeIndex];
   if (!node) return;
   const base = postBase(node);
-  fetch(base + '/live/preroll?vid=' + encodeURIComponent(getViewerId()))
+  // old nodes (pre-0.11) don't serve /feed/ad — the fetch 404s and we just show nothing
+  fetch(base + '/feed/ad?vid=' + encodeURIComponent(getViewerId()))
     .then(r => r.json())
     .then(d => {
       if (d.show && d.ad && d.ad.mediaUrl && !getAdMutes().includes(d.ad.category || 'general')) showFeedAd(d.ad, base, node.subdomain);
@@ -5188,7 +5441,7 @@ function showFeedAd(ad, base, host) {
   if (_feedAdShowing) return;
   _feedAdShowing = true; _swipesSinceAd = 0;
   _feedAdCategory = ad.category || 'general';
-  _feedAdClickUrl = ad.clickUrl || ''; _feedAdBase = base;
+  _feedAdClickUrl = ad.clickUrl || ''; _feedAdBase = base; _feedAdHost = host;
   const ov = document.getElementById('feedAdOverlay');
   const video = document.getElementById('feedAdVideo');
   const sp = document.getElementById('feedAdSponsor');
@@ -5234,7 +5487,7 @@ function showFeedAd(ad, base, host) {
       if (video._counted) return;
       video._counted = true;
       // impression counts only when the creative actually renders
-      fetch(base + '/live/preroll/seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: getViewerId() }) }).catch(() => {});
+      fetch(base + '/feed/ad/seen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: getViewerId() }) }).catch(() => {});
       reportImpression(host, 'feed');
     };
     video.muted = false;
@@ -5258,7 +5511,8 @@ function skipFeedAd() {
 
 function onFeedAdClick() {
   if (!_feedAdClickUrl.startsWith('http://') && !_feedAdClickUrl.startsWith('https://')) return;
-  fetch(_feedAdBase + '/live/preroll/click', { method: 'POST' }).catch(() => {});
+  fetch(_feedAdBase + '/feed/ad/click', { method: 'POST' }).catch(() => {});
+  reportClick(_feedAdHost, 'feed');
   window.open(_feedAdClickUrl, '_blank', 'noopener');
 }
 
@@ -6200,8 +6454,9 @@ function renderProfileBody(data, subdomain) {
   const items = [];
   // Host configures the node-wide ad + sees the ledger; a hosted creator with a share %
   // gets a read-only earnings view; everyone else gets nothing.
-  if (isOwn && isHost) items.push(['💰 Node ad &amp; revenue', 'openPrerollSheet()']);
+  if (isOwn && isHost) items.push(['💰 Feed ad &amp; revenue', 'openPrerollSheet()']);
   else if (isOwn && data.adsEnabled) items.push(['💰 Your earnings', 'openEarnings()']);
+  if (isOwn && isCreator) items.push(['📺 Live pre-roll / intro', 'openLiveAdSheet()']);
   if (isOwn && isHost) items.push(['👥 Manage creators', 'openCreators()']);
   if (isOwn && isCreator) items.push(['📥 Import from TikTok', 'openImport()']);
   if (isOwn && isCreator) items.push(['🔗 Cross-posting', 'openXpost()']);
@@ -6707,10 +6962,106 @@ async function savePreroll() {
       }),
     });
     if (!res.ok) throw new Error('save failed');
-    showToast(enabled ? 'Pre-roll ad on' : 'Pre-roll ad saved');
+    showToast(enabled ? 'Feed ad on' : 'Feed ad saved');
     closePrerollSheet();
   } catch(e) { showToast('Error: ' + e.message); }
   btn.disabled = false; btn.textContent = 'Save';
+}
+
+// ── LIVE PRE-ROLL ADMIN (per-creator) ─────────────────────────
+// Every creator owns the slot before their OWN streams: a self-sourced sponsor ad,
+// or kind 'intro' — a theme song with no sponsor and no impression billing.
+let _liveAdMediaUrl = null, _liveAdContentType = null, _liveAdKind = 'sponsor', _liveAdDashUrl = '';
+
+async function openLiveAdSheet() {
+  document.getElementById('liveAdSheet').classList.add('show');
+  try {
+    const data = await fetch('/admin/livead.json', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    const cfg = data.livead || {};
+    document.getElementById('liveAdEnabled').checked = !!cfg.enabled;
+    document.getElementById('liveAdSponsorName').value = cfg.sponsorName || '';
+    document.getElementById('liveAdClickUrl').value = cfg.clickUrl || '';
+    document.getElementById('liveAdCategory').value = cfg.category || '';
+    document.getElementById('liveAdCpm').value = cfg.cpm ? String(cfg.cpm) : '';
+    _liveAdMediaUrl = cfg.mediaUrl || null;
+    _liveAdContentType = cfg.contentType || null;
+    _liveAdDashUrl = data.sponsorUrl || '';
+    document.getElementById('liveAdFileName').textContent = cfg.mediaUrl ? 'current clip uploaded ✓' : '';
+    setLiveAdKind(cfg.kind === 'intro' ? 'intro' : 'sponsor');
+    renderLiveAdStats(data.stats || {}, cfg);
+  } catch(e) {}
+}
+
+function setLiveAdKind(k) {
+  _liveAdKind = k;
+  const on = 'rgba(255,255,255,0.25)', off = 'rgba(255,255,255,0.08)';
+  document.getElementById('liveAdKindSponsor').style.background = k === 'sponsor' ? on : off;
+  document.getElementById('liveAdKindIntro').style.background = k === 'intro' ? on : off;
+  document.getElementById('liveAdSponsorFields').style.display = k === 'intro' ? 'none' : 'block';
+}
+
+function renderLiveAdStats(s, cfg) {
+  const imp = s.impressions || 0, clicks = s.clicks || 0;
+  const earnings = s.earnings != null ? s.earnings : (imp / 1000) * (cfg.cpm || 0);
+  const ctr = imp ? ((clicks / imp) * 100).toFixed(1) + '%' : '—';
+  document.getElementById('liveAdStats').innerHTML =
+    '<div style="font-size:26px;font-weight:800;color:#fff;line-height:1">$' + (earnings || 0).toFixed(2) + '</div>' +
+    '<div style="font-size:11px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px">estimated earnings (your live pre-roll)</div>' +
+    '<div style="font-size:13px;color:rgba(255,255,255,0.6);margin-top:10px">' + imp + ' views · ' + clicks + ' clicks · ' + ctr + ' CTR</div>';
+}
+
+function closeLiveAdSheet() {
+  document.getElementById('liveAdSheet').classList.remove('show');
+}
+
+async function onLiveAdFilePick(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const btn = document.getElementById('liveAdSaveBtn');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  document.getElementById('liveAdFileName').textContent = file.name;
+  try {
+    const r = await uploadFile(file);
+    _liveAdMediaUrl = r.url; _liveAdContentType = r.contentType;
+    document.getElementById('liveAdFileName').textContent = file.name + ' ✓';
+  } catch(e) {
+    showToast('Upload failed');
+    document.getElementById('liveAdFileName').textContent = '';
+  }
+  btn.disabled = false; btn.textContent = 'Save';
+}
+
+async function saveLiveAd() {
+  const enabled = document.getElementById('liveAdEnabled').checked;
+  if (enabled && !_liveAdMediaUrl) { showToast('Upload a video first'); return; }
+  const btn = document.getElementById('liveAdSaveBtn');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const res = await fetch('/admin/livead', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({
+        enabled,
+        kind: _liveAdKind,
+        mediaUrl: _liveAdMediaUrl,
+        contentType: _liveAdContentType,
+        sponsorName: document.getElementById('liveAdSponsorName').value.trim(),
+        clickUrl: document.getElementById('liveAdClickUrl').value.trim(),
+        category: document.getElementById('liveAdCategory').value.trim(),
+        cpm: document.getElementById('liveAdCpm').value.trim(),
+        durationSec: 15,
+      }),
+    });
+    if (!res.ok) throw new Error('save failed');
+    showToast(enabled ? (_liveAdKind === 'intro' ? 'Intro on' : 'Live pre-roll on') : 'Saved');
+    closeLiveAdSheet();
+  } catch(e) { showToast('Error: ' + e.message); }
+  btn.disabled = false; btn.textContent = 'Save';
+}
+
+function copyLiveAdDash() {
+  if (!_liveAdDashUrl) return;
+  navigator.clipboard.writeText(_liveAdDashUrl).then(() => showToast('Dashboard link copied'), () => showToast(_liveAdDashUrl));
 }
 
 // ── INBOX ─────────────────────────────────────────────────────
@@ -7624,6 +7975,7 @@ function closeTopOverlay() {
   if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }
   if (document.getElementById('liveModal').style.display === 'flex') {
+    if (vis('liveAdSheet')) { closeLiveAdSheet(); return true; }
     if (vis('prerollSheet')) { closePrerollSheet(); return true; }
     // a stray edge-swipe must never end a running broadcast
     const endBtn = document.getElementById('liveBtnEnd');
@@ -7634,7 +7986,7 @@ function closeTopOverlay() {
     ['loungeSheet', closeLounge],
     ['commentsSheet', closeComments], ['searchModal', () => shut('searchModal')],
     ['unlockModal', closeUnlock], ['publishModal', closePublish],
-    ['prerollSheet', closePrerollSheet], ['earningsSheet', () => shut('earningsSheet')],
+    ['prerollSheet', closePrerollSheet], ['liveAdSheet', closeLiveAdSheet], ['earningsSheet', () => shut('earningsSheet')],
     ['inboxSheet', closeInbox], ['editProfileSheet', closeEditProfile],
   ];
   if (_selMode) { exitSelMode(); return true; } // back leaves select mode before closing the profile

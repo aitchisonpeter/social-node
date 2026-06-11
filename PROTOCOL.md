@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.8.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.11.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -159,10 +159,19 @@ Chat lives and dies with the stream: history (last 100 messages) is only served 
 ### Broadcasting
 Creator-auth only — see [Admin](#admin-endpoints). OBS/Larix can ingest via **WHIP** at `POST /live/whip?token=<creator token>` (or `Authorization: Bearer`); end the stream with the WHIP `DELETE`.
 
-### Sponsor ads
-- `GET /live/preroll?vid=` → `{ "show": false }` or `{ "show": true, "ad": { "mediaUrl", "sponsorName", "clickUrl", "durationSec", "category" } }` (per-`vid` frequency cap, ~8 min grace)
-- `POST /live/preroll/seen` `{ "vid" }` — count an impression (per-IP floor applies)
+### Ads — two separate slots (split in 0.11.0)
+
+**Live pre-roll — owned by the CREATOR being watched** (per-tenant config, `/admin/livead`). A sponsor the creator sourced themselves, or `kind: "intro"` — a theme song / intro clip with no sponsor and no billing.
+- `GET /live/preroll?vid=` → `{ "show": false }` or `{ "show": true, "ad": { "kind": "sponsor"|"intro", "mediaUrl", "sponsorName", "clickUrl", "durationSec", "category" } }` (per-`vid` frequency cap, ~8 min grace, separate from the feed ad's)
+- `POST /live/preroll/seen` `{ "vid", "bill"? }` — record the grace window; increments the impression counter unless `bill: false` (clients send `bill: false` for `intro` creatives — a theme song isn't a sponsor view)
 - `POST /live/preroll/click` — count a click
+
+**In-feed interstitial — owned by the NODE host** (worker-wide config, `/admin/preroll`, master). Revenue is shared per-creator via share %.
+- `GET /feed/ad?vid=` → same shape as above, no `kind` (per-`vid` cap, own grace window)
+- `POST /feed/ad/seen` `{ "vid" }` — count an impression (per-IP floor applies)
+- `POST /feed/ad/click` — count a click
+
+Counters are independent per surface: watching a live pre-roll never suppresses (or inflates) the feed ad, and vice versa.
 
 ---
 
@@ -170,8 +179,10 @@ Creator-auth only — see [Admin](#admin-endpoints). OBS/Larix can ingest via **
 
 Advertiser-facing numbers come from the root, not the node being paid ("don't grade your own homework"). Served only by the root host:
 
-- `POST https://<root>/measure/impression` `{ "host": "<viewed node>", "vid" }` — clients beacon this in parallel with the local `seen` call. Root checks the host is a registry member, dedupes per `vid` AND per IP per window, day-buckets the count.
-- `GET https://<root>/measure/stats.json?host=` → `{ "host", "total": n, "days": { "YYYY-MM-DD": n } }` — **public and auditable** by sponsors.
+- `POST https://<root>/measure/impression` `{ "host": "<viewed node>", "vid", "surface": "live"|"feed" }` — clients beacon this in parallel with the local `seen` call. Root checks the host is a registry member, dedupes per `vid` AND per IP per window **per surface**, day-buckets the count. Intro creatives are never beaconed.
+- `POST https://<root>/measure/click` `{ "host", "vid", "surface" }` (added 0.11.0) — verified click, deduped per `vid` per window.
+- `GET https://<root>/measure/stats.json?host=` → `{ "host", "total", "days": { "YYYY-MM-DD": n }, "surfaces": { "live": { "total", "days", "clicks" }, "feed": { ... } } }` — **public and auditable** by sponsors. (`total`/`days` at the top level are the combined pre-0.11 buckets.)
+- `GET https://<root>/sponsor/<host>` (added 0.11.0) — a public, human-readable sponsor dashboard for that creator's live pre-roll: verified views (today / 7d / lifetime), verified clicks, daily breakdown, auto-refreshing every 5s. The URL a creator hands their sponsor.
 
 ---
 
@@ -207,7 +218,7 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 
 **Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end).
 
-**Revenue** — `GET/POST /admin/preroll` *(master — the ad config is worker-wide)*; `GET /admin/preroll.json`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
+**Revenue** — `POST /admin/preroll` *(master — the FEED ad config is worker-wide)*; `GET /admin/preroll.json` *(master)*; `POST /admin/livead` `{ enabled, kind: "sponsor"|"intro", mediaUrl, sponsorName, clickUrl, category, cpm, durationSec }` (any creator — their own live pre-roll, added 0.11.0); `GET /admin/livead.json` → `{ livead, stats: { impressions, clicks, earnings }, sponsorUrl }`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator FEED views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
 
 **Tenants & onboarding** *(all master)* — `GET /admin/provisioned`; `POST /admin/provision` / `/admin/unprovision` `{ host }`; `POST /admin/creator/mint-claim` `{ host }` → one-time claim code + URL; `POST /admin/creator/mint-token` / `/clear-token` `{ host }`.
 
