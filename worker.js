@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.11.0';
+const PROTOCOL_VERSION = '0.12.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -239,6 +239,15 @@ export class LiveRoom extends DurableObject {
     if (seg === 'chat') {
       const status = await this.statusObj();
       return Response.json({ messages: status.active ? await this.recentChat() : [] });
+    }
+    // moderation: remove one chat message everywhere (storage + every connected viewer)
+    if (seg === 'chat-del' && request.method === 'POST') {
+      const { id } = await request.json().catch(() => ({}));
+      if (!id) return Response.json({ error: 'id required' }, { status: 400 });
+      const chat = (await this.ctx.storage.get('chat')) || [];
+      await this.ctx.storage.put('chat', chat.filter(m => m.id !== id));
+      this.broadcast({ t: 'chat-del', id });
+      return Response.json({ ok: true });
     }
 
     // ---- ad frequency cap + counters (per surface) ----
@@ -2302,6 +2311,14 @@ async function handleRequest(request, storage, env, ctx) {
     const r = await liveDO(env, subdomain, '/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     return json(await r.json().catch(() => ({})), r.status);
   }
+  // Delete one chat message (moderation, creator-only — viewers can't delete, even
+  // their own: chat is stream-scoped and ephemeral, and mute covers repeat offenders).
+  if (path === '/admin/live/chat-delete' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const body = await request.text();
+    const r = await liveDO(env, subdomain, '/chat-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
 
   // ---- live: admin — broadcast overlay (text/image drawn over the stream client-side;
   // the WebRTC video track is untouched, so latency stays sub-second) ----
@@ -2610,6 +2627,17 @@ async function handleRequest(request, storage, env, ctx) {
     return json({ ok: true });
   }
 
+  // Dismiss one notification (swipe-away in the client). Deleting a join/sub request
+  // notif does NOT resolve the request — pending entries live in their own stores.
+  if (path === '/admin/inbox/delete' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const { id } = await request.json().catch(() => ({}));
+    if (!id) return json({ error: 'id required' }, 400);
+    const notifs = (await storage.get('inbox:notifications')) || [];
+    await storage.set('inbox:notifications', notifs.filter(n => n.id !== id));
+    return json({ ok: true });
+  }
+
   // ---- network: this node asks the root to join ----
   if (path === '/admin/request-join' && request.method === 'POST') {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
@@ -2728,7 +2756,21 @@ async function handleRequest(request, storage, env, ctx) {
     }
     await gstore.set('provisioned', list);
     memSet('prov', list); // refresh this isolate immediately (others converge within 60s)
-    return json({ ok: true, provisioned: list });
+    // Removing a creator on the ROOT also ejects them from the network registry —
+    // otherwise they keep serving (registry members bypass the provisioning gate) and
+    // every client keeps them in its feed graph + search. One ✕ means gone everywhere.
+    let ejected = false;
+    if (path === '/admin/unprovision' && isRoot(identity)) {
+      const members = await getRegistryMembers(env, identity);
+      if (members.find(m => m.subdomain === host)) {
+        await gstore.set('registry:members', members.filter(m => m.subdomain !== host));
+        await gstore.set('registry:updatedAt', new Date().toISOString());
+        await gstore.set('registry:signed', await registrySigned(env, identity, subdomain));
+        try { await caches.default.delete(new Request('https://' + subdomain + '/.well-known/registry.json')); } catch (e) {}
+        ejected = true;
+      }
+    }
+    return json({ ok: true, provisioned: list, ejected });
   }
 
   // ---- creator credentials (host master only): per-tenant login tokens ----
@@ -3666,8 +3708,16 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
   display: flex; align-items: center; gap: 14px;
   padding: 14px 16px; border-bottom: 0.5px solid rgba(255,255,255,0.07);
   cursor: pointer;
+  position: relative; touch-action: pan-y; /* horizontal swipe = dismiss, vertical stays scroll */
 }
 .inbox-notif.unread { background: rgba(254,44,85,0.06); }
+.inbox-notif.snap-back { transition: transform 0.18s ease; }
+.inbox-notif.fly-out { transition: transform 0.2s ease, opacity 0.2s ease; opacity: 0; }
+.inbox-notif-x {
+  background: none; border: none; color: rgba(255,255,255,0.3);
+  font-size: 16px; padding: 8px; flex-shrink: 0; cursor: pointer;
+}
+.inbox-notif-x:active { color: #fff; }
 .inbox-notif-avatar {
   width: 46px; height: 46px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
@@ -4006,6 +4056,17 @@ ${s.noscript || ''}
     <button class="modal-close" onclick="closeLiveViewers()">×</button>
   </div>
   <div id="liveViewersBody" style="max-height:55vh;overflow-y:auto">Loading…</div>
+</div>
+
+<!-- Chat moderation chooser (broadcaster taps a chat message) — above #liveModal -->
+<div class="modal" id="chatModModal" style="z-index:140">
+  <div class="modal-header">
+    <div class="modal-title">Moderate</div>
+    <button class="modal-close" onclick="closeChatMod()">×</button>
+  </div>
+  <div id="chatModPreview" style="font-size:13px;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.05);border-radius:10px;padding:10px 12px;margin-bottom:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+  <button class="profile-connect-btn" style="display:block;width:100%;background:rgba(255,255,255,0.08);text-align:left;margin:0 0 8px" onclick="chatModDelete()">🗑 Delete this message</button>
+  <button class="profile-connect-btn" id="chatModMuteBtn" style="display:block;width:100%;background:rgba(255,255,255,0.08);text-align:left;margin:0" onclick="chatModMute()">🔇 Mute sender</button>
 </div>
 
 <!-- Past streams (broadcaster analytics) — opened from inside #liveModal (z 100), so needs a higher z -->
@@ -4617,6 +4678,8 @@ class LiveSocket {
       this.opts.onOverlay?.(d.overlay || null);
     } else if (d.t === 'chat') {
       this.chat.push(d.msg); if (this.chat.length > 100) this.chat.shift(); this.renderChat();
+    } else if (d.t === 'chat-del') {
+      this.chat = this.chat.filter(m => m.id !== d.id); this.renderChat();
     } else if (d.t === 'viewers') {
       this.setViewers(d.viewers);
     } else if (d.t === 'live') {
@@ -4634,9 +4697,9 @@ class LiveSocket {
     // full history (DO retains last 100); stick to newest unless the user scrolled up
     const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     box.innerHTML = this.chat.map(m => {
-      // broadcaster can tap a message to mute its sender
-      const mod = this.opts.canMod && m.sid
-        ? ' data-sid="' + esc(m.sid) + '" data-name="' + esc(m.name) + '" onclick="modMuteTap(this)" style="cursor:pointer"'
+      // broadcaster can tap a message for moderation: delete it, or mute its sender
+      const mod = this.opts.canMod && (m.id || m.sid)
+        ? ' data-id="' + esc(m.id || '') + '" data-sid="' + esc(m.sid || '') + '" data-name="' + esc(m.name) + '" data-text="' + esc(m.text) + '" onclick="modChatTap(this)" style="cursor:pointer"'
         : '';
       const who = commenterInfo(m.name);
       const badge = m.sub ? '<span class="sub-badge">SUB</span>' : '';
@@ -6817,12 +6880,29 @@ async function toggleLiveMute(el) {
     openLiveViewers();
   } catch(e) { toast('failed'); }
 }
-function modMuteTap(el) {
-  const sid = el.dataset.sid; if (!sid) return;
-  const name = el.dataset.name || 'viewer';
-  if (!confirm('Mute ' + name + '? Their chat messages will be hidden for everyone, on this and future streams.')) return;
-  fetch('/admin/live/mute', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, name, muted: true }) })
-    .then(() => toast(name + ' muted')).catch(() => toast('failed'));
+// Tap a chat message (broadcaster only) → moderation chooser: delete it, or mute the sender.
+let _chatModTarget = null;
+function modChatTap(el) {
+  _chatModTarget = { id: el.dataset.id || '', sid: el.dataset.sid || '', name: el.dataset.name || 'viewer' };
+  document.getElementById('chatModPreview').textContent = _chatModTarget.name + ': ' + (el.dataset.text || '');
+  const muteBtn = document.getElementById('chatModMuteBtn');
+  muteBtn.style.display = _chatModTarget.sid ? 'block' : 'none'; // pre-sid legacy messages can't be muted
+  muteBtn.textContent = '🔇 Mute ' + _chatModTarget.name;
+  document.getElementById('chatModModal').classList.add('show');
+}
+function closeChatMod() { document.getElementById('chatModModal').classList.remove('show'); _chatModTarget = null; }
+function chatModDelete() {
+  const t = _chatModTarget; closeChatMod();
+  if (!t || !t.id) { toast('too old to delete'); return; }
+  fetch('/admin/live/chat-delete', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.id }) })
+    .then(() => toast('message deleted')).catch(() => toast('failed'));
+}
+function chatModMute() {
+  const t = _chatModTarget; closeChatMod();
+  if (!t || !t.sid) return;
+  if (!confirm('Mute ' + t.name + '? Their chat messages will be hidden for everyone, on this and future streams.')) return;
+  fetch('/admin/live/mute', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ sid: t.sid, name: t.name, muted: true }) })
+    .then(() => toast(t.name + ' muted')).catch(() => toast('failed'));
 }
 
 // ── STREAM HISTORY (broadcaster analytics) ───────────────────
@@ -7159,13 +7239,14 @@ function renderInbox(notifs) {
     </div>\`;
     }
     const letter = (handle || n.name || '?')[0];
-    const click = n.subdomain ? \`openProfile('\${esc(n.subdomain)}')\` : '';
+    // _sw guard: a just-finished swipe must not also fire the tap action
+    const click = n.subdomain ? \`if(!this._sw)openProfile('\${esc(n.subdomain)}')\` : '';
     // real avatar when the notif is about a known node; gradient letter otherwise
     const who = n.subdomain ? commenterInfo(n.subdomain) : null;
     const avInner = who && who.avatarUrl
       ? \`<img src="\${esc(who.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
       : esc(letter.toUpperCase());
-    return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" onclick="\${click}">
+    return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" data-nid="\${esc(n.id || '')}" onclick="\${click}">
       <div class="inbox-notif-avatar" style="background:\${grad};overflow:hidden">\${avInner}</div>
       <div class="inbox-notif-body">
         <div class="inbox-notif-text">\${text}</div>
@@ -7173,8 +7254,50 @@ function renderInbox(notifs) {
         \${actions}
       </div>
       \${dot}
+      <button class="inbox-notif-x" onclick="event.stopPropagation();dismissNotif(this.parentElement)" title="Dismiss">✕</button>
     </div>\`;
   }).join('');
+  document.querySelectorAll('#inboxList .inbox-notif').forEach(attachNotifSwipe);
+}
+
+// Swipe a notification horizontally to dismiss it (the ✕ is the mouse/a11y fallback).
+function attachNotifSwipe(el) {
+  let x0 = 0, y0 = 0, dx = 0, horizontal = null;
+  el.addEventListener('touchstart', e => {
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+    dx = 0; horizontal = null;
+    el.classList.remove('snap-back');
+  }, { passive: true });
+  el.addEventListener('touchmove', e => {
+    dx = e.touches[0].clientX - x0;
+    const dy = e.touches[0].clientY - y0;
+    if (horizontal === null && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) horizontal = Math.abs(dx) > Math.abs(dy);
+    if (horizontal) { el._sw = true; el.style.transform = 'translateX(' + dx + 'px)'; }
+  }, { passive: true });
+  el.addEventListener('touchend', () => {
+    if (horizontal && Math.abs(dx) > 90) { dismissNotif(el, dx > 0 ? 1 : -1); }
+    else {
+      el.classList.add('snap-back');
+      el.style.transform = '';
+      setTimeout(() => { el._sw = false; el.classList.remove('snap-back'); }, 200);
+    }
+  }, { passive: true });
+}
+
+function dismissNotif(el, dir) {
+  const id = el.dataset.nid;
+  el.classList.add('fly-out');
+  el.style.transform = 'translateX(' + (dir < 0 ? '-' : '') + '110%)';
+  setTimeout(() => {
+    el.remove();
+    if (!document.querySelector('#inboxList .inbox-notif'))
+      document.getElementById('inboxList').innerHTML =
+        '<div class="inbox-empty"><div class="inbox-empty-icon">💬</div>No notifications yet</div>';
+  }, 200);
+  if (id) fetch('/admin/inbox/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: JSON.stringify({ id }),
+  }).catch(() => {});
 }
 
 async function approveJoin(pubkey, subdomain) {
@@ -7396,7 +7519,7 @@ async function loadCreatorList() {
     const d = await fetch('/admin/provisioned', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
     const list = (d.provisioned || []).filter(h => h !== SELF_SUBDOMAIN);
     const ads = d.ads || {};
-    document.getElementById('creatorList').innerHTML = list.length
+    let html = list.length
       ? '<div style="font-size:12px;color:rgba(255,255,255,0.5);margin-bottom:8px">Creators — "Share %" is their cut of ad revenue earned on their content</div>' + list.map(h =>
           \`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">
             <span style="font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">\${esc(h)}</span>
@@ -7405,7 +7528,30 @@ async function loadCreatorList() {
             <button class="btn-secondary" style="padding:4px 10px;font-size:12px;color:#FE2C55" onclick="removeCreator('\${esc(h)}')" title="Remove">✕</button>
           </div>\`).join('')
       : '';
+    // Root operator also sees the NETWORK members here — the registry is what feeds
+    // every client's scroll + search, so this ✕ is the one that makes content vanish.
+    if (SELF_SUBDOMAIN === NETWORK_ROOT_HOST) {
+      try {
+        const reg = await fetch('/admin/registry.json', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+        const members = (reg.members || []).filter(m => m.subdomain !== SELF_SUBDOMAIN);
+        if (members.length) {
+          html += '<div style="font-size:12px;color:rgba(255,255,255,0.5);margin:18px 0 8px">Network members — removing here ejects them from every node\\u2019s feed and search</div>' + members.map(m =>
+            \`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">
+              <span style="font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">\${esc(m.subdomain)}</span>
+              <button class="btn-secondary" style="padding:4px 10px;font-size:12px;color:#FE2C55" onclick="removeMember('\${esc(m.pubkey)}','\${esc(m.subdomain)}')" title="Remove from network">✕</button>
+            </div>\`).join('');
+        }
+      } catch(e) {}
+    }
+    document.getElementById('creatorList').innerHTML = html;
   } catch(e) {}
+}
+async function removeMember(pubkey, host) {
+  if (!confirm('Remove ' + host + ' from the NETWORK? It disappears from every node\\u2019s feed and search. Its data stays in storage; it can rejoin via a new join request.')) return;
+  try {
+    const d = await fetch('/admin/registry/remove', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ pubkey }) }).then(r => r.json());
+    if (d.ok) { toast(host + ' removed from the network'); loadCreatorList(); } else toast(d.error || 'failed');
+  } catch(e) { toast('failed'); }
 }
 async function setCreatorShare(host, current) {
   const v = prompt('Revenue share % for ' + host + ' (0–100, 0 = no share)', String(current || 0));
@@ -7418,10 +7564,10 @@ async function setCreatorShare(host, current) {
   } catch(e) { toast('failed'); }
 }
 async function removeCreator(host) {
-  if (!confirm('Remove ' + host + ' from this node? It will stop serving. Its content stays in storage — re-adding the handle restores it.')) return;
+  if (!confirm('Remove ' + host + ' from this node? It stops serving and (if a network member) leaves the network — out of every feed and search. Its content stays in storage — re-adding the handle restores it.')) return;
   try {
     const d = await fetch('/admin/unprovision', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ host }) }).then(r => r.json());
-    if (d.ok) { toast(host + ' removed'); loadCreatorList(); } else toast(d.error || 'failed');
+    if (d.ok) { toast(host + (d.ejected ? ' removed + ejected from the network' : ' removed')); loadCreatorList(); } else toast(d.error || 'failed');
   } catch(e) { toast('failed'); }
 }
 async function addCreator() {
@@ -7963,7 +8109,8 @@ function cancelGesture() {
 function closeTopOverlay() {
   const vis = id => { const el = document.getElementById(id); return el && el.classList.contains('show'); };
   const shut = id => document.getElementById(id).classList.remove('show');
-  // modals that stack above everything (z 130)
+  // modals that stack above everything (z 130+)
+  if (vis('chatModModal')) { closeChatMod(); return true; }
   if (vis('liveViewersModal')) { closeLiveViewers(); return true; }
   if (vis('streamHistoryModal')) { closeStreamHistory(); return true; }
   if (vis('creatorsModal')) { closeCreators(); return true; }
