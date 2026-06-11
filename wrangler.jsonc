@@ -5,6 +5,14 @@
   "compatibility_date": "2026-06-08",
   "main": "worker.js",
   "workers_dev": true,
+  // Optional — cookieless traffic analytics (Cloudflare Web Analytics beacon +
+  // GET /admin/analytics report; see PROTOCOL.md "Traffic analytics"). Uncomment and
+  // fill from your dashboard; also set the ANALYTICS_TOKEN secret. Omit to disable.
+  // "vars": {
+  //   "ANALYTICS_BEACON_TOKEN": "<web analytics snippet token>",
+  //   "ANALYTICS_SITE_TAG": "<hex id from the manage-site URL>",
+  //   "ANALYTICS_ACCOUNT_ID": "<your cloudflare account id>"
+  // },
   "kv_namespaces": [
     {
       "binding": "NODE_STATE",

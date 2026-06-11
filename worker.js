@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.12.0';
+const PROTOCOL_VERSION = '0.13.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -1379,7 +1379,7 @@ async function handleRequest(request, storage, env, ctx) {
   if (path === '/' || path === '/index.html') {
     const profile = (await storage.get('profile')) || {};
     const feed = await getFeed(storage);
-    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed }) }));
+    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed }), beacon: env.ANALYTICS_BEACON_TOKEN }));
   }
   // Per-post permalink: same app, but with post-specific OG meta so shares unfurl,
   // plus a crawler-readable noscript body. The client deep-links to the post on boot.
@@ -1388,7 +1388,7 @@ async function handleRequest(request, storage, env, ctx) {
     const post = feed.find(i => i.id === path.slice(3));
     if (!post) return Response.redirect(url.origin + '/', 302); // deleted/stale link → profile
     const profile = (await storage.get('profile')) || {};
-    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed, post }) }));
+    return html(renderApp({ identity, subdomain, seo: buildSeo({ origin: url.origin, subdomain, profile, feed, post }), beacon: env.ANALYTICS_BEACON_TOKEN }));
   }
   if (path === '/robots.txt') {
     return new Response('User-agent: *\nAllow: /\nDisallow: /admin/\nDisallow: /auth/\n\nSitemap: ' + url.origin + '/sitemap.xml\n', {
@@ -1791,6 +1791,66 @@ async function handleRequest(request, storage, env, ctx) {
   if (path === '/admin/verify' && request.method === 'POST') {
     if (!(await checkAuth(request))) return json({ ok: false }, 401);
     return json({ ok: true, master: isMaster(request) });
+  }
+
+  // ---- admin: node traffic report (Cloudflare Web Analytics pull) ----
+  // Master-only. Pulls the RUM beacon data back out via the GraphQL Analytics API so the
+  // host can report on traffic without the Cloudflare dashboard. Needs three pieces of
+  // deployment config: ANALYTICS_TOKEN (secret, Account Analytics:Read), and the
+  // ANALYTICS_ACCOUNT_ID / ANALYTICS_BEACON_TOKEN vars (the public beacon site token
+  // doubles as the GraphQL siteTag). ?days=N window, 1–90, default 7.
+  if (path === '/admin/analytics' && request.method === 'GET') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    if (!env.ANALYTICS_TOKEN || !env.ANALYTICS_ACCOUNT_ID || !env.ANALYTICS_BEACON_TOKEN) {
+      return json({ error: 'analytics not configured — set the ANALYTICS_TOKEN secret plus ANALYTICS_ACCOUNT_ID / ANALYTICS_BEACON_TOKEN vars' }, 503);
+    }
+    const days = Math.min(90, Math.max(1, parseInt(url.searchParams.get('days') || '7', 10) || 7));
+    const until = new Date();
+    const since = new Date(until.getTime() - days * 86400000);
+    // GraphQL filters on the site TAG (dashboard Manage-site URL), not the beacon token —
+    // two distinct ids per Web Analytics site. Fall back to the token for setups where they match.
+    const siteTag = env.ANALYTICS_SITE_TAG || env.ANALYTICS_BEACON_TOKEN;
+    // Filter is inlined (values are our own config + ISO dates, no user input).
+    const range = `filter: {siteTag: "${siteTag}", datetime_geq: "${since.toISOString()}", datetime_leq: "${until.toISOString()}"}`;
+    const grp = (extra, dims) => `rumPageloadEventsAdaptiveGroups(${range}, ${extra}) { count sum { visits }${dims ? ` dimensions { ${dims} }` : ''} }`;
+    const query = `{ viewer { accounts(filter: {accountTag: "${env.ANALYTICS_ACCOUNT_ID}"}) {
+      total: ${grp('limit: 1', '')}
+      byDay: ${grp('limit: 90, orderBy: [date_ASC]', 'date')}
+      byHost: ${grp('limit: 20, orderBy: [count_DESC]', 'requestHost')}
+      byPath: ${grp('limit: 20, orderBy: [count_DESC]', 'requestPath')}
+      byCountry: ${grp('limit: 10, orderBy: [count_DESC]', 'countryName')}
+      byReferer: ${grp('limit: 10, orderBy: [count_DESC]', 'refererHost')}
+      byDevice: ${grp('limit: 5, orderBy: [count_DESC]', 'deviceType')}
+    } } }`;
+    let g;
+    try {
+      const res = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + env.ANALYTICS_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      });
+      g = await res.json();
+    } catch (e) {
+      return json({ error: 'analytics API unreachable: ' + e.message }, 502);
+    }
+    if (g.errors && g.errors.length) return json({ error: 'analytics query failed', detail: g.errors }, 502);
+    const acct = g.data && g.data.viewer && g.data.viewer.accounts && g.data.viewer.accounts[0];
+    if (!acct) return json({ error: 'no analytics data — check ANALYTICS_ACCOUNT_ID and the token scope' }, 502);
+    const row = (r, dim) => ({ [dim]: r.dimensions[dim], pageviews: r.count, visits: r.sum.visits });
+    return json({
+      ok: true,
+      days, since: since.toISOString(), until: until.toISOString(),
+      totals: {
+        pageviews: acct.total[0] ? acct.total[0].count : 0,
+        visits: acct.total[0] ? acct.total[0].sum.visits : 0,
+      },
+      byDay: acct.byDay.map(r => row(r, 'date')),
+      byHost: acct.byHost.map(r => row(r, 'requestHost')),
+      byPath: acct.byPath.map(r => row(r, 'requestPath')),
+      byCountry: acct.byCountry.map(r => row(r, 'countryName')),
+      byReferer: acct.byReferer.map(r => row(r, 'refererHost')),
+      byDevice: acct.byDevice.map(r => row(r, 'deviceType')),
+    });
   }
 
   // ---- admin: upload media to R2 ----
@@ -2914,7 +2974,8 @@ function html(content, status = 200) {
       // The SPA is one inline <script>/<style>, so 'unsafe-inline' stays — the win here is
       // blocking foreign script/object injection, framing, and base/form hijacks. Media and
       // avatars load cross-node (https:), upload previews use blob:, chat may use wss:.
-      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src https: data: blob:; media-src https: data: blob:; connect-src https: wss:; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      // static.cloudflareinsights.com = the Web Analytics beacon (connect-src https: covers its POST).
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src https: data: blob:; media-src https: data: blob:; connect-src https: wss:; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
     },
   });
 }
@@ -3131,7 +3192,7 @@ a{color:#20D5EC}p,li{font-size:14px}code{background:rgba(255,255,255,0.1);paddin
 <li>No viewer accounts. Your display name and preferences live in your browser's local storage, on your device.</li>
 <li>The node stores what you submit: comments (with the name you chose), like counts keyed to a random per-device id, and reports.</li>
 <li>IP addresses are used transiently for rate-limiting and ad-impression deduping, in short rolling windows.</li>
-<li>No tracking pixels, no analytics scripts, no data sales.</li>
+<li>Aggregate, cookieless analytics (Cloudflare Web Analytics) count page loads and performance. No cookies, no cross-site tracking, no individual profiles, no data sales.</li>
 </ul>
 
 <h2>Imported content</h2>
@@ -3243,9 +3304,13 @@ function renderUnclaimed(subdomain) {
 </body></html>`;
 }
 
-function renderApp({ identity, subdomain, seo }) {
+function renderApp({ identity, subdomain, seo, beacon }) {
   const s = seo || {}; // absent in tests/harness — fall back to the plain title
   const seoHead = s.head || ('<title>' + escapeHtml(subdomain) + '</title>');
+  // Cloudflare Web Analytics — cookieless RUM beacon, only when the deployment sets
+  // ANALYTICS_BEACON_TOKEN (the public site token, safe in HTML; CSP allows the origin).
+  const beaconToken = String(beacon || '').replace(/[^a-f0-9]/gi, '');
+  const beaconTag = beaconToken ? `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "${beaconToken}"}'></script>` : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3258,7 +3323,7 @@ function renderApp({ identity, subdomain, seo }) {
 ${seoHead}
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">${beaconTag}
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 html, body {

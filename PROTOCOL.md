@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.12.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.13.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -69,6 +69,8 @@ For link sharing and crawlers — these serve HTML/text, not JSON:
 - `GET /robots.txt` — allows all, disallows `/admin/` and `/auth/`, points at the sitemap.
 - `GET /sitemap.xml` — homepage + every `/p/<id>` URL with `lastmod`.
 - `GET /legal` (added 0.7.0) — the node's policies page: acceptable use, how to report, takedown process, privacy, imported-content rights.
+
+When the deployment opts into traffic analytics (added 0.13.0 — see **Traffic analytics** under Admin endpoints), app pages carry Cloudflare's cookieless Web Analytics beacon (`static.cloudflareinsights.com`): aggregate page-load counts only, no cookies, no cross-site tracking. Nodes that don't configure it serve no analytics script at all.
 
 ---
 
@@ -219,6 +221,8 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 **Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/chat-delete` `{ id }` (added 0.12.0) — moderation-deletes one chat message from storage and broadcasts `{ "t": "chat-del", "id" }` to every connected client (creator-only by design — viewers cannot delete, even their own); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end).
 
 **Revenue** — `POST /admin/preroll` *(master — the FEED ad config is worker-wide)*; `GET /admin/preroll.json` *(master)*; `POST /admin/livead` `{ enabled, kind: "sponsor"|"intro", mediaUrl, sponsorName, clickUrl, category, cpm, durationSec }` (any creator — their own live pre-roll, added 0.11.0); `GET /admin/livead.json` → `{ livead, stats: { impressions, clicks, earnings }, sponsorUrl }`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator FEED views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
+
+**Traffic analytics (added 0.13.0)** — `GET /admin/analytics?days=1..90` *(master, default 7)* → `{ totals: { pageviews, visits }, byDay, byHost, byPath, byCountry, byReferer, byDevice }` — the node's web traffic, pulled live from Cloudflare's GraphQL Analytics API (Web Analytics RUM data). Opt-in per deployment: set the `ANALYTICS_TOKEN` secret (an API token with Account Analytics:Read) plus the `ANALYTICS_BEACON_TOKEN`, `ANALYTICS_SITE_TAG`, and `ANALYTICS_ACCOUNT_ID` vars; unconfigured nodes return `503`. Setting the beacon token also turns on the beacon in served pages (see Web surface). Gotcha: Cloudflare gives each Web Analytics site TWO ids — the beacon **token** (in the JS snippet) and the **site tag** (the hex id in the dashboard's manage-site URL, what GraphQL filters on). They are not interchangeable.
 
 **Tenants & onboarding** *(all master)* — `GET /admin/provisioned`; `POST /admin/provision` / `/admin/unprovision` `{ host }`; `POST /admin/creator/mint-claim` `{ host }` → one-time claim code + URL; `POST /admin/creator/mint-token` / `/clear-token` `{ host }`.
 
