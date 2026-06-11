@@ -3810,7 +3810,7 @@ ${s.noscript || ''}
     <div class="modal-title">Search</div>
     <button class="modal-close" onclick="document.getElementById('searchModal').classList.remove('show')">×</button>
   </div>
-  <input id="searchInput" class="field-input" placeholder="Node address (e.g. name.domain.com)" style="margin-bottom:12px" oninput="onSearchInput(this.value)">
+  <input id="searchInput" class="field-input" placeholder="Node address or #hashtag" style="margin-bottom:12px" oninput="onSearchInput(this.value)">
   <div id="searchResults"></div>
 </div>
 
@@ -5619,6 +5619,13 @@ function renderSidebar(node, item) {
   </div>\`;
 }
 
+// Escape, then make #hashtags tappable (opens tag search). Char class instead of \\w —
+// backslashes inside this template string get eaten (see deploy-validation notes).
+function tagify(text) {
+  return esc(text).replace(/#[A-Za-z0-9_]+/g, t =>
+    '<span onclick="event.stopPropagation();searchTag(\\'' + t.slice(1) + '\\')" style="color:#20D5EC;pointer-events:auto;cursor:pointer">' + t + '</span>');
+}
+
 function renderInfo(node, item) {
   const handle = '@' + node.subdomain; // full host — handles are globally unique across the network
   const title  = item?.title || '';
@@ -5628,7 +5635,7 @@ function renderInfo(node, item) {
   return \`<div class="card-info">
     \${live}
     <div class="info-username" onclick="openProfile('\${esc(node.subdomain)}')" style="cursor:pointer">\${esc(handle)}</div>
-    \${desc ? \`<div class="info-desc">\${esc(desc)}</div>\` : ''}
+    \${desc ? \`<div class="info-desc">\${tagify(desc)}</div>\` : ''}
   </div>\`;
 }
 
@@ -7375,6 +7382,24 @@ function onSearchInput(q) {
 
 function renderSearchResults(q) {
   const box = document.getElementById('searchResults');
+  q = (q || '').toLowerCase();
+  // "#tag" → search POSTS (loaded feeds only — feeds hydrate lazily as you scroll)
+  if (q.startsWith('#') && q.length > 1) {
+    const hits = [];
+    nodeGraph.forEach(n => (Array.isArray(n.feed) ? n.feed : []).forEach((it, i) => {
+      if (((it.title || '') + ' ' + (it.body || '')).toLowerCase().includes(q)) hits.push({ n, it, i });
+    }));
+    box.innerHTML = hits.length
+      ? hits.slice(0, 50).map(h => \`<div onclick="goToPost('\${esc(h.n.subdomain)}',\${h.i})" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);cursor:pointer">
+          <div style="font-size:20px;flex-shrink:0">\${h.it.type === 'video' ? '🎬' : h.it.type === 'photo' ? '🖼' : '📝'}</div>
+          <div style="min-width:0">
+            <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(h.it.title || h.it.body || 'post')}</div>
+            <div style="font-size:12px;color:rgba(255,255,255,0.5)">@\${esc(h.n.subdomain)}</div>
+          </div>
+        </div>\`).join('') + '<div style="padding:12px 0;font-size:11px;color:rgba(255,255,255,0.35)">Searches content your app has loaded so far</div>'
+      : '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.4)">No loaded posts with ' + esc(q) + ' yet</div>';
+    return;
+  }
   const matches = nodeGraph.filter(n =>
     !q || n.subdomain.toLowerCase().includes(q)
   );
@@ -7428,6 +7453,23 @@ function goToNode(subdomain) {
     nodeIndex = idx; renderCurrent(); updateIndicators();
     document.getElementById('searchModal').classList.remove('show');
   }
+}
+
+// Tap a #tag in a caption → search prefilled with it.
+function searchTag(tag) {
+  document.getElementById('searchModal').classList.add('show');
+  const input = document.getElementById('searchInput');
+  input.value = '#' + tag;
+  renderSearchResults('#' + tag);
+}
+
+// Jump straight to one post (tag-search result).
+function goToPost(subdomain, postIdx) {
+  const idx = nodeGraph.findIndex(n => n.subdomain === subdomain);
+  if (idx < 0) return;
+  nodeGraph[idx].postIndex = postIdx;
+  nodeIndex = idx; renderCurrent(); updateIndicators();
+  document.getElementById('searchModal').classList.remove('show');
 }
 
 function addNodeFromSearch() {
