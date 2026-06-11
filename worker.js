@@ -4853,8 +4853,24 @@ function renderCard(node, postIdx) {
   if (!node.loaded) return \`<div class="card card-loading"><div class="spinner"></div></div>\`;
   if (node.feed === null) return \`<div class="card card-error"><div class="c-label">couldn't reach \${esc(node.subdomain)}</div></div>\`;
   if (node.feed.length === 0) {
-    const hint = node.subdomain === SELF_SUBDOMAIN && isCreator ? 'tap + to post' : 'no posts yet';
-    return \`<div class="card card-empty"><div class="c-label">\${esc(node.subdomain)}</div><div class="c-label" style="margin-top:6px;font-size:12px">\${hint}</div></div>\`;
+    // Live-only creators exist (no posts, just streams) — their empty card is their
+    // presence in the scroll: avatar + name, and a big LIVE door when they're on air.
+    const name = node.displayName || node.subdomain.split('.')[0];
+    const grad = avatarGrad(node.subdomain);
+    const avInner = node.avatarUrl
+      ? \`<img src="\${esc(node.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
+      : esc((name[0] || '?').toUpperCase());
+    const live = node.liveStatus?.active
+      ? \`<div class="info-live-badge" onclick="onLiveTap()" style="cursor:pointer;pointer-events:auto;font-size:16px;padding:8px 18px">● LIVE — tap to watch</div>\`
+      : \`<div class="c-label" style="font-size:12px">\${node.subdomain === SELF_SUBDOMAIN && isCreator ? 'tap + to post' : 'no posts yet'}</div>\`;
+    return \`<div class="card card-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px">
+      <div onclick="openProfile('\${esc(node.subdomain)}')" style="width:88px;height:88px;border-radius:50%;background:\${grad};overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:700;cursor:pointer\${node.liveStatus?.active ? ';box-shadow:0 0 0 3px #FE2C55' : ''}">\${avInner}</div>
+      <div style="text-align:center">
+        <div style="font-size:17px;font-weight:600">\${esc(name)}</div>
+        <div class="c-label" style="margin-top:2px;font-size:12px" onclick="openProfile('\${esc(node.subdomain)}')">@\${esc(node.subdomain)}</div>
+      </div>
+      \${live}
+    </div>\`;
   }
 
   const item   = node.feed[postIdx] || node.feed[0];
@@ -5389,7 +5405,12 @@ function renderLounge() {
     const push = (_lounge.creatorMode && m.creator)
       ? '<button onclick="pushLoungeMsg(this)" data-text="' + esc(m.text) + '" style="background:none;font-size:15px;padding:0 6px;align-self:center" title="Push to subscribers">📣</button>'
       : '';
-    return '<div class="inbox-notif' + (pingsMe ? ' lounge-ping' : '') + '" style="cursor:default"><div class="inbox-notif-body">'
+    const avInner = who && who.avatarUrl
+      ? '<img src="' + esc(who.avatarUrl) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'
+      : esc((shown[0] || '?').toUpperCase());
+    return '<div class="inbox-notif' + (pingsMe ? ' lounge-ping' : '') + '" style="cursor:default">'
+      + '<div class="inbox-notif-avatar" data-name="' + esc(shown) + '" onclick="mentionName(this)" style="background:' + avatarGrad(m.name || '?') + ';overflow:hidden;cursor:pointer">' + avInner + '</div>'
+      + '<div class="inbox-notif-body">'
       + '<div class="inbox-notif-text">' + badge + '<strong data-name="' + esc(shown) + '" onclick="mentionName(this)" style="cursor:pointer">' + esc(shown) + '</strong> ' + loungeRichText(m.text, knownNames) + '</div>'
       + '<div class="inbox-notif-time">' + timeAgo(m.at) + '</div>'
       + '</div>' + push + '</div>';
@@ -5537,6 +5558,51 @@ stage.addEventListener('touchend', e => {
   }
   lastTap = now;
 }, { passive: true });
+
+// ── 2× SPEED PRESS-AND-HOLD (right edge, TikTok-style) ───────
+// Hold the right third of a feed video ≥350ms → 2× while held. Engages only if the
+// finger hasn't moved (so swipes win), and only on cards with a playing video.
+let _hold2x = { timer: null, video: null, on: false };
+function _end2x() {
+  if (_hold2x.timer) { clearTimeout(_hold2x.timer); _hold2x.timer = null; }
+  if (_hold2x.on && _hold2x.video) {
+    try { _hold2x.video.playbackRate = 1; } catch(e) {}
+    const ind = document.getElementById('speedInd');
+    if (ind) ind.style.display = 'none';
+  }
+  _hold2x.on = false; _hold2x.video = null;
+}
+stage.addEventListener('touchstart', e => {
+  const t = e.touches[0];
+  if (!t || e.touches.length > 1) return;
+  if (t.clientX < window.innerWidth * 0.66) return; // right-edge only
+  _end2x();
+  _hold2x.timer = setTimeout(() => {
+    _hold2x.timer = null;
+    // the touchmove canceller killed the timer if a swipe started — still here = a real hold
+    const v = activePanel().querySelector('.card video');
+    if (!v || v.paused) return;
+    let ind = document.getElementById('speedInd');
+    if (!ind) {
+      ind = document.createElement('div');
+      ind.id = 'speedInd';
+      ind.style.cssText = 'position:fixed;top:max(env(safe-area-inset-top),16px);left:50%;transform:translateX(-50%);z-index:60;background:rgba(0,0,0,0.6);border-radius:16px;padding:5px 14px;font-size:13px;font-weight:700;color:#fff;pointer-events:none';
+      ind.textContent = '2× ▶▶';
+      document.body.appendChild(ind);
+    }
+    ind.style.display = 'block';
+    try { v.playbackRate = 2; _hold2x.video = v; _hold2x.on = true; } catch(e) {}
+  }, 350);
+}, { passive: true });
+stage.addEventListener('touchmove', e => {
+  // movement = the user is swiping, not holding
+  if (_hold2x.timer) {
+    const t = e.touches[0];
+    if (t && (Math.abs(t.clientX - G.startX) > 12 || Math.abs(t.clientY - G.startY) > 12)) _end2x();
+  }
+}, { passive: true });
+stage.addEventListener('touchend', _end2x, { passive: true });
+stage.addEventListener('touchcancel', _end2x, { passive: true });
 
 function showHeartBurst(x, y) {
   const el = document.getElementById('heartBurst');
@@ -6269,8 +6335,13 @@ function renderInbox(notifs) {
     }
     const letter = (handle || n.name || '?')[0];
     const click = n.subdomain ? \`openProfile('\${esc(n.subdomain)}')\` : '';
+    // real avatar when the notif is about a known node; gradient letter otherwise
+    const who = n.subdomain ? commenterInfo(n.subdomain) : null;
+    const avInner = who && who.avatarUrl
+      ? \`<img src="\${esc(who.avatarUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">\`
+      : esc(letter.toUpperCase());
     return \`<div class="inbox-notif\${n.read ? '' : ' unread'}" onclick="\${click}">
-      <div class="inbox-notif-avatar" style="background:\${grad}">\${esc(letter.toUpperCase())}</div>
+      <div class="inbox-notif-avatar" style="background:\${grad};overflow:hidden">\${avInner}</div>
       <div class="inbox-notif-body">
         <div class="inbox-notif-text">\${text}</div>
         <div class="inbox-notif-time">\${timeAgo(n.at)}</div>
