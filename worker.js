@@ -2760,7 +2760,7 @@ async function handleRequest(request, storage, env, ctx) {
     // otherwise they keep serving (registry members bypass the provisioning gate) and
     // every client keeps them in its feed graph + search. One ✕ means gone everywhere.
     let ejected = false;
-    if (path === '/admin/unprovision' && isRoot(identity)) {
+    if (path === '/admin/unprovision' && isRoot(identity) && host !== NETWORK_ROOT_HOST) {
       const members = await getRegistryMembers(env, identity);
       if (members.find(m => m.subdomain === host)) {
         await gstore.set('registry:members', members.filter(m => m.subdomain !== host));
