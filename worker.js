@@ -6597,6 +6597,9 @@ function renderProfileBody(data, subdomain) {
   if (isOwn && isCreator) items.push(['🔗 Cross-posting', 'openXpost()']);
   if (subdomain === SELF_SUBDOMAIN) items.push(['🎛 My algorithm', 'openAlgo()']);
   if (!isOwn) items.push([(blocked ? '🚫 Unblock' : '🚫 Block'), \`toggleBlock('\${esc(subdomain)}')\`]);
+  // Log out = drop the stored credential and reload. Until now there was NO way out of
+  // creator mode (or to switch password-session → master token) short of clearing site data.
+  if (isOwn && isCreator) items.push(['🔑 Log out', 'logoutCreator()']);
   // select-posts is NOT a menu item — it's the ◯ toggle in the profile header
   const selBtnEl = document.getElementById('profileSelBtn');
   if (selBtnEl) { selBtnEl.style.display = (isOwn && isCreator && (data.postCount || 0) > 0) ? 'flex' : 'none'; selBtnEl.textContent = '◯'; }
@@ -7565,6 +7568,11 @@ function toggleClaim() {
   const f = document.getElementById('claimForm');
   f.style.display = f.style.display === 'none' ? 'block' : 'none';
   document.getElementById('tokenForm').style.display = 'none';
+}
+function logoutCreator() {
+  localStorage.removeItem('adminToken');
+  token = ''; isCreator = false; isHost = false;
+  location.reload();
 }
 function toggleTokenUnlock() {
   const f = document.getElementById('tokenForm');
