@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.9.0';
+const PROTOCOL_VERSION = '0.10.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -796,6 +796,242 @@ async function sendWebPush(vapid, subscription, payloadObj, subject) {
   return r.status;
 }
 
+// ============================================================
+// CROSS-POSTING  ("post once, publish everywhere")
+// ------------------------------------------------------------
+// The HOST registers one developer app per platform (client id/secret, stored
+// encrypted in global KV); each CREATOR then OAuth-connects their own account
+// (tokens encrypted per-tenant). Publishing fans out post-publish via per-platform
+// adapters. Everything is encrypted with AES-GCM under the XPOST_KEY worker secret —
+// no plaintext platform tokens ever sit in KV.
+const XPOST_PLATFORMS = {
+  tiktok:    { name: 'TikTok',    cap: 2200,  types: ['video'],                   note: 'video only; commercial content must be disclosed' },
+  instagram: { name: 'Instagram', cap: 2200,  types: ['photo', 'video'],          note: 'vertical video posts as Reels' },
+  youtube:   { name: 'YouTube',   cap: 5000,  types: ['video'],                   note: 'vertical <60s auto-detects as Shorts' },
+  x:         { name: 'X',         cap: 280,   types: ['photo', 'writing'],        note: 'text + images only' },
+  linkedin:  { name: 'LinkedIn',  cap: 3000,  types: ['photo', 'video', 'writing'] },
+  facebook:  { name: 'Facebook',  cap: 63206, types: ['photo', 'video', 'writing'], note: 'posts to your first managed Page' },
+};
+async function xpAesKey(env) {
+  if (!env.XPOST_KEY) return null;
+  const bits = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.XPOST_KEY));
+  return crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+async function xpEncrypt(env, obj) {
+  const key = await xpAesKey(env);
+  if (!key) throw new Error('XPOST_KEY secret not set');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj))));
+  return b64url(iv) + '.' + b64url(ct);
+}
+async function xpDecrypt(env, str) {
+  const key = await xpAesKey(env);
+  if (!key || !str || !str.includes('.')) return null;
+  try {
+    const [iv, ct] = str.split('.');
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64urlDecode(iv) }, key, b64urlDecode(ct));
+    return JSON.parse(new TextDecoder().decode(pt));
+  } catch (e) { return null; }
+}
+// OAuth endpoints + scopes per platform. authUrl/tokenUrl take the app's client creds.
+const XPOST_OAUTH = {
+  tiktok: {
+    auth: (a, ru, st) => 'https://www.tiktok.com/v2/auth/authorize/?client_key=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=user.info.basic,video.publish&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st,
+    token: 'https://open.tiktokapis.com/v2/oauth/token/', idField: 'client_key',
+  },
+  instagram: {
+    auth: (a, ru, st) => 'https://www.facebook.com/v19.0/dialog/oauth?client_id=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=instagram_basic,instagram_content_publish,pages_show_list&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st,
+    token: 'https://graph.facebook.com/v19.0/oauth/access_token', idField: 'client_id',
+  },
+  youtube: {
+    auth: (a, ru, st) => 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=' + encodeURIComponent('https://www.googleapis.com/auth/youtube.upload') + '&access_type=offline&prompt=consent&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st,
+    token: 'https://oauth2.googleapis.com/token', idField: 'client_id',
+  },
+  x: {
+    auth: (a, ru, st, chal) => 'https://twitter.com/i/oauth2/authorize?client_id=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=' + encodeURIComponent('tweet.read tweet.write users.read offline.access') + '&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st + '&code_challenge=' + chal + '&code_challenge_method=S256',
+    token: 'https://api.twitter.com/2/oauth2/token', idField: 'client_id', pkce: true, basicAuth: true,
+  },
+  linkedin: {
+    auth: (a, ru, st) => 'https://www.linkedin.com/oauth/v2/authorization?client_id=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=' + encodeURIComponent('openid profile w_member_social') + '&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st,
+    token: 'https://www.linkedin.com/oauth/v2/accessToken', idField: 'client_id',
+  },
+  facebook: {
+    auth: (a, ru, st) => 'https://www.facebook.com/v19.0/dialog/oauth?client_id=' + encodeURIComponent(a.clientId) + '&response_type=code&scope=pages_manage_posts,pages_read_engagement&redirect_uri=' + encodeURIComponent(ru) + '&state=' + st,
+    token: 'https://graph.facebook.com/v19.0/oauth/access_token', idField: 'client_id',
+  },
+};
+// Exchange an OAuth code (or refresh token) for tokens. Returns the raw token response.
+async function xpTokenCall(platform, app, params) {
+  const o = XPOST_OAUTH[platform];
+  const body = new URLSearchParams(params);
+  body.set(o.idField, app.clientId);
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (o.basicAuth) headers['Authorization'] = 'Basic ' + btoa(app.clientId + ':' + app.clientSecret);
+  else body.set('client_secret', app.clientSecret);
+  const r = await fetch(o.token, { method: 'POST', headers, body });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(platform + ' token: ' + (d.error_description || d.error || r.status));
+  return d;
+}
+// Get a live access token for a connected account, refreshing if stale.
+async function xpAccess(env, storage, platform, acct, app) {
+  if (acct.expiresAt && Date.now() < acct.expiresAt - 60000) return acct.access;
+  if (!acct.refresh) return acct.access; // no refresh token — use until it dies
+  const d = await xpTokenCall(platform, app, { grant_type: 'refresh_token', refresh_token: acct.refresh });
+  acct.access = d.access_token;
+  if (d.refresh_token) acct.refresh = d.refresh_token;
+  acct.expiresAt = d.expires_in ? Date.now() + d.expires_in * 1000 : 0;
+  const xp = (await storage.get('xpost')) || {};
+  xp[platform] = { ...(xp[platform] || {}), enc: await xpEncrypt(env, acct) };
+  await storage.set('xpost', xp);
+  return acct.access;
+}
+
+// ---- cross-post publish adapters ----
+// Each adapter takes (env, storage, acct{access,...,meta}, app, post{type,title,body,mediaUrl,mediaContentType,vertical?}, mediaAbsUrl)
+// and returns { ok:true, id? } or throws. Caption building + char caps are shared.
+function xpCaption(post, cap) {
+  const txt = [post.title, post.body].filter(Boolean).join(' — ');
+  return txt.length > cap ? txt.slice(0, cap - 1) + '…' : txt;
+}
+async function xpFetchMedia(mediaAbsUrl) {
+  const r = await fetch(mediaAbsUrl);
+  if (!r.ok) throw new Error('media fetch ' + r.status);
+  return r;
+}
+const XPOST_ADAPTERS = {
+  // TikTok Content Posting API — PULL_FROM_URL (the node's /media URL must be on a
+  // domain verified in the TikTok app). Commercial content discloses via the toggles.
+  async tiktok(env, storage, acct, app, post, mediaAbsUrl) {
+    const body = {
+      post_info: {
+        title: xpCaption(post, 2200),
+        privacy_level: 'PUBLIC_TO_EVERYONE',
+        ...(post.commercial ? { brand_organic_toggle: true, brand_content_toggle: true } : {}),
+      },
+      source_info: { source: 'PULL_FROM_URL', video_url: mediaAbsUrl },
+    };
+    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || (d.error && d.error.code !== 'ok')) throw new Error('tiktok: ' + (d.error?.message || r.status));
+    return { ok: true, id: d.data?.publish_id };
+  },
+  // Instagram Graph API — container (URL-based) then publish. Vertical video → REELS.
+  async instagram(env, storage, acct, app, post, mediaAbsUrl) {
+    const igId = acct.meta?.igUserId;
+    if (!igId) throw new Error('instagram: no business account linked to your Facebook pages');
+    const caption = encodeURIComponent(xpCaption(post, 2200));
+    const isVideo = post.type === 'video';
+    const make = 'https://graph.facebook.com/v19.0/' + igId + '/media?access_token=' + encodeURIComponent(acct.access)
+      + '&caption=' + caption
+      + (isVideo ? '&media_type=REELS&video_url=' : '&image_url=') + encodeURIComponent(mediaAbsUrl);
+    let r = await fetch(make, { method: 'POST' });
+    let d = await r.json().catch(() => ({}));
+    if (!d.id) throw new Error('instagram: ' + (d.error?.message || 'container failed'));
+    // video containers process async — poll briefly
+    if (isVideo) {
+      for (let i = 0; i < 15; i++) {
+        await new Promise(res => setTimeout(res, 2000));
+        const s = await fetch('https://graph.facebook.com/v19.0/' + d.id + '?fields=status_code&access_token=' + encodeURIComponent(acct.access)).then(x => x.json()).catch(() => ({}));
+        if (s.status_code === 'FINISHED') break;
+        if (s.status_code === 'ERROR') throw new Error('instagram: video processing failed');
+      }
+    }
+    r = await fetch('https://graph.facebook.com/v19.0/' + igId + '/media_publish?creation_id=' + d.id + '&access_token=' + encodeURIComponent(acct.access), { method: 'POST' });
+    d = await r.json().catch(() => ({}));
+    if (!d.id) throw new Error('instagram: ' + (d.error?.message || 'publish failed'));
+    return { ok: true, id: d.id };
+  },
+  // YouTube resumable upload, streamed from R2. Vertical <60s auto-detects as Shorts.
+  async youtube(env, storage, acct, app, post, mediaAbsUrl) {
+    const meta = {
+      snippet: { title: (post.title || 'Untitled').slice(0, 100), description: xpCaption(post, 5000) },
+      status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
+    };
+    const init = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access, 'Content-Type': 'application/json' },
+      body: JSON.stringify(meta),
+    });
+    if (!init.ok) throw new Error('youtube: init ' + init.status + ' ' + (await init.text()).slice(0, 120));
+    const loc = init.headers.get('Location');
+    const media = await xpFetchMedia(mediaAbsUrl);
+    const up = await fetch(loc, { method: 'PUT', headers: { 'Content-Type': post.mediaContentType || 'video/mp4' }, body: media.body });
+    const d = await up.json().catch(() => ({}));
+    if (!up.ok) throw new Error('youtube: upload ' + up.status);
+    return { ok: true, id: d.id };
+  },
+  // X v2 — text + up to 1 image (Social Node posts carry one media). Media via v1.1 upload.
+  async x(env, storage, acct, app, post, mediaAbsUrl) {
+    const tweet = { text: xpCaption(post, 280) };
+    if (post.type === 'photo' && mediaAbsUrl) {
+      const media = await xpFetchMedia(mediaAbsUrl);
+      const buf = await media.arrayBuffer();
+      const fd = new FormData();
+      fd.append('media', new Blob([buf], { type: post.mediaContentType || 'image/jpeg' }));
+      const mu = await fetch('https://upload.twitter.com/1.1/media/upload.json', {
+        method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access }, body: fd,
+      });
+      const md = await mu.json().catch(() => ({}));
+      if (!mu.ok || !md.media_id_string) throw new Error('x: media upload ' + mu.status + (md.errors ? ' ' + JSON.stringify(md.errors).slice(0, 100) : ''));
+      tweet.media = { media_ids: [md.media_id_string] };
+    }
+    const r = await fetch('https://api.twitter.com/2/tweets', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access, 'Content-Type': 'application/json' },
+      body: JSON.stringify(tweet),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('x: ' + (d.detail || d.title || r.status));
+    return { ok: true, id: d.data?.id };
+  },
+  // LinkedIn UGC post (person), media via assets registerUpload → PUT.
+  async linkedin(env, storage, acct, app, post, mediaAbsUrl) {
+    const person = acct.meta?.personUrn;
+    if (!person) throw new Error('linkedin: missing profile id');
+    let mediaBlock = { shareMediaCategory: 'NONE' };
+    if (mediaAbsUrl && (post.type === 'photo' || post.type === 'video')) {
+      const recipe = post.type === 'photo' ? 'urn:li:digitalmediaRecipe:feedshare-image' : 'urn:li:digitalmediaRecipe:feedshare-video';
+      const reg = await fetch('https://api.linkedin.com/v2/assets?action=registerUpload', {
+        method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerUploadRequest: { recipes: [recipe], owner: person, serviceRelationships: [{ relationshipType: 'OWNER', identifier: 'urn:li:userGeneratedContent' }] } }),
+      });
+      const rd = await reg.json().catch(() => ({}));
+      const mech = rd.value?.uploadMechanism?.['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest'];
+      if (!mech) throw new Error('linkedin: registerUpload failed');
+      const media = await xpFetchMedia(mediaAbsUrl);
+      const up = await fetch(mech.uploadUrl, { method: 'PUT', headers: { 'Authorization': 'Bearer ' + acct.access }, body: media.body });
+      if (!up.ok && up.status !== 201) throw new Error('linkedin: media upload ' + up.status);
+      mediaBlock = { shareMediaCategory: post.type === 'photo' ? 'IMAGE' : 'VIDEO', media: [{ status: 'READY', media: rd.value.asset }] };
+    }
+    const r = await fetch('https://api.linkedin.com/v2/ugcPosts', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + acct.access, 'Content-Type': 'application/json', 'X-Restli-Protocol-Version': '2.0.0' },
+      body: JSON.stringify({
+        author: person, lifecycleState: 'PUBLISHED',
+        specificContent: { 'com.linkedin.ugc.ShareContent': { shareCommentary: { text: xpCaption(post, 3000) }, ...mediaBlock } },
+        visibility: { 'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC' },
+      }),
+    });
+    if (!r.ok) throw new Error('linkedin: post ' + r.status + ' ' + (await r.text()).slice(0, 120));
+    return { ok: true, id: r.headers.get('x-restli-id') || '' };
+  },
+  // Facebook Page post — URL-based media (the graph pulls from our public /media URL).
+  async facebook(env, storage, acct, app, post, mediaAbsUrl) {
+    const page = acct.meta?.page;
+    if (!page) throw new Error('facebook: no managed Page found on this account');
+    const cap = encodeURIComponent(xpCaption(post, 63206));
+    let url;
+    if (post.type === 'photo') url = 'https://graph.facebook.com/v19.0/' + page.id + '/photos?url=' + encodeURIComponent(mediaAbsUrl) + '&message=' + cap + '&access_token=' + encodeURIComponent(page.token);
+    else if (post.type === 'video') url = 'https://graph.facebook.com/v19.0/' + page.id + '/videos?file_url=' + encodeURIComponent(mediaAbsUrl) + '&description=' + cap + '&access_token=' + encodeURIComponent(page.token);
+    else url = 'https://graph.facebook.com/v19.0/' + page.id + '/feed?message=' + cap + '&access_token=' + encodeURIComponent(page.token);
+    const r = await fetch(url, { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) throw new Error('facebook: ' + (d.error?.message || r.status));
+    return { ok: true, id: d.id || d.post_id };
+  },
+};
+
 async function verifySession(identity, host, tokenStr) {
   const dot = tokenStr.indexOf('.');
   if (dot < 0) return false;
@@ -1333,6 +1569,64 @@ async function handleRequest(request, storage, env, ctx) {
     const subs = await getSubs();
     if (subs[s.id]) { delete subs[s.id].push; delete subs[s.id].pushAt; await storage.set('subs', subs); }
     return jsonCors({ ok: true });
+  }
+
+  // ---- cross-posting: OAuth callback (public — the platform redirects here) ----
+  if (path.startsWith('/xpost/callback/')) {
+    const platform = path.split('/').pop();
+    const page = (msg, ok) => html('<!doctype html><meta charset="utf-8"><body style="background:#0a0a0a;color:#eee;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center"><div><div style="font-size:40px">' + (ok ? '✅' : '⚠️') + '</div><p>' + escapeHtml(msg) + '</p><p style="color:#888;font-size:13px">You can close this tab.</p></div></body>');
+    if (!XPOST_OAUTH[platform]) return page('Unknown platform', false);
+    const code = url.searchParams.get('code'), state = url.searchParams.get('state');
+    const stash = (await storage.get('xpoauth')) || {};
+    const st = state && stash[state];
+    delete stash[state];
+    await storage.set('xpoauth', stash);
+    if (!st || st.platform !== platform || st.exp < Date.now()) return page('Login expired — try connecting again.', false);
+    if (!code) return page('The platform refused: ' + (url.searchParams.get('error_description') || url.searchParams.get('error') || 'no code'), false);
+    try {
+      const apps = (await gstore.get('xpostapps')) || {};
+      const app = await xpDecrypt(env, apps[platform]);
+      if (!app) return page('This platform is not configured on the node.', false);
+      const ru = 'https://' + subdomain + '/xpost/callback/' + platform;
+      const d = await xpTokenCall(platform, app, { grant_type: 'authorization_code', code, redirect_uri: ru, ...(st.verifier ? { code_verifier: st.verifier } : {}) });
+      const acct = {
+        access: d.access_token, refresh: d.refresh_token || '',
+        expiresAt: d.expires_in ? Date.now() + d.expires_in * 1000 : 0,
+        meta: {}, connectedAt: new Date().toISOString(),
+      };
+      // platform-specific enrichment so publish-time has what it needs
+      if (platform === 'facebook' || platform === 'instagram') {
+        // upgrade to a long-lived user token, then find pages (+ IG business account)
+        try {
+          const ll = await fetch('https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=' + encodeURIComponent(app.clientId) + '&client_secret=' + encodeURIComponent(app.clientSecret) + '&fb_exchange_token=' + encodeURIComponent(acct.access)).then(r => r.json());
+          if (ll.access_token) { acct.access = ll.access_token; acct.expiresAt = ll.expires_in ? Date.now() + ll.expires_in * 1000 : 0; }
+        } catch (e) {}
+        const pages = await fetch('https://graph.facebook.com/v19.0/me/accounts?access_token=' + encodeURIComponent(acct.access)).then(r => r.json()).catch(() => ({}));
+        const pg = pages.data && pages.data[0];
+        if (platform === 'facebook') {
+          if (!pg) return page('No Facebook Page on this account — cross-posting needs a Page.', false);
+          acct.meta.page = { id: pg.id, token: pg.access_token, name: pg.name };
+        } else {
+          for (const p of pages.data || []) {
+            const ig = await fetch('https://graph.facebook.com/v19.0/' + p.id + '?fields=instagram_business_account&access_token=' + encodeURIComponent(acct.access)).then(r => r.json()).catch(() => ({}));
+            if (ig.instagram_business_account) { acct.meta.igUserId = ig.instagram_business_account.id; break; }
+          }
+          if (!acct.meta.igUserId) return page('No Instagram business/creator account linked to your Facebook pages.', false);
+        }
+      }
+      if (platform === 'linkedin') {
+        const me = await fetch('https://api.linkedin.com/v2/userinfo', { headers: { 'Authorization': 'Bearer ' + acct.access } }).then(r => r.json()).catch(() => ({}));
+        if (!me.sub) return page('Could not read your LinkedIn profile id.', false);
+        acct.meta.personUrn = 'urn:li:person:' + me.sub;
+      }
+      if (platform === 'tiktok') acct.meta.openId = d.open_id || '';
+      const xp = (await storage.get('xpost')) || {};
+      xp[platform] = { enc: await xpEncrypt(env, acct), connectedAt: acct.connectedAt };
+      await storage.set('xpost', xp);
+      return page(XPOST_PLATFORMS[platform].name + ' connected — cross-posting is ready.', true);
+    } catch (e) {
+      return page('Connect failed: ' + e.message, false);
+    }
   }
 
   // ---- lounge: persistent subscribers-only room (DO-backed, WS-first) ----
@@ -2000,6 +2294,92 @@ async function handleRequest(request, storage, env, ctx) {
     return json({ subscribers: Object.entries(subs).map(([id, s]) => ({
       id, name: s.name, status: s.status, requestedAt: s.requestedAt, approvedAt: s.approvedAt || null, push: !!s.push,
     })) });
+  }
+
+  // ---- admin: cross-posting ----
+  // Host registers platform apps (master); creators connect their accounts + publish.
+  if (path === '/admin/xpost/status') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const apps = (await gstore.get('xpostapps')) || {};
+    const xp = (await storage.get('xpost')) || {};
+    const out = {};
+    for (const p of Object.keys(XPOST_PLATFORMS)) {
+      out[p] = { name: XPOST_PLATFORMS[p].name, cap: XPOST_PLATFORMS[p].cap, types: XPOST_PLATFORMS[p].types, note: XPOST_PLATFORMS[p].note || '', configured: !!apps[p], connected: !!xp[p], connectedAt: xp[p]?.connectedAt || null };
+    }
+    return json({ platforms: out, keyed: !!env.XPOST_KEY });
+  }
+  if (path === '/admin/xpost/apps' && request.method === 'POST') {
+    if (!isMaster(request)) return json({ error: 'master token required' }, 401);
+    if (!env.XPOST_KEY) return json({ error: 'set the XPOST_KEY worker secret first: npx wrangler secret put XPOST_KEY' }, 503);
+    const { platform, clientId, clientSecret } = await request.json().catch(() => ({}));
+    if (!XPOST_PLATFORMS[platform] || !clientId || !clientSecret) return json({ error: 'platform, clientId, clientSecret required' }, 400);
+    const apps = (await gstore.get('xpostapps')) || {};
+    apps[platform] = await xpEncrypt(env, { clientId: String(clientId).trim(), clientSecret: String(clientSecret).trim() });
+    await gstore.set('xpostapps', apps);
+    return json({ ok: true, note: 'redirect URI to register with ' + XPOST_PLATFORMS[platform].name + ': https://<creator-host>/xpost/callback/' + platform });
+  }
+  if (path === '/admin/xpost/connect' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const { platform } = await request.json().catch(() => ({}));
+    const o = XPOST_OAUTH[platform];
+    if (!o) return json({ error: 'unknown platform' }, 400);
+    const apps = (await gstore.get('xpostapps')) || {};
+    const app = await xpDecrypt(env, apps[platform]);
+    if (!app) return json({ error: XPOST_PLATFORMS[platform].name + ' app not configured on this node yet' }, 503);
+    const state = randomTokenHex();
+    const entry = { platform, exp: Date.now() + 600000 };
+    let challenge = '';
+    if (o.pkce) {
+      entry.verifier = randomTokenHex();
+      challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(entry.verifier))));
+    }
+    const stash = (await storage.get('xpoauth')) || {};
+    for (const k of Object.keys(stash)) if (stash[k].exp < Date.now()) delete stash[k];
+    stash[state] = entry;
+    await storage.set('xpoauth', stash);
+    const ru = 'https://' + subdomain + '/xpost/callback/' + platform;
+    return json({ url: o.auth(app, ru, state, challenge) });
+  }
+  if (path === '/admin/xpost/disconnect' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const { platform } = await request.json().catch(() => ({}));
+    const xp = (await storage.get('xpost')) || {};
+    delete xp[platform];
+    await storage.set('xpost', xp);
+    return json({ ok: true });
+  }
+  // Fan a published post out to the selected platforms. Runs inline and reports
+  // per-platform results; failures on one platform never block another.
+  if (path === '/admin/xpost/publish' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const wanted = Array.isArray(b.platforms) ? b.platforms.filter(p => XPOST_PLATFORMS[p]) : [];
+    if (!b.postId || !wanted.length) return json({ error: 'postId and platforms required' }, 400);
+    const feed = await getFeed(storage);
+    const post = feed.find(it => it.id === b.postId);
+    if (!post) return json({ error: 'unknown post' }, 404);
+    post.commercial = !!b.commercial;
+    const mediaAbsUrl = post.mediaUrl ? (post.mediaUrl.startsWith('http') ? post.mediaUrl : 'https://' + subdomain + post.mediaUrl) : '';
+    const apps = (await gstore.get('xpostapps')) || {};
+    const xp = (await storage.get('xpost')) || {};
+    const results = {};
+    for (const p of wanted) {
+      try {
+        const rules = XPOST_PLATFORMS[p];
+        if (!rules.types.includes(post.type)) throw new Error(rules.name + " doesn't take " + post.type + ' posts');
+        if (rules.types.length && post.type !== 'writing' && !mediaAbsUrl) throw new Error('post has no media');
+        const app = await xpDecrypt(env, apps[p]);
+        if (!app) throw new Error('platform not configured');
+        const acct = await xpDecrypt(env, xp[p]?.enc);
+        if (!acct) throw new Error('account not connected');
+        acct.access = await xpAccess(env, storage, p, acct, app);
+        results[p] = await XPOST_ADAPTERS[p](env, storage, acct, app, post, mediaAbsUrl);
+      } catch (e) {
+        results[p] = { ok: false, error: String(e.message || e).slice(0, 200) };
+      }
+    }
+    await storage.set('xpres:' + b.postId, { at: new Date().toISOString(), results });
+    return json({ ok: true, results });
   }
 
   // ---- admin: push a lounge message to opted-in subscribers ----
@@ -2841,6 +3221,8 @@ body.creator .card-del { display: flex; }
 /* lounge @mentions: styled token + a ping wash on messages that mention YOU */
 .mention { color: #20D5EC; font-weight: 600; }
 .lounge-ping { background: rgba(254,44,85,0.1); border-left: 2px solid #FE2C55; }
+/* long-press = 2× speed, never the OS save/download sheet */
+.card video, .card img { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
 .live-viewer-badge {
   position: absolute; top: max(env(safe-area-inset-top),12px); right: 12px;
   background: rgba(0,0,0,0.5); border-radius: 16px;
@@ -3447,6 +3829,7 @@ ${s.noscript || ''}
   <div class="profile-header">
     <button onclick="closeProfile()" style="background:none;color:#fff;font-size:22px;width:36px;height:36px;display:flex;align-items:center;justify-content:center">←</button>
     <div class="profile-header-handle" id="profileHandle"></div>
+    <button id="profileSelBtn" title="Select posts" onclick="toggleSelMode()" style="display:none;background:none;color:#fff;font-size:18px;width:36px;height:36px;align-items:center;justify-content:center">◯</button>
     <button class="profile-edit-btn" id="profileEditBtn" style="display:none" onclick="openEditProfile()">Edit</button>
     <div style="width:36px" id="profileEditSpacer"></div>
   </div>
@@ -3455,8 +3838,8 @@ ${s.noscript || ''}
   </div>
 </div>
 
-<!-- Profile actions menu (☰ on the stats row) -->
-<div class="modal" id="profileMenuModal">
+<!-- Profile actions menu (☰ on the stats row) — z130: must stack ABOVE the profile sheet (z110) -->
+<div class="modal" id="profileMenuModal" style="z-index:130">
   <div class="modal-header">
     <div class="modal-title">Menu</div>
     <button class="modal-close" onclick="closeProfileMenu()">×</button>
@@ -3627,7 +4010,24 @@ ${s.noscript || ''}
     <label id="bodyLabel">Caption</label>
     <textarea id="bodyInput" placeholder=""></textarea>
   </div>
+  <!-- cross-post fan-out: checkboxes appear for each connected platform -->
+  <div id="xpostRow" style="display:none;margin-bottom:16px">
+    <label style="font-size:13px;color:rgba(255,255,255,0.5);display:block;margin-bottom:8px">Cross-post to…</label>
+    <div id="xpostChecks" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+    <label id="xpostCommercialRow" style="display:none;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:rgba(255,255,255,0.6)">
+      <input type="checkbox" id="xpostCommercial" style="width:16px;height:16px"> Contains commercial / branded content (required disclosure on TikTok)
+    </label>
+  </div>
   <button class="submit-btn" id="publishBtn" onclick="submitPublish()">Post</button>
+</div>
+
+<!-- Connected accounts (cross-posting) -->
+<div class="modal" id="xpostModal" style="z-index:130">
+  <div class="modal-header">
+    <div class="modal-title">Cross-posting</div>
+    <button class="modal-close" onclick="closeXpost()">×</button>
+  </div>
+  <div id="xpostBody">Loading…</div>
 </div>
 
 <!-- In-feed sponsor ad: shows the current creator's pre-roll ad between posts -->
@@ -3707,13 +4107,15 @@ function hasUnseen(node) {
   return node.feed.length < (node.feedTotal || 0);    // deeper pages may be unwatched
 }
 // Where to land when arriving at a creator: stay put if the resume post is still fresh,
-// otherwise jump to their first unseen post; fully-drained keeps the resume position.
+// otherwise jump to their first unseen post. Fully drained → advance ONE past the resume
+// spot, wrapping to the start — so all-caught-up laps walk the whole catalog in order
+// instead of parking on the same last posts forever (the "repeating tail" bug).
 function landingIndex(t) {
   if (!t.feed || !t.feed.length) return t.postIndex || 0;
   const cur = t.feed[t.postIndex];
   if (cur && cur.id && !seenSet.has(cur.id)) return t.postIndex;
   const fu = t.feed.findIndex(it => it && it.id && !seenSet.has(it.id));
-  return fu >= 0 ? fu : (t.postIndex || 0);
+  return fu >= 0 ? fu : ((t.postIndex || 0) + 1) % t.feed.length;
 }
 
 // ── AVATAR ────────────────────────────────────────────────────
@@ -5603,6 +6005,9 @@ stage.addEventListener('touchmove', e => {
 }, { passive: true });
 stage.addEventListener('touchend', _end2x, { passive: true });
 stage.addEventListener('touchcancel', _end2x, { passive: true });
+// Android Chrome long-press fires a contextmenu ("Download video / Open in Chrome…")
+// which steals the hold before 2× can engage — swallow it inside the feed.
+stage.addEventListener('contextmenu', e => { e.preventDefault(); });
 
 function showHeartBurst(x, y) {
   const el = document.getElementById('heartBurst');
@@ -5630,7 +6035,7 @@ async function onShare() {
 let createTaps = 0, createTapTimer;
 
 function onCreateTap() {
-  if (isCreator) { document.getElementById('publishModal').classList.add('show'); return; }
+  if (isCreator) { document.getElementById('publishModal').classList.add('show'); refreshXpostChecks(); return; }
   createTaps++;
   clearTimeout(createTapTimer);
   createTapTimer = setTimeout(() => createTaps = 0, 3000);
@@ -5735,9 +6140,12 @@ function renderProfileBody(data, subdomain) {
   else if (isOwn && data.adsEnabled) items.push(['💰 Your earnings', 'openEarnings()']);
   if (isOwn && isHost) items.push(['👥 Manage creators', 'openCreators()']);
   if (isOwn && isCreator) items.push(['📥 Import from TikTok', 'openImport()']);
+  if (isOwn && isCreator) items.push(['🔗 Cross-posting', 'openXpost()']);
   if (subdomain === SELF_SUBDOMAIN) items.push(['🎛 My algorithm', 'openAlgo()']);
-  if (isOwn && isCreator && (data.postCount || 0) > 0) items.push(['☑️ Select posts', 'toggleSelMode()']);
   if (!isOwn) items.push([(blocked ? '🚫 Unblock' : '🚫 Block'), \`toggleBlock('\${esc(subdomain)}')\`]);
+  // select-posts is NOT a menu item — it's the ◯ toggle in the profile header
+  const selBtnEl = document.getElementById('profileSelBtn');
+  if (selBtnEl) { selBtnEl.style.display = (isOwn && isCreator && (data.postCount || 0) > 0) ? 'flex' : 'none'; selBtnEl.textContent = '◯'; }
   _profileMenuHtml = items.map(it =>
     \`<button class="profile-connect-btn" style="display:block;width:100%;background:rgba(255,255,255,0.08);text-align:left;margin:0 0 8px" onclick="closeProfileMenu();\${it[1]}">\${it[0]}</button>\`
   ).join('') + \`<a href="\${pbase}/legal" target="_blank" onclick="closeProfileMenu()" style="display:block;text-align:center;margin-top:8px;font-size:12px;color:rgba(255,255,255,0.4);text-decoration:underline">Policies &amp; reporting</a>\`;
@@ -5795,6 +6203,8 @@ function toggleSelMode() {
   _selIds.clear();
   document.getElementById('selBar').style.display = _selMode ? 'flex' : 'none';
   document.querySelectorAll('.profile-grid-item.sel').forEach(el => el.classList.remove('sel'));
+  const sb = document.getElementById('profileSelBtn');
+  if (sb) sb.textContent = _selMode ? '⬤' : '◯'; // filled while selecting
   updateSelBar();
 }
 function exitSelMode() { if (_selMode) toggleSelMode(); }
@@ -6437,6 +6847,8 @@ function renderSearchResults(q) {
     </div>\`;
     return;
   }
+  // avatars only exist on nodes whose feed has loaded — hydrate the rest in the background
+  hydrateSearchAvatars(matches, q);
   box.innerHTML = matches.map((n, i) => {
     const grad   = avatarGrad(n.subdomain);
     const letter = ((n.displayName || n.subdomain)[0] || '?').toUpperCase();
@@ -6451,6 +6863,25 @@ function renderSearchResults(q) {
       </div>
     </div>\`;
   }).join('');
+}
+
+// Fetch profile basics (avatar + display name) for search results whose nodes haven't
+// lazily loaded yet. One profile.json per node, once per session; re-renders if the
+// search box still shows the same query.
+async function hydrateSearchAvatars(matches, q) {
+  const want = matches.filter(n => !n.avatarUrl && !n._pTried).slice(0, 20);
+  if (!want.length) return;
+  await Promise.allSettled(want.map(async n => {
+    n._pTried = true;
+    const base = n.subdomain === SELF_SUBDOMAIN ? '' : 'https://' + n.subdomain;
+    const p = await fetch(base + '/profile.json').then(r => r.ok ? r.json() : null);
+    if (!p) return;
+    if (p.avatarUrl) n.avatarUrl = p.avatarUrl.startsWith('http') ? p.avatarUrl : (n.url || base) + p.avatarUrl;
+    if (p.displayName && !n.displayName) n.displayName = p.displayName;
+  }));
+  const input = document.getElementById('searchInput');
+  const cur = input ? input.value.trim().toLowerCase() : '';
+  if (cur === q && document.getElementById('searchModal').classList.contains('show')) renderSearchResults(q);
 }
 
 function goToNode(subdomain) {
@@ -6616,7 +7047,7 @@ function closePublish() {
 document.querySelectorAll('#typePicker button').forEach(b => {
   b.addEventListener('click', () => {
     document.querySelectorAll('#typePicker button').forEach(x => x.classList.remove('active'));
-    b.classList.add('active'); selectedType = b.dataset.type; updateModalForType();
+    b.classList.add('active'); selectedType = b.dataset.type; updateModalForType(); refreshXpostChecks();
   });
 });
 
@@ -6708,14 +7139,117 @@ async function submitPublish() {
       body: JSON.stringify({ type:selectedType, title, body, mediaUrl:uploadedMediaUrl||null, mediaContentType:uploadedMediaContentType||null }),
     });
     if (res.ok) {
+      const pub = await res.json().catch(() => ({}));
       closePublish();
       nodeGraph[0].loaded = false; nodeGraph[0].feed = null;
       await loadNode(nodeGraph[0]);
       if (nodeIndex === 0) renderCurrent();
       updateIndicators(); toast('posted');
+      // fan out to checked platforms AFTER the local post succeeds
+      const picked = [...document.querySelectorAll('#xpostChecks input:checked')].map(c => c.value);
+      if (picked.length && pub.published?.id) {
+        toast('cross-posting to ' + picked.length + ' platform' + (picked.length === 1 ? '' : 's') + '…');
+        try {
+          const xr = await fetch('/admin/xpost/publish', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+            body: JSON.stringify({ postId: pub.published.id, platforms: picked, commercial: document.getElementById('xpostCommercial').checked }),
+          }).then(r => r.json());
+          const rs = xr.results || {};
+          const okList = Object.keys(rs).filter(p => rs[p].ok);
+          const bad = Object.keys(rs).filter(p => !rs[p].ok);
+          if (bad.length) toast('✓ ' + okList.length + ' posted, ✗ ' + bad.map(p => p + ': ' + rs[p].error).join('; ').slice(0, 140));
+          else toast('✓ cross-posted to ' + okList.join(', '));
+        } catch(e2) { toast('cross-post failed: ' + (e2.message || 'error')); }
+      }
     } else { toast('post failed'); }
   } catch(e) { toast(e.message||'error'); }
   btn.disabled = false;
+}
+
+// ── CROSS-POSTING UI ──────────────────────────────────────────
+let _xpostStatus = null;
+async function xpostStatus(force) {
+  if (_xpostStatus && !force) return _xpostStatus;
+  _xpostStatus = await fetch('/admin/xpost/status', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json()).catch(() => null);
+  return _xpostStatus;
+}
+// Publish modal: one checkbox per CONNECTED platform that accepts the current post type.
+async function refreshXpostChecks() {
+  const row = document.getElementById('xpostRow');
+  const box = document.getElementById('xpostChecks');
+  if (!row || !isCreator) return;
+  const st = await xpostStatus();
+  const ps = st && st.platforms ? Object.keys(st.platforms).filter(p => st.platforms[p].connected) : [];
+  if (!ps.length) { row.style.display = 'none'; return; }
+  row.style.display = 'block';
+  box.innerHTML = ps.map(p => {
+    const ok = st.platforms[p].types.includes(selectedType);
+    return '<label style="display:flex;align-items:center;gap:6px;font-size:13px;padding:6px 12px;border-radius:16px;background:rgba(255,255,255,0.08);opacity:' + (ok ? '1' : '0.35') + '">'
+      + '<input type="checkbox" value="' + p + '" ' + (ok ? '' : 'disabled') + ' onchange="onXpostCheck()" style="width:15px;height:15px">' + esc(st.platforms[p].name)
+      + '</label>';
+  }).join('');
+  onXpostCheck();
+}
+function onXpostCheck() {
+  const tk = document.querySelector('#xpostChecks input[value="tiktok"]');
+  document.getElementById('xpostCommercialRow').style.display = (tk && tk.checked) ? 'flex' : 'none';
+}
+async function openXpost() {
+  document.getElementById('xpostModal').classList.add('show');
+  document.getElementById('xpostBody').textContent = 'Loading…';
+  const st = await xpostStatus(true);
+  renderXpost(st);
+}
+function closeXpost() { document.getElementById('xpostModal').classList.remove('show'); }
+function renderXpost(st) {
+  const el = document.getElementById('xpostBody');
+  if (!st) { el.textContent = 'Could not load status'; return; }
+  let h = '';
+  if (!st.keyed) h += '<div style="background:rgba(254,44,85,0.12);border-radius:10px;padding:12px;font-size:13px;margin-bottom:14px">Host setup needed: run <code>npx wrangler secret put XPOST_KEY</code> (any long random string) so platform tokens can be stored encrypted.</div>';
+  h += '<p style="font-size:13px;color:rgba(255,255,255,0.5);line-height:1.5;margin-bottom:14px">Post once, publish everywhere. Connect your accounts — each platform needs the node host to register a developer app first.</p>';
+  for (const p of Object.keys(st.platforms)) {
+    const x = st.platforms[p];
+    const stat = x.connected ? '<span style="color:#20D5EC">connected</span>' : (x.configured ? '<span style="color:rgba(255,255,255,0.5)">not connected</span>' : '<span style="color:rgba(255,255,255,0.3)">app not set up on this node</span>');
+    const btn = x.connected
+      ? '<button onclick="disconnectXpost(' + "'" + p + "'" + ')" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:6px 12px;font-size:13px">Disconnect</button>'
+      : (x.configured ? '<button onclick="connectXpost(' + "'" + p + "'" + ')" style="background:#FE2C55;border:none;color:#fff;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600">Connect</button>' : '');
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08)">'
+      + '<div><div style="font-weight:600">' + esc(x.name) + '</div><div style="font-size:12px;color:rgba(255,255,255,0.4)">' + stat + (x.note ? ' · ' + esc(x.note) : '') + '</div></div>' + btn + '</div>';
+  }
+  if (isHost) {
+    h += '<div style="margin-top:18px"><div style="font-size:13px;color:rgba(255,255,255,0.5);margin-bottom:8px">Host: register a platform app (client id + secret). Redirect URI for each platform: <code>https://&lt;creator-host&gt;/xpost/callback/&lt;platform&gt;</code></div>'
+      + '<select id="xpAppPlat" class="field-input" style="margin-bottom:8px">' + Object.keys(st.platforms).map(p => '<option value="' + p + '">' + esc(st.platforms[p].name) + '</option>').join('') + '</select>'
+      + '<input id="xpAppId" class="field-input" placeholder="Client ID / key" style="margin-bottom:8px">'
+      + '<input id="xpAppSecret" class="field-input" placeholder="Client secret" style="margin-bottom:8px">'
+      + '<button class="submit-btn" onclick="saveXpostApp()">Save platform app</button></div>';
+  }
+  el.innerHTML = h;
+}
+async function connectXpost(p) {
+  try {
+    const d = await fetch('/admin/xpost/connect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ platform: p }),
+    }).then(r => r.json());
+    if (d.error) { toast(d.error); return; }
+    window.open(d.url, '_blank', 'noopener'); // platform login in a new tab; callback lands server-side
+    toast('Finish the login in the new tab, then reopen this panel');
+  } catch(e) { toast('connect failed'); }
+}
+async function disconnectXpost(p) {
+  await fetch('/admin/xpost/disconnect', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: JSON.stringify({ platform: p }),
+  }).catch(() => {});
+  openXpost();
+}
+async function saveXpostApp() {
+  const d = await fetch('/admin/xpost/apps', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: JSON.stringify({ platform: document.getElementById('xpAppPlat').value, clientId: document.getElementById('xpAppId').value, clientSecret: document.getElementById('xpAppSecret').value }),
+  }).then(r => r.json()).catch(() => ({ error: 'failed' }));
+  toast(d.error || 'Saved — creators can now connect ' + document.getElementById('xpAppPlat').value);
+  if (!d.error) openXpost();
 }
 
 // ── DELETE ────────────────────────────────────────────────────
@@ -7021,6 +7555,7 @@ function closeTopOverlay() {
   if (vis('importModal')) { closeImport(); return true; }
   if (vis('reportModal')) { closeReport(); return true; }
   if (vis('profileMenuModal')) { closeProfileMenu(); return true; }
+  if (vis('xpostModal')) { closeXpost(); return true; }
   if (vis('overlayModal')) { closeOverlaySheet(); return true; }
   if (vis('algoModal')) { closeAlgo(); return true; }
   if (vis('nameModal')) { closeNameModal(); return true; }

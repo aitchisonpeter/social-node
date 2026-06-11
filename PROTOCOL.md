@@ -215,6 +215,8 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 
 **Network (root operator)** — `GET /admin/registry.json`; `POST /admin/registry/approve|deny|remove`; `GET /admin/inbox.json`; `POST /admin/request-join` (any member-to-be).
 
+**Cross-posting (added 0.10.0)** — "post once, publish everywhere." The host registers one developer app per platform (`POST /admin/xpost/apps` `{platform, clientId, clientSecret}`, *master*; stored AES-GCM-encrypted under the `XPOST_KEY` worker secret — required). Creators then connect their own accounts: `GET /admin/xpost/status`; `POST /admin/xpost/connect` `{platform}` → `{url}` (OAuth authorize URL; X uses PKCE); the platform redirects to the public `GET /xpost/callback/<platform>` which exchanges the code and stores the tokens encrypted per-tenant; `POST /admin/xpost/disconnect` `{platform}`. Fan-out: `POST /admin/xpost/publish` `{postId, platforms:[...], commercial?}` → `{results: {<platform>: {ok, id?|error}}}` — per-platform adapters enforce caps/media rules (TikTok 2200 video-only via PULL_FROM_URL + commercial disclosure toggles; Instagram 2200 image/Reels via Graph containers; YouTube 5000 resumable upload, vertical <60s auto-Shorts; X 280 + image; LinkedIn 3000 UGC; Facebook Page posts). Platforms: `tiktok instagram youtube x linkedin facebook`. Captions are truncated to the platform cap with an ellipsis; one platform's failure never blocks another.
+
 ---
 
 ## Legacy / do not build on
