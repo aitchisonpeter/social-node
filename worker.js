@@ -7979,7 +7979,14 @@ function prepareIncoming(dx, dy) {
       let target = -1;
       for (let k = 1; k < nodeGraph.length; k++) {
         const cand = (nodeIndex + k) % nodeGraph.length;
-        if (hasUnseen(nodeGraph[cand])) { target = cand; break; }
+        const c = nodeGraph[cand];
+        // a creator who is LIVE right now is offered like unseen content — but at most
+        // once per 10 min, so the live door doesn't ride every lap of a long binge
+        const liveOffer = c.liveStatus?.active && Date.now() - (c._liveOfferedAt || 0) > 600000;
+        if (hasUnseen(c) || liveOffer) {
+          if (liveOffer && !hasUnseen(c)) c._liveOfferedAt = Date.now();
+          target = cand; break;
+        }
       }
       if (target === -1) {
         // nothing new anywhere — fall back to the next creator with SOMETHING to show
