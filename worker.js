@@ -3682,6 +3682,12 @@ ${s.noscript || ''}
 
   <!-- Viewer status -->
   <div id="liveViewStatus" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:rgba(255,255,255,0.7);font-size:14px;z-index:10">Connecting…</div>
+  <!-- explicit stream-state card: a frozen frame must never be mistaken for lag -->
+  <div id="liveStateCard" style="display:none;position:absolute;inset:0;z-index:11;background:rgba(0,0,0,0.72);backdrop-filter:blur(6px);flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center">
+    <div id="liveStateIcon" style="font-size:44px"></div>
+    <div id="liveStateLabel" style="font-size:17px;font-weight:600"></div>
+    <div id="liveStateSub" style="font-size:13px;color:rgba(255,255,255,0.55)"></div>
+  </div>
   <!-- Tap to unmute (shown if autoplay blocks audio) -->
   <div id="liveUnmuteBtn" onclick="const v=document.getElementById('liveViewVideo');v.muted=false;v.play().catch(()=>{});this.style.display='none'" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);border-radius:24px;padding:12px 24px;color:#fff;font-size:15px;font-weight:600;z-index:11;align-items:center;gap:8px;cursor:pointer">🔊 Tap to unmute</div>
 
@@ -4461,7 +4467,7 @@ function onLiveTap() {
     chatBoxId: 'liveChatBox',
     viewerCountId: 'liveViewerCount',
     canMod: isBroadcaster,
-    onEnded: () => { if (!isBroadcaster) { setLiveStatus('Stream ended'); } },
+    onEnded: () => { if (!isBroadcaster) { _liveEnded = true; setLiveState('ended'); } },
     // overlay images are origin-relative on the STREAMING node — prefix for remote viewers
     onOverlay: ov => renderLiveOverlay(ov, node.subdomain === SELF_SUBDOMAIN ? '' : 'https://' + node.subdomain),
   });
@@ -4658,6 +4664,7 @@ function closeLiveModal() {
   }
   document.getElementById('liveModal').style.display = 'none';
   document.getElementById('liveUnmuteBtn').style.display = 'none';
+  setLiveState(null); _liveEnded = false; // clean slate for the next watch
   // tear down pre-roll if a viewer bailed mid-ad
   prerollActive = false;
   const _ov = document.getElementById('prerollOverlay');
@@ -4943,14 +4950,71 @@ class LiveViewer {
   }
 }
 
+// ── VIEWER STREAM STATES ──────────────────────────────────────
+// TikTok-style explicit states: a frozen frame is either "paused" (broadcaster
+// backgrounded the app — video track muted / playback stalled) or "ended", never
+// ambiguous. 'ended' sticks until the next stream starts.
+let _liveStateTimer = null, _liveEnded = false;
+function setLiveState(state) {
+  const card = document.getElementById('liveStateCard');
+  if (!card) return;
+  if (_liveStateTimer) { clearTimeout(_liveStateTimer); _liveStateTimer = null; }
+  if (!state) { card.style.display = 'none'; return; }
+  const icon = document.getElementById('liveStateIcon');
+  const label = document.getElementById('liveStateLabel');
+  const sub = document.getElementById('liveStateSub');
+  if (state === 'ended') {
+    icon.textContent = '👋'; label.textContent = 'Stream has ended';
+    sub.textContent = 'Thanks for watching';
+  } else {
+    icon.textContent = '⏸'; label.textContent = 'Stream paused';
+    sub.textContent = 'The broadcaster stepped away — hang tight';
+  }
+  card.style.display = 'flex';
+}
+function wireLiveStateDetection(videoEl) {
+  if (videoEl._stateWired) return;
+  videoEl._stateWired = true;
+  // stall path: 'waiting'/'stalled' fire on hiccups too — only call it paused if it
+  // persists ~2s; any rendered frame clears it
+  const maybePaused = () => {
+    if (_liveEnded || _liveStateTimer) return;
+    _liveStateTimer = setTimeout(() => {
+      _liveStateTimer = null;
+      if (!_liveEnded && document.getElementById('liveModal').style.display === 'flex') setLiveState('paused');
+    }, 2000);
+  };
+  const playing = () => { if (!_liveEnded) setLiveState(null); };
+  videoEl.addEventListener('waiting', maybePaused);
+  videoEl.addEventListener('stalled', maybePaused);
+  videoEl.addEventListener('playing', playing);
+  videoEl.addEventListener('timeupdate', playing);
+  // track path: the sender stopping frames (app backgrounded) mutes the receiver track
+  const wireTracks = () => {
+    const ms = videoEl.srcObject;
+    if (!ms || !ms.getVideoTracks) return;
+    for (const t of ms.getVideoTracks()) {
+      if (t._stateWired) continue;
+      t._stateWired = true;
+      t.addEventListener('mute', maybePaused);
+      t.addEventListener('unmute', playing);
+    }
+  };
+  videoEl.addEventListener('loadedmetadata', wireTracks);
+  wireTracks();
+}
+
 async function startLiveViewer(subdomain) {
   const videoEl  = document.getElementById('liveViewVideo');
   const statusEl = document.getElementById('liveViewStatus');
   if (liveViewer) { liveViewer.cleanup(); liveViewer = null; }
+  _liveEnded = false;
+  setLiveState(null);
   liveViewer = new LiveViewer(subdomain);
   try {
     await liveViewer.start(videoEl, statusEl);
     if (statusEl) statusEl.style.display = 'none';
+    wireLiveStateDetection(videoEl);
   } catch(e) {
     if (statusEl) statusEl.textContent = 'Error: ' + e.message;
   }
