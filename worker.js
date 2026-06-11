@@ -7982,8 +7982,17 @@ function prepareIncoming(dx, dy) {
         if (hasUnseen(nodeGraph[cand])) { target = cand; break; }
       }
       if (target === -1) {
-        // nothing new anywhere — fall back to plain next/wrap so the feed never dead-ends
-        target = (nodeIndex + 1) % nodeGraph.length;
+        // nothing new anywhere — fall back to the next creator with SOMETHING to show
+        // (posts, or live right now). An empty presence-card doesn't earn a slot in
+        // every all-caught-up lap; that creator stays reachable via search/profile
+        // and re-enters the scroll when they post or go live. k can reach length so
+        // a lone creator-with-content wraps back to itself (landingIndex advances +1).
+        for (let k = 1; k <= nodeGraph.length; k++) {
+          const cand = (nodeIndex + k) % nodeGraph.length;
+          const c = nodeGraph[cand];
+          if (!c.loaded || (c.feed && c.feed.length) || c.liveStatus?.active) { target = cand; break; }
+        }
+        if (target === -1) target = (nodeIndex + 1) % nodeGraph.length; // everyone's empty — never dead-end
         if (!_caughtUpToasted) { _caughtUpToasted = true; toast("You're all caught up — nothing new right now"); }
       }
       dir = 'up'; nextNI = target; nextPI = landingIndex(nodeGraph[target]);
