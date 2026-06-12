@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.14.0';
+const PROTOCOL_VERSION = '0.15.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -52,6 +52,16 @@ const PREROLL_GRACE_MS = 8 * 60 * 1000; // don't re-show the pre-roll to the sam
 const IMPORT_DRIP_MS = 10000;      // background import: one video per alarm tick — spaces out feed KV writes
 
 export class LiveRoom extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    // Hibernation-friendly liveness: refreshed clients ping every 25s; the runtime
+    // answers without waking the DO and stamps the socket. viewerCount() reads the
+    // stamp to drop phones that died without a close event (the "count is slow to
+    // drop / too high" field bug). Old cached clients never ping — their stamp stays
+    // null and they keep the legacy always-counted behavior.
+    try { this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}')); } catch {}
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     const seg = url.pathname.split('/').pop();
@@ -139,6 +149,8 @@ export class LiveRoom extends DurableObject {
         lastViewers: this.viewerCount(),
       });
       await this.ctx.storage.put('chat', []); // fresh chat per stream
+      await this.ctx.storage.delete('bcPaused'); // pause flag is stream-scoped too
+      await this.clearGuest(); // guest slot is stream-scoped like chat
       // overlay deliberately NOT cleared here — broadcasters stage it before going live;
       // it clears on stream END (stream-scoped on the way out, not the way in)
       this.broadcast({ t: 'live', status: await this.statusObj() });
@@ -165,6 +177,9 @@ export class LiveRoom extends DurableObject {
         s.heartbeatAt = Date.now();
         this.sampleInto(s);
         await this.ctx.storage.put('session', s);
+        // close events from dead phones can lag minutes — the 15s broadcaster heartbeat
+        // doubles as a count sweep so the badge drops without waiting for TCP timeouts
+        if (this.viewerCount() !== this._lastViewers) this.broadcastViewers();
       }
       return Response.json({ ok: true });
     }
@@ -178,7 +193,74 @@ export class LiveRoom extends DurableObject {
         if (wasActive) await this.finalizeSession(s, Date.now());
       }
       await this.ctx.storage.delete('overlay');
+      await this.ctx.storage.delete('bcPaused');
+      await this.clearGuest();
       this.broadcast({ t: 'ended' });
+      return Response.json({ ok: true });
+    }
+
+    // ---- guest co-host: one subscriber on screen with the broadcaster ----
+    // Trust chain: the WORKER verifies the subscriber token before /guest-request and
+    // creator auth before approve/decline/remove (the DO trusts its caller, as usual).
+    // Approval mints a random grant token delivered over the guest's OWN socket — that
+    // grant is the capability the public /live/guest/* publish endpoints check.
+    // Guest state is stream-scoped like chat: cleared on publish and on end.
+    if (seg === 'guest-request' && request.method === 'POST') {
+      const { vid, name } = await request.json().catch(() => ({}));
+      const status = await this.statusObj();
+      if (!status.active) return Response.json({ error: 'not live' }, { status: 409 });
+      if (await this.ctx.storage.get('guest')) return Response.json({ error: 'guest slot taken' }, { status: 409 });
+      const sid = await this.sidOf(vid || '');
+      if (!sid) return Response.json({ error: 'vid required' }, { status: 400 });
+      // requests are relay-only (not stored): the broadcaster's client queues them, and a
+      // guest whose request got lost to a reconnect just taps again
+      this.sendTo(a => a.role === 'broadcaster', { t: 'guest-req', sid, name: String(name || 'viewer').slice(0, 30) });
+      return Response.json({ ok: true });
+    }
+    if (seg === 'guest-approve' && request.method === 'POST') {
+      const { sid, name } = await request.json().catch(() => ({}));
+      if (!sid) return Response.json({ error: 'sid required' }, { status: 400 });
+      const grant = crypto.randomUUID() + crypto.randomUUID().slice(0, 13);
+      await this.ctx.storage.put('guestGrant', { sid, name: String(name || 'viewer').slice(0, 30), grant, at: Date.now() });
+      const delivered = this.sendTo(a => a.sid === sid, { t: 'guest-ok', grant });
+      return Response.json({ ok: true, delivered });
+    }
+    if (seg === 'guest-decline' && request.method === 'POST') {
+      const { sid } = await request.json().catch(() => ({}));
+      if (sid) this.sendTo(a => a.sid === sid, { t: 'guest-no' });
+      return Response.json({ ok: true });
+    }
+    if (seg === 'guest-check' && request.method === 'POST') {
+      const { grant } = await request.json().catch(() => ({}));
+      const g = await this.ctx.storage.get('guestGrant');
+      return Response.json({ ok: !!(g && grant && g.grant === grant) });
+    }
+    if (seg === 'guest-publish' && request.method === 'POST') {
+      const { grant, sessionId, trackNames } = await request.json().catch(() => ({}));
+      const g = await this.ctx.storage.get('guestGrant');
+      if (!g || !grant || g.grant !== grant) return Response.json({ error: 'no grant' }, { status: 403 });
+      if (!sessionId) return Response.json({ error: 'sessionId required' }, { status: 400 });
+      const guest = {
+        sid: g.sid, name: g.name, sessionId,
+        trackNames: Array.isArray(trackNames) ? trackNames.slice(0, 4).map(String) : [],
+        at: Date.now(),
+      };
+      await this.ctx.storage.put('guest', guest);
+      this.broadcast({ t: 'guest', guest });
+      return Response.json({ ok: true });
+    }
+    if (seg === 'guest-end' && request.method === 'POST') {
+      // grant doubles as leave authorization — also lets a guest release an unused slot
+      const { grant } = await request.json().catch(() => ({}));
+      const g = await this.ctx.storage.get('guestGrant');
+      if (!g || !grant || g.grant !== grant) return Response.json({ error: 'no grant' }, { status: 403 });
+      await this.clearGuest();
+      return Response.json({ ok: true });
+    }
+    if (seg === 'guest-remove' && request.method === 'POST') {
+      const g = await this.ctx.storage.get('guestGrant');
+      if (g) this.sendTo(a => a.sid === g.sid, { t: 'guest-kick' });
+      await this.clearGuest();
       return Response.json({ ok: true });
     }
 
@@ -526,10 +608,14 @@ export class LiveRoom extends DurableObject {
     // WHIP (OBS/Larix) has no heartbeat — it ends via explicit DELETE.
     const stale = s.via !== 'whip' && s.heartbeatAt && (Date.now() - s.heartbeatAt > LIVE_STALE_MS);
     if (stale) {
-      // a dead broadcaster never calls /end — close out the session log here
+      // a dead broadcaster never calls /end — close out the session log here, and tell
+      // the room (viewers parked on the "paused" card otherwise wait forever)
       s.active = false; s.endedAt = new Date(s.heartbeatAt).toISOString();
       await this.ctx.storage.put('session', s);
       await this.finalizeSession(s, s.heartbeatAt);
+      await this.ctx.storage.delete('bcPaused');
+      await this.clearGuest();
+      this.broadcast({ t: 'ended' });
       return { active: false, viewers: this.viewerCount() };
     }
     return {
@@ -539,6 +625,10 @@ export class LiveRoom extends DurableObject {
       startedAt: s.startedAt,
       via: s.via,
       viewers: this.viewerCount(),
+      // active guest co-host, if any — late joiners pull these tracks alongside the main ones
+      guest: (await this.ctx.storage.get('guest')) || null,
+      // broadcaster currently backgrounded — late joiners show the paused card right away
+      paused: !!(await this.ctx.storage.get('bcPaused')),
     };
   }
 
@@ -584,9 +674,33 @@ export class LiveRoom extends DurableObject {
   }
 
   viewerCount() {
-    let n = 0;
+    // Field bugs 2026-06-11: count was slow to drop and sometimes included the host.
+    // Three fixes: (1) sockets whose pings stopped >70s ago are dead phones — close and
+    // skip them; (2) a viewer socket sharing the broadcaster's sid is the host's own
+    // preview/second tab, not audience; (3) the same sid twice (reconnect race, two
+    // tabs) counts once.
+    const now = Date.now();
+    const bSids = new Set();
+    const viewers = [];
     for (const ws of this.ctx.getWebSockets()) {
-      try { if (ws.deserializeAttachment()?.role === 'viewer') n++; } catch {}
+      let a = {};
+      try { a = ws.deserializeAttachment() || {}; } catch { continue; }
+      if ((a.room || 'live') !== 'live') continue;
+      let last = null;
+      try { last = this.ctx.getWebSocketAutoResponseTimestamp(ws); } catch {}
+      if (last && now - last.getTime() > 70000) { try { ws.close(1011, 'stale'); } catch {} continue; }
+      if (a.role === 'broadcaster') { if (a.sid) bSids.add(a.sid); continue; }
+      if (a.role === 'viewer') viewers.push(a);
+    }
+    let n = 0;
+    const seen = new Set();
+    for (const a of viewers) {
+      if (a.sid) {
+        if (bSids.has(a.sid)) continue;
+        if (seen.has(a.sid)) continue;
+        seen.add(a.sid);
+      }
+      n++;
     }
     return n;
   }
@@ -660,7 +774,30 @@ export class LiveRoom extends DurableObject {
   }
 
   broadcastViewers() {
-    this.broadcast({ t: 'viewers', viewers: this.viewerCount() });
+    const n = this.viewerCount();
+    this._lastViewers = n; // heartbeat compares against this to surface silent drops
+    this.broadcast({ t: 'viewers', viewers: n });
+  }
+
+  // targeted send to live-room sockets whose attachment matches; returns how many got it
+  sendTo(match, obj) {
+    const data = JSON.stringify(obj);
+    let n = 0;
+    for (const ws of this.ctx.getWebSockets()) {
+      let a = {};
+      try { a = ws.deserializeAttachment() || {}; } catch {}
+      if ((a.room || 'live') !== 'live' || !match(a)) continue;
+      try { ws.send(data); n++; } catch {}
+    }
+    return n;
+  }
+
+  // drop the guest slot + tell every screen to clear the tile (no-op when already clear)
+  async clearGuest() {
+    const had = await this.ctx.storage.get('guest');
+    await this.ctx.storage.delete('guest');
+    await this.ctx.storage.delete('guestGrant');
+    if (had) this.broadcast({ t: 'guest', guest: null });
   }
 
   async webSocketMessage(ws, message) {
@@ -671,6 +808,17 @@ export class LiveRoom extends DurableObject {
     if (data.t === 'name') {
       const nm = String(data.name || '').slice(0, 30);
       if (nm) { const att = ws.deserializeAttachment() || {}; att.name = nm; ws.serializeAttachment(att); }
+      return;
+    }
+    // broadcaster backgrounded/returned — the video track keeps serving its last frame,
+    // so viewers can't detect the pause themselves (field-tested); the page tells us
+    if (data.t === 'bc-state') {
+      let att = {};
+      try { att = ws.deserializeAttachment() || {}; } catch {}
+      if (att.role !== 'broadcaster') return;
+      const paused = !!data.paused;
+      await this.ctx.storage.put('bcPaused', paused);
+      this.broadcast({ t: 'bc-state', paused });
       return;
     }
     if (data.t === 'chat') {
@@ -696,14 +844,28 @@ export class LiveRoom extends DurableObject {
 
   async webSocketClose(ws, code, reason) {
     try { ws.close(code, reason); } catch {}
-    let room = 'live';
-    try { room = (ws.deserializeAttachment() || {}).room || 'live'; } catch {}
-    if (room === 'lounge') {
+    let att = {};
+    try { att = ws.deserializeAttachment() || {}; } catch {}
+    if ((att.room || 'live') === 'lounge') {
       this.broadcast({ t: 'members', members: this.loungeCount() }, 'lounge');
       return;
     }
     await this.sampleViewers();
     this.broadcastViewers();
+    // active guest's last socket gone → free the slot after a grace window
+    // (LiveSocket reconnects on a 2s backoff, so a blip shouldn't end their spot)
+    const guest = await this.ctx.storage.get('guest');
+    if (guest && att.sid && att.sid === guest.sid) {
+      clearTimeout(this._guestDropT);
+      this._guestDropT = setTimeout(async () => {
+        const g = await this.ctx.storage.get('guest');
+        if (!g) return;
+        const still = this.ctx.getWebSockets().some(s => {
+          try { const a = s.deserializeAttachment() || {}; return (a.room || 'live') === 'live' && a.sid === g.sid; } catch { return false; }
+        });
+        if (!still) await this.clearGuest();
+      }, 12000);
+    }
   }
 
   async webSocketError() {
@@ -1800,7 +1962,7 @@ async function handleRequest(request, storage, env, ctx) {
   if (path === '/sub/status' && request.method === 'POST') {
     const b = await request.json().catch(() => ({}));
     const s = await verifySubToken(b.token || '');
-    return jsonCors(s ? { status: s.status, name: s.name, push: !!s.push } : { status: 'none' });
+    return jsonCors(s ? { status: s.status, name: s.name, push: !!s.push, ringtone: s.ringtone || null } : { status: 'none' });
   }
   // Web Push opt-in: the browser's PushSubscription is stored on the subscriber record.
   if (path === '/sub/vapid.json') {
@@ -1829,6 +1991,21 @@ async function handleRequest(request, storage, env, ctx) {
     const subs = await getSubs();
     if (subs[s.id]) { delete subs[s.id].push; delete subs[s.id].pushAt; await storage.set('subs', subs); }
     return jsonCors({ ok: true });
+  }
+  // Doorbell ring choice: a subscriber picks the Spotify track that plays on the
+  // creator's phone when THEY ring. Stored as the bare 22-char track id; the doorbell
+  // push carries it as its second =:= segment so Tasker can split and Browse to it.
+  if (path === '/sub/ringtone' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const s = await activeSub(b.token || '');
+    if (!s) return jsonCors({ error: 'subscribers only' }, 403);
+    const track = String(b.track || '').trim();
+    if (track && !/^[A-Za-z0-9]{22}$/.test(track)) return jsonCors({ error: 'bad track id' }, 400);
+    const subs = await getSubs();
+    if (!subs[s.id]) return jsonCors({ error: 'unknown subscriber' }, 404);
+    if (track) subs[s.id].ringtone = track; else delete subs[s.id].ringtone;
+    await storage.set('subs', subs);
+    return jsonCors({ ok: true, ringtone: track || null });
   }
 
   // ---- cross-posting: OAuth callback (public — the platform redirects here) ----
@@ -2248,6 +2425,42 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(await r.json().catch(() => ({})), r.status);
   }
 
+  // ---- live: doorbell — subscribers ring the creator's phone (Join/Tasker relay) ----
+  // Relays to the Join (joaoapps) push API; Tasker on the phone catches the push and
+  // plays a doorbell sound. The Join secrets are WORKER-level and ring exactly one
+  // phone, so the endpoint is pinned to DOORBELL_HOST — every other tenant on this
+  // worker 404s and their viewers never see a bell. GET = capability probe for the
+  // client; POST = ring (active subscriber token, or creator auth for testing).
+  if (path === '/live/doorbell') {
+    const enabled = subdomain === env.DOORBELL_HOST && !!env.JOIN_API_KEY && !!env.JOIN_DEVICE_ID;
+    if (request.method === 'GET') return jsonCors({ enabled });
+    if (request.method !== 'POST') return jsonCors({ error: 'method not allowed' }, 405);
+    if (!enabled) return jsonCors({ error: 'no doorbell on this node' }, 404);
+    const b = await request.json().catch(() => ({}));
+    const s = await activeSub(b.subToken || '');
+    if (!s && !(await checkAuth(request))) return jsonCors({ error: 'subscribers only' }, 403);
+    const RING_COOLDOWN_MS = 30000;
+    const now = Date.now();
+    const cd = (await storage.get('doorbell:cooldown')) || {};
+    const who = s ? s.id : '_creator';
+    if (cd[who] && now - cd[who] < RING_COOLDOWN_MS) {
+      return jsonCors({ ok: false, wait: Math.ceil((RING_COOLDOWN_MS - (now - cd[who])) / 1000) }, 429);
+    }
+    for (const k of Object.keys(cd)) if (now - cd[k] >= RING_COOLDOWN_MS) delete cd[k];
+    cd[who] = now;
+    const ju = new URL('https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush');
+    ju.searchParams.set('apikey', env.JOIN_API_KEY);
+    ju.searchParams.set('deviceId', env.JOIN_DEVICE_ID);
+    // text = doorbell=:=<trackId>=:=<who>. Segment 2 is always a valid track id (the
+    // subscriber's pick or the default) so the Tasker split can Browse it blindly.
+    const ring = (s && s.ringtone) || '2ctvdKmETyOzPb2GiJJT53'; // default: Breathe (In the Air)
+    const fromName = String(s ? (s.name || 'subscriber') : 'creator test').split('=:=').join(' ');
+    ju.searchParams.set('text', 'doorbell=:=' + ring + '=:=' + fromName);
+    // push and cooldown-write in parallel — the ring is the latency path
+    const [r] = await Promise.all([fetch(ju).catch(() => null), storage.set('doorbell:cooldown', cd)]);
+    return jsonCors({ ok: !!(r && r.ok) }, r && r.ok ? 200 : 502);
+  }
+
   // ---- live: pre-roll gate (public) ----
   // REVENUE MODEL (split 2026-06-11): the LIVE pre-roll belongs to the CREATOR being
   // watched (per-tenant 'livead' — their own sponsor, or a theme-song intro). The node-
@@ -2444,6 +2657,60 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(data);
   }
 
+  // ---- live: guest co-host (a subscriber joins on camera, 2-way) ----
+  // Request needs an ACTIVE subscriber token; publishing needs the grant the broadcaster's
+  // approval minted (delivered over the guest's own WebSocket — possession proves they were
+  // picked). All public + CORS: the guest may be watching from another node's client.
+  const guestGrantOk = async (grant) => {
+    if (!grant) return false;
+    const r = await liveDO(env, subdomain, '/guest-check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant }) });
+    return !!(await r.json().catch(() => ({}))).ok;
+  };
+  if (path === '/live/guest/request' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
+    const b = await request.json().catch(() => ({}));
+    const s = await activeSub(b.subToken || '');
+    if (!s) return jsonCors({ error: 'subscribers only' }, 403);
+    const r = await liveDO(env, subdomain, '/guest-request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vid: b.vid, name: b.name || s.name }) });
+    return jsonCors(await r.json().catch(() => ({})), r.status);
+  }
+  if (path === '/live/guest/start' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return jsonCors({ error: 'not configured' }, 503);
+    const b = await request.json().catch(() => ({}));
+    if (!(await guestGrantOk(b.grant))) return jsonCors({ error: 'no grant' }, 403);
+    try {
+      const data = await callsApi(creds, 'POST', '/sessions/new', undefined);
+      return jsonCors({ sessionId: data.sessionId });
+    } catch(e) {
+      return jsonCors({ error: e.message }, 502);
+    }
+  }
+  if (path === '/live/guest/tracks' && request.method === 'POST') {
+    if (!(await rlAllowed('live', 30, 60000))) return jsonCors({ error: 'rate limited' }, 429);
+    const creds = await getCallsCreds(env, storage);
+    if (!creds) return jsonCors({ error: 'not configured' }, 503);
+    const b = await request.json().catch(() => ({}));
+    if (!(await guestGrantOk(b.grant))) return jsonCors({ error: 'no grant' }, 403);
+    try {
+      const data = await callsApi(creds, 'POST', `/sessions/${b.sessionId}/tracks/new`, { tracks: b.tracks, sessionDescription: b.sessionDescription });
+      return jsonCors(data);
+    } catch(e) {
+      return jsonCors({ error: e.message }, 502);
+    }
+  }
+  if (path === '/live/guest/publish' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const r = await liveDO(env, subdomain, '/guest-publish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant: b.grant, sessionId: b.sessionId, trackNames: b.trackNames }) });
+    return jsonCors(await r.json().catch(() => ({})), r.status);
+  }
+  if (path === '/live/guest/end' && request.method === 'POST') {
+    const b = await request.json().catch(() => ({}));
+    const r = await liveDO(env, subdomain, '/guest-end', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant: b.grant }) });
+    return jsonCors(await r.json().catch(() => ({})), r.status);
+  }
+
   // ---- live: WHIP ingest (Larix / OBS → Cloudflare Realtime) ----
   if (path === '/live/whip' || path.startsWith('/live/whip/')) {
     const whipCreds = await getCallsCreds(env, storage);
@@ -2594,6 +2861,25 @@ async function handleRequest(request, storage, env, ctx) {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     const body = await request.text();
     const r = await liveDO(env, subdomain, '/chat-del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
+
+  // ---- live: admin — guest co-host moderation (approve / decline / remove) ----
+  if (path === '/admin/live/guest/approve' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const body = await request.text();
+    const r = await liveDO(env, subdomain, '/guest-approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
+  if (path === '/admin/live/guest/decline' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const body = await request.text();
+    const r = await liveDO(env, subdomain, '/guest-decline', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    return json(await r.json().catch(() => ({})), r.status);
+  }
+  if (path === '/admin/live/guest/remove' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const r = await liveDO(env, subdomain, '/guest-remove', { method: 'POST' });
     return json(await r.json().catch(() => ({})), r.status);
   }
 
@@ -4196,6 +4482,12 @@ ${s.noscript || ''}
       <button onclick="openStreamHistory()" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600">📊 Past streams</button>
     </div>
     <div id="liveStatusMsg" style="font-size:13px;color:rgba(255,255,255,0.7);text-align:center"></div>
+    <!-- guest join request — one at a time, queued in memory -->
+    <div id="guestReqBar" style="display:none;background:rgba(0,0,0,0.65);border-radius:12px;padding:10px 14px;align-items:center;gap:10px;max-width:90vw">
+      <div id="guestReqName" style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+      <button onclick="guestApproveTap()" style="background:#FE2C55;border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px;font-weight:600">Accept</button>
+      <button onclick="guestDeclineTap()" style="background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px">Decline</button>
+    </div>
   </div>
 
   <!-- Viewer status -->
@@ -4207,7 +4499,15 @@ ${s.noscript || ''}
     <div id="liveStateSub" style="font-size:13px;color:rgba(255,255,255,0.55)"></div>
   </div>
   <!-- Tap to unmute (shown if autoplay blocks audio) -->
-  <div id="liveUnmuteBtn" onclick="const v=document.getElementById('liveViewVideo');v.muted=false;v.play().catch(()=>{});this.style.display='none'" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);border-radius:24px;padding:12px 24px;color:#fff;font-size:15px;font-weight:600;z-index:11;align-items:center;gap:8px;cursor:pointer">🔊 Tap to unmute</div>
+  <div id="liveUnmuteBtn" onclick="const v=document.getElementById('liveViewVideo');v.muted=false;v.play().catch(()=>{});const g=document.getElementById('liveGuestVideo');if(g&&g.srcObject&&!g.dataset.local){g.muted=false;g.play().catch(()=>{});}this.style.display='none'" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);border-radius:24px;padding:12px 24px;color:#fff;font-size:15px;font-weight:600;z-index:11;align-items:center;gap:8px;cursor:pointer">🔊 Tap to unmute</div>
+
+  <!-- Guest co-host tile — a subscriber's camera in the corner, on every screen.
+       Right side, below the top bar / broadcaster panel, above where chat tops out. -->
+  <div id="liveGuestTile" style="display:none;position:absolute;top:28%;right:12px;width:32vw;max-width:190px;aspect-ratio:3/4;z-index:7;border-radius:12px;overflow:hidden;background:#111;box-shadow:0 2px 14px rgba(0,0,0,0.55)">
+    <video disableremoteplayback x-webkit-airplay="deny" id="liveGuestVideo" autoplay playsinline style="width:100%;height:100%;object-fit:cover"></video>
+    <div id="liveGuestName" style="position:absolute;left:0;right:0;bottom:0;padding:14px 6px 4px;font-size:11px;font-weight:600;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,0.65));white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+    <button id="liveGuestX" onclick="guestTileX()" style="display:none;position:absolute;top:4px;right:4px;width:26px;height:26px;border:none;border-radius:50%;background:rgba(0,0,0,0.55);color:#fff;font-size:15px;line-height:1;align-items:center;justify-content:center">×</button>
+  </div>
 
   <!-- Chat overlay — sits just above the chat input; capped height, scrollable history -->
   <div style="position:absolute;bottom:calc(max(env(safe-area-inset-bottom),12px) + 52px);left:0;width:75%;max-height:25.5vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 16px;z-index:10;display:flex;flex-direction:column;gap:5px;pointer-events:auto" id="liveChatBox"></div>
@@ -4216,6 +4516,8 @@ ${s.noscript || ''}
   <div style="position:absolute;bottom:max(env(safe-area-inset-bottom),12px);left:0;right:0;padding:0 16px;display:flex;gap:8px;z-index:10">
     <input id="liveChatInput" placeholder="Say something…" style="flex:1;background:rgba(255,255,255,0.15);border:none;border-radius:20px;padding:8px 16px;color:#fff;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')liveSendChat()">
     <button onclick="liveSendChat()" style="background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:20px;padding:8px 16px;font-size:14px">Send</button>
+    <button id="liveDoorbellBtn" onclick="ringDoorbell()" title="Ring the creator's doorbell" style="display:none;background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:20px;padding:8px 13px;font-size:15px">🔔</button>
+    <button id="liveJoinBtn" onclick="guestRequestJoin()" title="Ask to join on camera" style="display:none;background:rgba(255,255,255,0.15);border:none;color:#fff;border-radius:20px;padding:8px 13px;font-size:15px">🎥</button>
   </div>
 </div>
 
@@ -4798,10 +5100,11 @@ async function loadNode(node) {
   // The viewer may be parked on this card's spinner (swiped faster than the prefetch) —
   // without this the loading card sat there until the next manual swipe re-rendered.
   if (nodeGraph[nodeIndex] === node) renderCurrent();
-  // Fetch live status separately — never blocks feed display
+  // Fetch live status separately — never blocks feed display. Inactive responses are
+  // stored too (an active-only cache let ended streams keep a stale LIVE flag).
   fetch(node.url + '/live/status.json')
     .then(r => r.ok ? r.json() : null)
-    .then(s => { if (s?.active) { node.liveStatus = s; renderCurrent(); } })
+    .then(s => { if (s) { node.liveStatus = s; if (s.active) renderCurrent(); } })
     .catch(() => {});
 }
 
@@ -4970,6 +5273,13 @@ class LiveSocket {
     this.ws.onmessage = e => this.onMsg(e);
     this.ws.onclose = () => { if (!this.closed) setTimeout(() => this.connect(), 2000); };
     this.ws.onerror = () => {};
+    // liveness ping — answered by the DO's hibernation auto-responder (exact-string
+    // match, so this must stay literally {"t":"ping"}); lets the server drop dead
+    // phones from the viewer count instead of waiting out TCP timeouts
+    clearInterval(this._pingT);
+    this._pingT = setInterval(() => {
+      if (this.ws && this.ws.readyState === 1) { try { this.ws.send('{"t":"ping"}'); } catch(e) {} }
+    }, 25000);
   }
   rename(name) {
     if (this.ws && this.ws.readyState === 1) { try { this.ws.send(JSON.stringify({ t: 'name', name })); } catch(e) {} }
@@ -4980,6 +5290,8 @@ class LiveSocket {
       this.chat = d.chat || []; this.renderChat(); this.setViewers(d.viewers);
       if (d.status?.active) this.opts.onLive?.(d.status);
       this.opts.onOverlay?.(d.overlay || null);
+      this.opts.onGuest?.(d.status?.guest || null); // current co-host (or clears a stale tile on reconnect)
+      if (d.status?.active && d.status.paused) this.opts.onBcPause?.(true); // joined mid-pause
     } else if (d.t === 'chat') {
       this.chat.push(d.msg); if (this.chat.length > 100) this.chat.shift(); this.renderChat();
     } else if (d.t === 'chat-del') {
@@ -4990,8 +5302,21 @@ class LiveSocket {
       this.opts.onLive?.(d.status);
     } else if (d.t === 'overlay') {
       this.opts.onOverlay?.(d.overlay || null);
+    } else if (d.t === 'guest') {
+      this.opts.onGuest?.(d.guest || null);
+    } else if (d.t === 'guest-req') {
+      this.opts.onGuestReq?.(d);
+    } else if (d.t === 'guest-ok') {
+      this.opts.onGuestOk?.(d.grant);
+    } else if (d.t === 'guest-no') {
+      this.opts.onGuestNo?.();
+    } else if (d.t === 'guest-kick') {
+      this.opts.onGuestKick?.();
+    } else if (d.t === 'bc-state') {
+      this.opts.onBcPause?.(!!d.paused);
     } else if (d.t === 'ended') {
       this.opts.onOverlay?.(null);
+      this.opts.onGuest?.(null);
       this.opts.onEnded?.();
     }
   }
@@ -5019,7 +5344,7 @@ class LiveSocket {
     if (this.ws && this.ws.readyState === 1) { this.ws.send(JSON.stringify({ t: 'chat', text, name })); return true; }
     return false;
   }
-  close() { this.closed = true; if (this.ws) { try { this.ws.close(); } catch {} } }
+  close() { this.closed = true; clearInterval(this._pingT); if (this.ws) { try { this.ws.close(); } catch {} } }
 }
 
 function pauseFeedVideos() { document.querySelectorAll('.card video').forEach(v => v.pause()); }
@@ -5076,6 +5401,8 @@ function onLiveTap(targetSub) {
 
   // Realtime chat + viewer count over WebSocket (replaces polling).
   if (liveSocket) { liveSocket.close(); liveSocket = null; }
+  _guestBase = sub === SELF_SUBDOMAIN ? '' : 'https://' + sub; // guest endpoints live on the streaming node
+  _guestReqQueue = [];
   liveSocket = new LiveSocket(sub, isBroadcaster ? 'broadcaster' : 'viewer', {
     chatBoxId: 'liveChatBox',
     viewerCountId: 'liveViewerCount',
@@ -5083,16 +5410,41 @@ function onLiveTap(targetSub) {
     onEnded: () => { if (!isBroadcaster) { _liveEnded = true; setLiveState('ended'); } },
     // overlay images are origin-relative on the STREAMING node — prefix for remote viewers
     onOverlay: ov => renderLiveOverlay(ov, sub === SELF_SUBDOMAIN ? '' : 'https://' + sub),
+    onGuest: g => renderGuestTile(g),
+    onGuestReq: isBroadcaster ? (d => onGuestReq(d)) : undefined,
+    onGuestOk: grant => onGuestOk(grant),
+    onGuestNo: () => toast('The host declined this time'),
+    onGuestKick: () => toast('The host took you off screen'),
+    // server-signaled pause (broadcaster backgrounded) — beats the frozen-frame guesswork
+    onBcPause: p => { if (!isBroadcaster && !_liveEnded) setLiveState(p ? 'paused' : null); },
   });
   setOverlayEditable(isBroadcaster); // broadcaster can drag/pinch the overlay in place
+  updateGuestJoinBtn();
 }
 
 // Bottom-nav Live = WATCH: jump to whoever is live right now. Broadcasting moved
 // behind Create → LIVE, so this button has one job and no creator ambiguity.
-function onLiveNavTap() {
+// The graph's cached liveStatus goes stale (fetched once when a feed loads, then
+// 60s-polled only for the card you're parked on) — field bug 2026-06-12: the button
+// said "no one is live" mid-stream. So the tap checks every member FRESH, in parallel.
+let _liveNavBusy = false;
+async function onLiveNavTap() {
+  if (_liveNavBusy) return;
+  _liveNavBusy = true;
+  try {
+    const opt = AbortSignal.timeout ? { signal: AbortSignal.timeout(4000) } : {};
+    await Promise.all(nodeGraph.map(n =>
+      fetch((n.url || '') + '/live/status.json', opt)
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s) n.liveStatus = s; })
+        .catch(() => {})
+    ));
+  } finally { _liveNavBusy = false; }
   const live = nodeGraph.find(n => n.liveStatus?.active);
-  if (live) onLiveTap(live.subdomain);
-  else toast('No one is live right now');
+  if (live) { onLiveTap(live.subdomain); return; }
+  toast('No one is live right now');
+  // the fresh sweep may have cleared a stale LIVE badge on the card we're sitting on
+  if (!feedCovered()) renderCurrent();
 }
 
 // ── LIVE OVERLAY (broadcaster text/image over the stream) ────
@@ -5298,6 +5650,11 @@ function closeLiveModal() {
   viewVid.srcObject = null;
   renderLiveOverlay(null);
   setOverlayEditable(false);
+  // guesting and bailed out of the modal = leaving the stream
+  if (guestPublisher) guestReleaseGrant();
+  renderGuestTile(null); // also tears down guestPull / guestPublisher
+  _guestReqQueue = [];
+  renderGuestReqBar();
   if (liveBroadcaster) { liveBroadcaster.cleanup(); liveBroadcaster = null; }
   if (liveViewer) { liveViewer.cleanup(); liveViewer = null; }
   if (liveSocket) { liveSocket.close(); liveSocket = null; }
@@ -5379,6 +5736,83 @@ function startLiveChatPoll(subdomain) {
 
 function stopLiveChatPoll() {
   if (liveChatInterval) { clearInterval(liveChatInterval); liveChatInterval = null; }
+}
+
+// ── DOORBELL — subscribers ring the creator's phone ──────────
+// The bell only appears when the node answers the capability probe AND this
+// device holds an active subscriber token for it. Server enforces both anyway.
+// Tap = ring; long-press / right-click = pick the Spotify track your ring plays.
+let _doorbellCooldownUntil = 0;
+let _doorbellSuppressUntil = 0;
+let _doorbellPromptGuard = 0;
+async function updateDoorbellBtn(host) {
+  const btn = document.getElementById('liveDoorbellBtn');
+  if (!btn) return;
+  btn.style.display = 'none';
+  try {
+    const base = host === SELF_SUBDOMAIN ? '' : 'https://' + host;
+    const d = await fetch(base + '/live/doorbell').then(r => r.json());
+    if (!d.enabled) return;
+    if ((await subStatusFor(host)) !== 'active') return;
+    btn.dataset.host = host;
+    btn.style.display = 'block';
+    if (!btn.dataset.lp) { // wire the long-press once
+      btn.dataset.lp = '1';
+      let lpTimer = null;
+      btn.addEventListener('touchstart', function(){ lpTimer = setTimeout(setDoorbellSong, 600); }, { passive: true });
+      btn.addEventListener('touchend', function(){ if (lpTimer) clearTimeout(lpTimer); });
+      btn.addEventListener('touchmove', function(){ if (lpTimer) clearTimeout(lpTimer); }, { passive: true });
+      btn.addEventListener('contextmenu', function(e){ e.preventDefault(); if (lpTimer) clearTimeout(lpTimer); setDoorbellSong(); });
+    }
+  } catch(e) {}
+}
+async function setDoorbellSong() {
+  const now = Date.now();
+  if (now < _doorbellPromptGuard) return; // contextmenu + touch timer can both fire on Android
+  _doorbellPromptGuard = now + 1000;
+  _doorbellSuppressUntil = now + 900; // swallow the tap that follows the long-press
+  const btn = document.getElementById('liveDoorbellBtn');
+  const host = (btn && btn.dataset.host) || SELF_SUBDOMAIN;
+  const cur = _subRing[host] ? 'https://open.spotify.com/track/' + _subRing[host] : '';
+  const raw = prompt('Your doorbell song — paste a Spotify track link (blank = default):', cur);
+  if (raw === null) return;
+  const m = raw.match(/track[:/]([A-Za-z0-9]{22})/);
+  const track = m ? m[1] : '';
+  if (raw.trim() && !track) { showToast('That does not look like a Spotify track link'); return; }
+  try {
+    const base = host === SELF_SUBDOMAIN ? '' : 'https://' + host;
+    const d = await fetch(base + '/sub/ringtone', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: subTokenFor(host), track }),
+    }).then(r => r.json());
+    if (d.ok) { _subRing[host] = track; showToast(track ? 'Your ring song is set 🎵' : 'Back to the default ring'); }
+    else showToast(d.error || 'Could not save');
+  } catch(e) { showToast('Could not save'); }
+}
+async function ringDoorbell() {
+  if (Date.now() < _doorbellSuppressUntil) return;
+  const btn = document.getElementById('liveDoorbellBtn');
+  const host = (btn && btn.dataset.host) || SELF_SUBDOMAIN;
+  const now = Date.now();
+  if (now < _doorbellCooldownUntil) { showToast('Doorbell is cooling down'); return; }
+  _doorbellCooldownUntil = now + 30000;
+  if (btn) { btn.style.opacity = '0.4'; setTimeout(function(){ btn.style.opacity = '1'; }, 30000); }
+  try {
+    const base = host === SELF_SUBDOMAIN ? '' : 'https://' + host;
+    const d = await fetch(base + '/live/doorbell', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subToken: subTokenFor(host) }),
+    }).then(r => r.json());
+    if (d.ok) { showToast('Ding dong! 🔔'); return; }
+    if (d.wait) { _doorbellCooldownUntil = now + d.wait * 1000; showToast('Doorbell needs ' + d.wait + 's'); return; }
+    showToast('Doorbell unavailable');
+    _doorbellCooldownUntil = 0;
+    if (btn) btn.style.opacity = '1';
+  } catch(e) {
+    showToast('Doorbell unreachable');
+    _doorbellCooldownUntil = 0;
+    if (btn) btn.style.opacity = '1';
+  }
 }
 
 let liveCardChatInterval = null;
@@ -5571,6 +6005,248 @@ class LiveViewer {
   }
 }
 
+// ── GUEST CO-HOST ─────────────────────────────────────────────
+// One subscriber on camera with the broadcaster. The guest publishes cam+mic into the
+// same Calls app via /live/guest/* (gated by the grant minted when the broadcaster
+// accepts); everyone else pulls those tracks into the corner tile over a second pc —
+// the main stream and its latency are untouched.
+let guestPublisher = null;  // me, when I'm the on-screen guest
+let guestPull = null;       // everyone else: pc pulling the guest's tracks
+let _guestState = null;     // latest guest descriptor from the DO
+let _guestGrant = '';       // my grant token (guest only)
+let _guestReqQueue = [];    // broadcaster: pending join requests
+let _guestBase = '';        // origin of the streaming node ('' = self)
+let _guestReqSentAt = 0;
+
+// publishes the guest's camera/mic — LiveBroadcaster's flow, but grant-authed
+class GuestPublisher {
+  constructor(stream, base, grant) {
+    this.stream = stream; this.base = base; this.grant = grant;
+    this.pc = null; this.sessionId = null;
+  }
+  async start() {
+    const sessRes = await fetch(this.base + '/live/guest/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant: this.grant }),
+    });
+    if (!sessRes.ok) throw new Error((await sessRes.json().catch(() => ({}))).error || sessRes.statusText);
+    this.sessionId = (await sessRes.json()).sessionId;
+    this.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+    this.stream.getTracks().forEach(t => this.pc.addTrack(t, this.stream));
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    const tracks = this.pc.getTransceivers().map(t => ({
+      location: 'local',
+      mid: t.mid,
+      trackName: t.sender.track ? t.sender.track.kind + '-' + t.sender.track.id.slice(0, 8) : t.mid,
+    }));
+    const tracksRes = await fetch(this.base + '/live/guest/tracks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant: this.grant, sessionId: this.sessionId, sessionDescription: { type: 'offer', sdp: offer.sdp }, tracks }),
+    });
+    if (!tracksRes.ok) throw new Error('Tracks failed: ' + await tracksRes.text());
+    const resp = await tracksRes.json();
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: resp.sessionDescription.sdp });
+    // a corner tile doesn't need main-stream bitrate — half the cap keeps egress sane
+    for (const sender of this.pc.getSenders()) {
+      if (!sender.track || sender.track.kind !== 'video') continue;
+      try {
+        const p = sender.getParameters();
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = 1200000;
+        await sender.setParameters(p);
+      } catch(e) {}
+    }
+    await fetch(this.base + '/live/guest/publish', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant: this.grant, sessionId: this.sessionId, trackNames: tracks.map(t => t.trackName) }),
+    });
+  }
+  cleanup() {
+    if (this.pc) { this.pc.close(); this.pc = null; }
+    if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+  }
+}
+
+// pulls the guest's tracks into the tile (broadcaster + every viewer)
+class GuestPull {
+  constructor(base, guest) { this.base = base; this.guest = guest; this.pc = null; }
+  async start(videoEl) {
+    const sessRes = await fetch(this.base + '/live/subscribe', { method: 'POST' });
+    if (!sessRes.ok) throw new Error('Subscribe failed');
+    const sessionId = (await sessRes.json()).sessionId;
+    this.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+    const rx = new MediaStream();
+    videoEl.srcObject = rx;
+    this.pc.ontrack = e => {
+      rx.addTrack(e.track);
+      videoEl.play().catch(() => {
+        // autoplay blocked — start muted, surface the existing unmute button
+        videoEl.muted = true;
+        videoEl.play().catch(() => {});
+        const btn = document.getElementById('liveUnmuteBtn');
+        if (btn) btn.style.display = 'flex';
+      });
+    };
+    const tracks = (this.guest.trackNames || []).map(trackName => ({ location: 'remote', trackName, sessionId: this.guest.sessionId }));
+    const tracksRes = await fetch(this.base + '/live/tracks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscriberSessionId: sessionId, tracks }),
+    });
+    if (!tracksRes.ok) throw new Error('Tracks failed');
+    const resp = await tracksRes.json();
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: resp.sessionDescription.sdp });
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+    await fetch(this.base + '/live/renegotiate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscriberSessionId: sessionId, sessionDescription: { type: 'answer', sdp: answer.sdp } }),
+    });
+  }
+  cleanup() { if (this.pc) { this.pc.close(); this.pc = null; } }
+}
+
+// single entry point for guest state — init, broadcasts, and teardown all land here
+function renderGuestTile(g) {
+  _guestState = g;
+  const tile = document.getElementById('liveGuestTile');
+  const vid = document.getElementById('liveGuestVideo');
+  const nameEl = document.getElementById('liveGuestName');
+  const x = document.getElementById('liveGuestX');
+  updateGuestJoinBtn();
+  if (!tile) return;
+  if (!g) {
+    tile.style.display = 'none';
+    if (guestPull) { guestPull.cleanup(); guestPull = null; }
+    if (guestPublisher) { guestPublisher.cleanup(); guestPublisher = null; _guestGrant = ''; }
+    vid.srcObject = null; vid.style.transform = ''; delete vid.dataset.local;
+    renderGuestReqBar(); // a freed slot may unblock the next queued request
+    return;
+  }
+  tile.style.display = 'block';
+  nameEl.textContent = g.name || 'guest';
+  const mine = !!guestPublisher;
+  const canKick = !!(liveSocket && liveSocket.role === 'broadcaster');
+  x.style.display = (mine || canKick) ? 'flex' : 'none';
+  x.title = mine ? 'Leave the stream' : 'Remove guest';
+  if (mine) {
+    // my own camera — local preview, muted + mirrored like the broadcaster's
+    vid.muted = true;
+    vid.dataset.local = '1';
+    vid.style.transform = 'scaleX(-1)';
+    if (vid.srcObject !== guestPublisher.stream) vid.srcObject = guestPublisher.stream;
+    vid.play().catch(() => {});
+    return;
+  }
+  vid.style.transform = ''; delete vid.dataset.local;
+  vid.muted = false;
+  if (!guestPull || guestPull.guest.sessionId !== g.sessionId) {
+    if (guestPull) guestPull.cleanup();
+    guestPull = new GuestPull(_guestBase, g);
+    guestPull.start(vid).catch(() => {});
+  }
+}
+
+// 🎥 shows for subscribers of the live creator while no one holds the guest slot
+function updateGuestJoinBtn() {
+  const btn = document.getElementById('liveJoinBtn');
+  if (!btn) return;
+  const isB = !!(liveSocket && liveSocket.role === 'broadcaster');
+  btn.style.display = (!isB && liveSocket && subTokenFor(liveSocket.sub) && !_guestState) ? '' : 'none';
+  btn.disabled = Date.now() - _guestReqSentAt < 30000;
+}
+
+async function guestRequestJoin() {
+  const name = await ensureName();
+  if (!name) return;
+  _guestReqSentAt = Date.now();
+  updateGuestJoinBtn();
+  setTimeout(updateGuestJoinBtn, 31000);
+  try {
+    const r = await fetch(_guestBase + '/live/guest/request', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subToken: subTokenFor(liveSocket ? liveSocket.sub : ''), vid: getViewerId(), name }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) toast('Request sent — waiting for the host 🎥');
+    else if (d.error === 'guest slot taken') toast('Someone is already on screen');
+    else toast(d.error === 'not live' ? 'The stream is not live' : (d.error || 'Could not send the request'));
+  } catch(e) { toast('Could not send the request'); }
+}
+
+// broadcaster side: queue requests, show one banner at a time
+function onGuestReq(d) {
+  if (!_guestReqQueue.some(q => q.sid === d.sid)) _guestReqQueue.push({ sid: d.sid, name: d.name });
+  renderGuestReqBar();
+}
+function renderGuestReqBar() {
+  const bar = document.getElementById('guestReqBar');
+  if (!bar) return;
+  const q = _guestReqQueue[0];
+  if (!q || _guestState || !(liveSocket && liveSocket.role === 'broadcaster')) { bar.style.display = 'none'; return; }
+  document.getElementById('guestReqName').textContent = '🎥 ' + q.name + ' wants to join';
+  bar.style.display = 'flex';
+}
+async function guestApproveTap() {
+  const q = _guestReqQueue.shift();
+  renderGuestReqBar();
+  if (!q) return;
+  await fetch('/admin/live/guest/approve', {
+    method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid: q.sid, name: q.name }),
+  }).catch(() => {});
+}
+async function guestDeclineTap() {
+  const q = _guestReqQueue.shift();
+  renderGuestReqBar();
+  if (!q) return;
+  await fetch('/admin/live/guest/decline', {
+    method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid: q.sid }),
+  }).catch(() => {});
+}
+
+// guest side: the host accepted — camera up, publish, hand the rest to the DO broadcast
+async function onGuestOk(grant) {
+  if (guestPublisher) return;
+  _guestGrant = grant;
+  toast("You're in — starting your camera");
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 720 }, height: { ideal: 960 }, facingMode: 'user' },
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+  } catch(e) { toast('Camera error: ' + e.message); guestReleaseGrant(); return; }
+  guestPublisher = new GuestPublisher(stream, _guestBase, grant);
+  try {
+    await guestPublisher.start();
+  } catch(e) {
+    toast('Could not join: ' + e.message);
+    guestPublisher.cleanup(); guestPublisher = null;
+    guestReleaseGrant();
+  }
+}
+// hand an unused/finished grant back so the slot frees up server-side
+function guestReleaseGrant() {
+  if (!_guestGrant) return;
+  fetch(_guestBase + '/live/guest/end', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant: _guestGrant }),
+  }).catch(() => {});
+  _guestGrant = '';
+}
+
+// tile ✕ — the guest leaves, or the broadcaster removes them
+function guestTileX() {
+  if (guestPublisher) { guestReleaseGrant(); return; } // teardown lands via the guest:null broadcast
+  if (liveSocket && liveSocket.role === 'broadcaster') {
+    fetch('/admin/live/guest/remove', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token },
+    }).catch(() => {});
+  }
+}
+
 // ── VIEWER STREAM STATES ──────────────────────────────────────
 // TikTok-style explicit states: a frozen frame is either "paused" (broadcaster
 // backgrounded the app — video track muted / playback stalled) or "ended", never
@@ -5625,10 +6301,24 @@ function wireLiveStateDetection(videoEl) {
   wireTracks();
 }
 
+// Broadcaster side of the paused card: when the app backgrounds, the camera track keeps
+// delivering its last frame, so viewers' mute/stall detection never fires (field-tested
+// 2026-06-11). The page TELLS the room instead — visibility flips ride the live WS and
+// the DO rebroadcasts them as bc-state.
+function sendBcState() {
+  if (!liveBroadcaster || !liveSocket || liveSocket.role !== 'broadcaster') return;
+  if (liveSocket.ws && liveSocket.ws.readyState === 1) {
+    try { liveSocket.ws.send(JSON.stringify({ t: 'bc-state', paused: document.hidden })); } catch(e) {}
+  }
+}
+document.addEventListener('visibilitychange', sendBcState);
+window.addEventListener('pageshow', sendBcState); // iOS bfcache returns skip visibilitychange
+
 async function startLiveViewer(subdomain) {
   const videoEl  = document.getElementById('liveViewVideo');
   const statusEl = document.getElementById('liveViewStatus');
   if (liveViewer) { liveViewer.cleanup(); liveViewer = null; }
+  updateDoorbellBtn(subdomain);
   _liveEnded = false;
   setLiveState(null);
   liveViewer = new LiveViewer(subdomain);
@@ -6309,6 +6999,7 @@ function setSubTokenFor(host, tok) {
 }
 let _subStatus = {};   // host → 'none' | 'pending' | 'active' (session cache)
 let _subPush = {};     // host → push registered server-side
+let _subRing = {};     // host → chosen doorbell track id ('' = default)
 function subBase(host) { return host === SELF_SUBDOMAIN ? '' : 'https://' + host; }
 
 async function subStatusFor(host, force) {
@@ -6322,6 +7013,7 @@ async function subStatusFor(host, force) {
     }).then(r => r.json());
     _subStatus[host] = d.status || 'none';
     _subPush[host] = !!d.push;
+    _subRing[host] = d.ringtone || '';
     if (_subStatus[host] === 'none') setSubTokenFor(host, ''); // declined/removed — the token is dead
   } catch(e) { _subStatus[host] = 'none'; } // unreachable → act as none this session, keep the token
   return _subStatus[host];

@@ -1,6 +1,6 @@
 # Social Node Protocol
 
-**Protocol version: `0.13.0`** (reported in `/.well-known/node.json` as `protocol`)
+**Protocol version: `0.15.0`** (reported in `/.well-known/node.json` as `protocol`)
 
 This document is the contract for building on Social Node without touching the node code: third-party clients (mobile, TV, desktop), host dashboards, creator portals, analytics tools, sponsors auditing impressions.
 
@@ -135,7 +135,8 @@ Live streaming is WebRTC via Cloudflare Realtime (Calls) — sub-second latency,
 
 ### State & presence
 - `GET /live/status.json` → `{ "active": false, "viewers": 0 }` or
-  `{ "active": true, "publisherSessionId": "...", "trackNames": [...], "startedAt": "...", "via": "browser|whip", "viewers": 2 }`
+  `{ "active": true, "publisherSessionId": "...", "trackNames": [...], "startedAt": "...", "via": "browser|whip", "viewers": 2, "guest": null | { "sid", "name", "sessionId", "trackNames": [...] }, "paused": false }`
+  (`guest` and `paused` added 0.15.0 — `guest` is the active co-host whose tracks late joiners pull alongside the main ones; `paused` means the broadcaster's app is backgrounded, so show a paused state instead of a frozen frame)
 - `GET /live/who.json` *(creator auth required as of 0.8.0 — who's-in-the-room names are the broadcaster's moderation data, not public)* → `{ "viewers": [ { "name", "sid", "role", "muted" }... ], "mutedList": [...] }`. Unauthenticated → `401`; the viewer COUNT stays public via `status.json`/WS.
 
 ### Chat
@@ -146,8 +147,13 @@ Chat lives and dies with the stream: history (last 100 messages) is only served 
   - `{ "t": "chat", "msg": { "id", "name", "text", "sid", "at", "sub"? } }`
   - `{ "t": "viewers", "viewers": n }`
   - `{ "t": "live", "status": {...} }` / `{ "t": "ended" }`
+  - `{ "t": "bc-state", "paused": true|false }` (added 0.15.0) — broadcaster backgrounded / came back
+  - `{ "t": "guest", "guest": {...}|null }` (added 0.15.0) — a co-host started or stopped publishing; pull or drop their tracks
+  - guest-flow messages scoped to specific sockets (0.15.0): `guest-req` (to the broadcaster), `guest-ok` / `guest-no` / `guest-kick` (to the requesting/active guest — see Guest co-host)
 
-  Client→server: `{ "t": "chat", "text": "...", "name": "..." }` (per-connection throttle applies).
+  Client→server: `{ "t": "chat", "text": "...", "name": "..." }` (per-connection throttle applies). A broadcaster socket may also send `{ "t": "bc-state", "paused": true|false }` (page-visibility signal, rebroadcast to viewers).
+
+  **Liveness ping (added 0.15.0):** send the literal string `{"t":"ping"}` every ~25s; the server answers `{"t":"pong"}` (hibernation auto-responder — exact string match, no extra whitespace). Sockets silent for >70s are closed and dropped from the viewer count. The count also excludes the broadcaster's own viewer tabs (same `sid` as a broadcaster socket) and dedupes by `sid`.
 - **HTTP fallback**: `GET /live/chat.json` → `{ "messages": [...] }`; `POST /live/chat` `{ "text", "name", "vid", "subToken"? }` (per-IP throttled, 429 on spam).
 
 `sid` is a short hash of the sender's `vid` — stable enough to moderate, useless to impersonate. Muted senders are shadow-muted: their sends are silently dropped server-side.
@@ -162,6 +168,24 @@ Chat lives and dies with the stream: history (last 100 messages) is only served 
 
 ### Broadcasting
 Creator-auth only — see [Admin](#admin-endpoints). OBS/Larix can ingest via **WHIP** at `POST /live/whip?token=<creator token>` (or `Authorization: Bearer`); end the stream with the WHIP `DELETE`.
+
+### Guest co-host (added 0.15.0)
+One subscriber can join the broadcast on camera, two-way. The trust chain: requesting needs an **active subscriber token**; publishing needs a **grant** — a random capability token minted when the broadcaster approves, delivered over the guest's own WebSocket (possession proves they were the one picked). Guest state is stream-scoped like chat: cleared when the guest leaves, is removed, or the stream ends. One guest slot per stream.
+
+All endpoints are public + CORS (the guest may be watching from another node's client) and rate-limited per IP:
+
+1. `POST /live/guest/request` `{ "subToken", "vid", "name"? }` → `{ "ok": true }` — relays `{ "t": "guest-req", "sid", "name" }` to the broadcaster's socket. `403` without an active subscriber token; `409` if not live or the slot is taken. Requests are relay-only (not stored) — if lost to a reconnect, tap again.
+2. The broadcaster approves or declines (see Admin). Approval delivers `{ "t": "guest-ok", "grant": "..." }` on the guest's socket; decline delivers `{ "t": "guest-no" }`.
+3. `POST /live/guest/start` `{ "grant" }` → `{ "sessionId" }` — mints a Calls session for the guest's publish leg.
+4. `POST /live/guest/tracks` `{ "grant", "sessionId", "tracks", "sessionDescription" }` → Calls answer (same shape as the viewer `/live/tracks` proxy, but for publishing local tracks).
+5. `POST /live/guest/publish` `{ "grant", "sessionId", "trackNames": [...] }` → `{ "ok": true }` — marks the guest live; everyone in the room gets `{ "t": "guest", "guest": { "sid", "name", "sessionId", "trackNames" } }` and pulls those tracks (late joiners get the guest from `status.json` / WS `init`).
+6. `POST /live/guest/end` `{ "grant" }` — guest leaves (the grant doubles as leave authorization; also releases an approved-but-unused slot). Removal by the broadcaster instead sends `{ "t": "guest-kick" }` to the guest and broadcasts `{ "t": "guest", "guest": null }`.
+
+### Doorbell (optional, added 0.15.0)
+A node operator can wire a literal doorbell: subscribers ring the creator's phone (relayed through the [Join](https://joaoapps.com/join/) push API; e.g. Tasker plays a sound). Worker-level opt-in — set the `DOORBELL_HOST` var plus `JOIN_API_KEY` / `JOIN_DEVICE_ID` secrets; only that one tenant gets a bell, every other node `404`s.
+
+- `GET /live/doorbell` → `{ "enabled": true|false }` — capability probe (the embedded client shows 🔔 only when true)
+- `POST /live/doorbell` `{ "subToken" }` (or creator auth, for testing) → `{ "ok": true }` — rings the phone; per-subscriber 30s cooldown (`429` with `{ "wait": <sec> }`), `403` without an active subscriber token.
 
 ### Ads — two separate slots (split in 0.11.0)
 
@@ -224,7 +248,7 @@ For host dashboards and creator portals. All take `Authorization: Bearer`. *(mas
 
 **Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType, transcript? }` → `{ published: <post> }`; `POST /admin/upload` (multipart, max 256MB, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); **background import queue (added 0.14.0)** — `POST /admin/import/queue` `{ items: [ { url, title?, createdAt?, source? }... ] }` (max 500) queues the list server-side and imports ONE video every ~10s via a Durable Object alarm (spaces out feed writes; survives the client closing; an `import_done` inbox notification with counts/errors lands at the end), `GET /admin/import/status` → `{ remaining, stats }`, `POST /admin/import/cancel` (already-imported posts stay); `POST /admin/delete` `{ id }` or `{ ids: [...] }` (bulk, max 500); `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
 
-**Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/chat-delete` `{ id }` (added 0.12.0) — moderation-deletes one chat message from storage and broadcasts `{ "t": "chat-del", "id" }` to every connected client (creator-only by design — viewers cannot delete, even their own); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end).
+**Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/chat-delete` `{ id }` (added 0.12.0) — moderation-deletes one chat message from storage and broadcasts `{ "t": "chat-del", "id" }` to every connected client (creator-only by design — viewers cannot delete, even their own); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end); **guest co-host moderation (added 0.15.0)** — `POST /admin/live/guest/approve` `{ sid, name }` (mints the grant and delivers it to that viewer's socket; response `{ ok, delivered }` — `delivered: false` means the guest's socket was gone, they must re-request), `POST /admin/live/guest/decline` `{ sid }`, `POST /admin/live/guest/remove` (kicks the active guest and clears the slot; see Guest co-host).
 
 **Revenue** — `POST /admin/preroll` *(master — the FEED ad config is worker-wide)*; `GET /admin/preroll.json` *(master)*; `POST /admin/livead` `{ enabled, kind: "sponsor"|"intro", mediaUrl, sponsorName, clickUrl, category, cpm, durationSec }` (any creator — their own live pre-roll, added 0.11.0); `GET /admin/livead.json` → `{ livead, stats: { impressions, clicks, earnings }, sponsorUrl }`; `POST /admin/ads` `{ host, sharePct }` *(master)*; `GET /admin/ads-ledger` *(master)* — per-creator FEED views × CPM × share %, network fee, host net; `GET /admin/my-earnings` (any creator) — read-only owed view; `POST /admin/calls-creds` `{ host, appId, appSecret }` *(master)* — point a tenant's live traffic at its own Cloudflare account.
 

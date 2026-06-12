@@ -14,7 +14,10 @@
   // "vars": {
   //   "ANALYTICS_BEACON_TOKEN": "<web analytics snippet token>",
   //   "ANALYTICS_SITE_TAG": "<hex id from the manage-site URL>",
-  //   "ANALYTICS_ACCOUNT_ID": "<your cloudflare account id>"
+  //   "ANALYTICS_ACCOUNT_ID": "<your cloudflare account id>",
+  //   // Optional — subscriber doorbell rings one creator's phone via the Join push
+  //   // API (see PROTOCOL.md "Doorbell"); also set JOIN_API_KEY + JOIN_DEVICE_ID secrets.
+  //   "DOORBELL_HOST": "<the one hostname that gets the bell>"
   // },
   "kv_namespaces": [
     {
