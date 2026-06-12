@@ -5,6 +5,9 @@
   "compatibility_date": "2026-06-08",
   "main": "worker.js",
   "workers_dev": true,
+  // Workers Logs: persisted invocation logs + exceptions in the dashboard, plus the
+  // client error beacon's reports (see PROTOCOL.md). Free tier included; remove to disable.
+  "observability": { "enabled": true },
   // Optional — cookieless traffic analytics (Cloudflare Web Analytics beacon +
   // GET /admin/analytics report; see PROTOCOL.md "Traffic analytics"). Uncomment and
   // fill from your dashboard; also set the ANALYTICS_TOKEN secret. Omit to disable.

@@ -91,9 +91,11 @@ The escalation ingest: `{ "host", "postId", "reason", "details" }`. Non-root nod
 ## Post interactions (public)
 
 - `GET /post/likes?postId=&vid=` → `{ "count": 5, "liked": true }` (`liked` reflects the given `vid`)
-- `POST /post/like` `{ "postId", "vid", "liked": true|false }` → `{ "count", "liked" }` — idempotent per `vid`
+- `POST /post/like` `{ "postId", "vid", "liked": true|false, "self"? }` → `{ "count", "liked" }` — idempotent per `vid`
 - `GET /post/comments?postId=` → `{ "comments": [ { "id", "name", "text", "at", "sub"? }... ] }` (`sub: true` = verified subscriber, added 0.9.0)
-- `POST /post/comment` `{ "postId", "text", "name", "subToken"? }` → `{ "ok": true, "comment": {...} }` (creator deletes via admin; a valid active `subToken` stamps the comment `sub: true` — the badge is verified server-side, never client-claimed)
+- `POST /post/comment` `{ "postId", "text", "name", "subToken"?, "self"? }` → `{ "ok": true, "comment": {...} }` (creator deletes via admin; a valid active `subToken` stamps the comment `sub: true` — the badge is verified server-side, never client-claimed)
+
+Engagement notifications (added 0.14.0): a new like or comment also lands in the creator's inbox — unread like-notifications aggregate per post ("3 people liked…"). `self: true` is a client hint that the creator is engaging with their own post (suppresses the notification only; no effect on counts or badges). Comments whose `name` equals the tenant hostname are treated as the creator's own.
 
 ---
 
@@ -188,6 +190,10 @@ Advertiser-facing numbers come from the root, not the node being paid ("don't gr
 
 ---
 
+## Client error beacon (added 0.14.0)
+
+`POST /debug/client-error` `{ "msg", "src"?, "ctx"? }` → `{ "ok": true }` — public, rate-limited (20/min/IP, floods silently dropped). The embedded client reports uncaught JS errors and unhandled promise rejections here; the node logs them (visible in `wrangler tail` and Workers Logs when `observability` is enabled in wrangler.jsonc). Nothing is stored; it is purely an operator observability hook.
+
 ## Joining the network
 
 1. Deploy your node (see README). It serves all of the above immediately — membership only affects cross-node discovery.
@@ -206,7 +212,7 @@ Three bearer credentials, checked in this order; all admin endpoints fail closed
 3. **Session token** — from password login. 30-day, stateless (Ed25519-signed by the node's key), scoped to one hostname.
 
 Public auth endpoints (rate-limited 10/10min/IP):
-- `POST /auth/claim` `{ "code", "password" }` → `{ "ok": true, "session": "<token>" }` — one-time claim-code redemption (host onboarding), sets the password.
+- `POST /auth/claim` `{ "code", "password" }` → `{ "ok": true, "session": "<token>", "joinRequested": true|false }` — one-time claim-code redemption (host onboarding), sets the password. Since 0.14.0 a successful claim also auto-files the network join request (the host provisioning the handle expressed the intent; the root's Approve remains the human gate) — `joinRequested` reports whether that succeeded.
 - `POST /auth/login` `{ "password" }` → `{ "ok": true, "session": "<token>" }`
 - `POST /admin/verify` (any credential) → `{ "ok": true, "master": true|false }` — probe what a token can do.
 
@@ -216,7 +222,7 @@ Public auth endpoints (rate-limited 10/10min/IP):
 
 For host dashboards and creator portals. All take `Authorization: Bearer`. *(master)* = host master token only.
 
-**Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType, transcript? }` → `{ published: <post> }`; `POST /admin/upload` (multipart, max 256MB, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); `POST /admin/delete` `{ id }` or `{ ids: [...] }` (bulk, max 500); `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
+**Content** — `POST /admin/publish` `{ type, title, body, mediaUrl, mediaContentType, transcript? }` → `{ published: <post> }`; `POST /admin/upload` (multipart, max 256MB, returns the `/media/` URL); `POST /admin/import-url` `{ url, title?, createdAt?, source? }` — the node fetches the video server-side into its own storage and publishes it with the original date (feed stays sorted by `createdAt`; idempotent per source URL; used by the TikTok data-export importer); **background import queue (added 0.14.0)** — `POST /admin/import/queue` `{ items: [ { url, title?, createdAt?, source? }... ] }` (max 500) queues the list server-side and imports ONE video every ~10s via a Durable Object alarm (spaces out feed writes; survives the client closing; an `import_done` inbox notification with counts/errors lands at the end), `GET /admin/import/status` → `{ remaining, stats }`, `POST /admin/import/cancel` (already-imported posts stay); `POST /admin/delete` `{ id }` or `{ ids: [...] }` (bulk, max 500); `POST /admin/profile` `{ displayName, bio, avatarUrl }`; `POST /admin/comment/delete` `{ postId, id }`.
 
 **Live** — `POST /admin/live/start` → Calls session; `POST /admin/live/tracks` (publisher SDP); `POST /admin/live/publish` `{ sessionId, trackNames }` (marks live); `POST /admin/live/heartbeat` (every ~15s — browser streams are presumed dead after 45s without one); `POST /admin/live/end`; `GET /admin/live/history` → `{ streams: [ { startedAt, endedAt, durationSec, peakViewers, viewerSec, via }... ] }` (newest first, last 50 — `viewerSec` is accumulated viewer-seconds, the honest basis for data/cost estimates); `POST /admin/live/mute` `{ sid, name, muted: true|false }` (persistent shadow-mute); `POST /admin/live/chat-delete` `{ id }` (added 0.12.0) — moderation-deletes one chat message from storage and broadcasts `{ "t": "chat-del", "id" }` to every connected client (creator-only by design — viewers cannot delete, even their own); `POST /admin/live/overlay` `{ text ≤120, imageUrl, txt, img }` (added 0.8.0) — text/image overlay rendered client-side over the stream; `txt`/`img` are `{x,y,s}` placements (screen fractions + scale, clamped server-side); broadcast to viewers over WS as `{ "t": "overlay", "overlay": {...} }` and included in WS `init`; stream-scoped (clears on end).
 

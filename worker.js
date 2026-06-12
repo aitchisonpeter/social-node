@@ -10,7 +10,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 
-const PROTOCOL_VERSION = '0.13.0';
+const PROTOCOL_VERSION = '0.14.0';
 
 // ============================================================
 // NETWORK ROOT OF TRUST
@@ -49,6 +49,7 @@ const LIVE_STALE_MS = 45000;       // browser broadcaster considered dead after 
 const CHAT_KEEP      = 100;         // messages retained for late joiners
 const CHAT_MIN_GAP_MS = 800;       // light per-connection chat throttle
 const PREROLL_GRACE_MS = 8 * 60 * 1000; // don't re-show the pre-roll to the same viewer within this window
+const IMPORT_DRIP_MS = 10000;      // background import: one video per alarm tick — spaces out feed KV writes
 
 export class LiveRoom extends DurableObject {
   async fetch(request) {
@@ -379,7 +380,76 @@ export class LiveRoom extends DurableObject {
       return Response.json(await this.commentDel(postId, id));
     }
 
+    // ---- background import queue (drip-fed by the alarm; survives the client closing) ----
+    if (seg === 'import-queue' && request.method === 'POST') {
+      const { host, items } = await request.json().catch(() => ({}));
+      if (!host || !Array.isArray(items) || !items.length) {
+        return Response.json({ error: 'host and items required' }, { status: 400 });
+      }
+      const q = (await this.ctx.storage.get('impq')) || [];
+      const room = Math.max(0, 500 - q.length);
+      const add = items.slice(0, room);
+      q.push(...add);
+      const stats = (await this.ctx.storage.get('impStats')) || { done: 0, failed: 0, dups: 0, total: 0, errors: [] };
+      stats.total += add.length;
+      await this.ctx.storage.put('impq', q);
+      await this.ctx.storage.put('impHost', host);
+      await this.ctx.storage.put('impStats', stats);
+      if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 1000);
+      return Response.json({ ok: true, queued: q.length, total: stats.total });
+    }
+    if (seg === 'import-status') {
+      const q = (await this.ctx.storage.get('impq')) || [];
+      const stats = (await this.ctx.storage.get('impStats')) || null;
+      return Response.json({ remaining: q.length, stats });
+    }
+    if (seg === 'import-cancel' && request.method === 'POST') {
+      const q = (await this.ctx.storage.get('impq')) || [];
+      await this.ctx.storage.delete('impq');
+      await this.ctx.storage.delete('impStats');
+      await this.ctx.storage.deleteAlarm();
+      return Response.json({ ok: true, cancelled: q.length });
+    }
+
     return new Response('not found', { status: 404 });
+  }
+
+  // Import-queue worker: one video per tick. Every step is caught so a bad item is
+  // recorded and skipped rather than retried forever (DO alarms auto-retry on throw).
+  async alarm() {
+    const q = (await this.ctx.storage.get('impq')) || [];
+    const host = await this.ctx.storage.get('impHost');
+    if (!q.length || !host) { await this.ctx.storage.delete('impq'); return; }
+    const stats = (await this.ctx.storage.get('impStats')) || { done: 0, failed: 0, dups: 0, total: q.length, errors: [] };
+    const item = q.shift();
+    try {
+      const storage = makeStorage(this.env, host);
+      const identity = await storage.get('identity');
+      const r = await importOneVideo(this.env, storage, identity, item);
+      if (r.ok) { stats.done++; if (r.dup) stats.dups++; }
+      else {
+        stats.failed++;
+        if (stats.errors.length < 8) stats.errors.push((item.createdAt || '').slice(0, 10) + ': ' + (r.error || 'failed'));
+      }
+    } catch (e) {
+      stats.failed++;
+      if (stats.errors.length < 8) stats.errors.push(String((e && e.message) || e).slice(0, 100));
+    }
+    await this.ctx.storage.put('impq', q);
+    await this.ctx.storage.put('impStats', stats);
+    if (q.length) {
+      await this.ctx.storage.setAlarm(Date.now() + IMPORT_DRIP_MS);
+    } else {
+      // finished — tell the creator's inbox, then clear run state
+      try {
+        await addInboxNotif(makeStorage(this.env, host), {
+          type: 'import_done', done: stats.done, failed: stats.failed, dups: stats.dups,
+          total: stats.total, errors: stats.errors,
+        });
+      } catch (e) {}
+      await this.ctx.storage.delete('impq');
+      await this.ctx.storage.delete('impStats');
+    }
   }
 
   async likeToggle(postId, vid, liked) {
@@ -1242,6 +1312,112 @@ async function registrySigned(env, identity, subdomain) {
   return { root: { subdomain, pubkey: identity.publicKey }, members, updatedAt, signature };
 }
 
+// Prepend a notification to a tenant's inbox (newest first, capped).
+async function addInboxNotif(storage, n) {
+  const notifs = (await storage.get('inbox:notifications')) || [];
+  notifs.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), read: false, ...n });
+  if (notifs.length > 100) notifs.splice(100);
+  await storage.set('inbox:notifications', notifs);
+}
+
+// File a join request with the network root. Shared by /admin/request-join (the profile
+// button) and /auth/claim (a freshly-claimed creator joins automatically — the host
+// provisioning them already expressed intent; the root's Approve stays as the human gate).
+async function fireJoinRequest(env, identity, subdomain) {
+  if (isRoot(identity)) return { ok: true, alreadyMember: true };
+  const gstore = makeStorage(env);
+  // Same-worker short-circuit: if the network root is a tenant on THIS Worker
+  // (e.g. scotty.tuliptown.ca joining root social.tuliptown.ca), a fetch to the
+  // root host is a Worker self-subrequest and Cloudflare returns 522 (whose body
+  // "error code: 522" then fails r.json() → "token 'e' is not valid JSON"). The
+  // registry:pending list is global (gstore) and the root inbox is just another
+  // tenant's KV, so write the join request directly instead of fetching ourselves.
+  const rootStore = makeStorage(env, NETWORK_ROOT_HOST);
+  const rootIdentity = await rootStore.get('identity');
+  if (rootIdentity && isRoot(rootIdentity)) {
+    const members = await getRegistryMembers(env, rootIdentity);
+    if (members.find(m => m.pubkey === identity.publicKey)) return { ok: true, alreadyMember: true };
+    const pending = (await gstore.get('registry:pending')) || [];
+    if (!pending.find(p => p.pubkey === identity.publicKey)) {
+      pending.unshift({ subdomain, pubkey: identity.publicKey, at: new Date().toISOString() });
+      await gstore.set('registry:pending', pending);
+      await addInboxNotif(rootStore, { type: 'join_request', subdomain, publicKey: identity.publicKey });
+    }
+    return { ok: true, pending: true };
+  }
+  // Cross-worker (e.g. social.bigdumbvan.com → social.tuliptown.ca): normal signed POST.
+  const message = JSON.stringify({ subdomain, pubkey: identity.publicKey, timestamp: new Date().toISOString() });
+  const signature = await sign(identity.privateKey, message);
+  try {
+    const r = await fetch('https://' + NETWORK_ROOT_HOST + '/protocol/join-request', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, signature }),
+    });
+    return await r.json();
+  } catch (e) { return { error: e.message }; }
+}
+
+// Core of a single video import (fetch source URL → R2 → feed). Shared by the
+// /admin/import-url route and the LiveRoom DO's background import queue.
+// Returns a plain result object; never throws for per-item failures.
+async function importOneVideo(env, storage, identity, b) {
+  if (!env.NODE_MEDIA) return { error: 'R2 bucket NODE_MEDIA not configured' };
+  if (!identity || !identity.publicKey) return { error: 'tenant identity missing' };
+  const srcUrl = (b.url || '').trim();
+  if (!srcUrl.startsWith('http://') && !srcUrl.startsWith('https://')) return { error: 'url required' };
+  const feed = await getFeed(storage);
+  const dup = feed.find(it => it.importedSrc === srcUrl);
+  if (dup) {
+    // re-running an import can repair metadata (e.g. the 'N/A' titles an earlier parser kept)
+    const newTitle = String(b.title || '').slice(0, 300);
+    if (newTitle !== (dup.title || '')) { dup.title = newTitle; await saveFeed(storage, feed); }
+    return { ok: true, dup: true, id: dup.id };
+  }
+
+  let res;
+  try { res = await fetch(srcUrl, { redirect: 'follow' }); }
+  catch (e) { return { error: 'fetch failed: ' + e.message }; }
+  if (!res.ok) return { error: 'source returned ' + res.status + ' (export links expire — request a fresh export)' };
+  const ct = (res.headers.get('Content-Type') || '').split(';')[0].trim() || 'video/mp4';
+  if (!ct.startsWith('video/') && ct !== 'application/octet-stream') {
+    return { error: 'not a video (' + ct + ') — the link may have expired into an error page' };
+  }
+  const len = parseInt(res.headers.get('Content-Length') || '0', 10);
+  if (len > 256 * 1024 * 1024) return { error: 'file too large' };
+  const key = crypto.randomUUID() + '.mp4';
+  try {
+    if (len > 0) {
+      await env.NODE_MEDIA.put(key, res.body, { httpMetadata: { contentType: ct } });
+    } else {
+      // unknown length — buffer (capped) so R2 gets a sized body
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > 256 * 1024 * 1024) return { error: 'file too large' };
+      await env.NODE_MEDIA.put(key, buf, { httpMetadata: { contentType: ct } });
+    }
+  } catch (e) { return { error: 'storage failed: ' + e.message }; }
+
+  const when = b.createdAt && !isNaN(Date.parse(b.createdAt)) ? new Date(Date.parse(b.createdAt)).toISOString() : new Date().toISOString();
+  const item = {
+    id: crypto.randomUUID(),
+    type: 'video',
+    title: String(b.title || '').slice(0, 300),
+    body: '',
+    mediaUrl: '/media/' + key,
+    mediaContentType: ct,
+    importedFrom: String(b.source || 'tiktok').slice(0, 30),
+    importedSrc: srcUrl,
+    createdAt: when,
+    authorPublicKey: identity.publicKey,
+  };
+  // re-read the feed: the R2 fetch above can take tens of seconds for big files and a
+  // concurrent publish would otherwise be clobbered by our stale copy
+  const fresh = await getFeed(storage);
+  fresh.push(item);
+  fresh.sort((a, c) => (c.createdAt || '').localeCompare(a.createdAt || '')); // newest first
+  await saveFeed(storage, fresh);
+  return { ok: true, published: item };
+}
+
 // ============================================================
 // ROUTING
 // ============================================================
@@ -1362,7 +1538,25 @@ async function handleRequest(request, storage, env, ctx) {
   if (provisioned.length > 0 && subdomain !== NETWORK_ROOT_HOST && !provisioned.includes(subdomain)) {
     const regMembers = (await gstore.get('registry:members')) || [];
     if (!regMembers.find(m => m.subdomain === subdomain)) {
-      return html(renderUnclaimed(subdomain), 404);
+      // On a NON-root worker the registry lives in the root's KV, so the local list above
+      // is empty — ask the root before locking anyone out, otherwise provisioning ANY host
+      // on a member's worker locks out the member itself (bit social.bigdumbvan.com when
+      // estherluella.bigdumbvan.com was provisioned there). Only consulted when the local
+      // registry is empty: the root answers from its own KV and must never fetch its own
+      // hostname (same-worker self-subrequest = 522).
+      let ok = memGet('gate:' + subdomain, 300000);
+      if (ok === undefined) {
+        ok = false;
+        if (regMembers.length === 0) {
+          try {
+            const reg = await fetch('https://' + NETWORK_ROOT_HOST + '/.well-known/registry.json',
+              { cf: { cacheTtl: 300 } }).then(r => r.json());
+            ok = !!(reg.members || []).find(m => m.subdomain === subdomain);
+          } catch (e) {}
+        }
+        memSet('gate:' + subdomain, ok);
+      }
+      if (!ok) return html(renderUnclaimed(subdomain), 404);
     }
   }
 
@@ -1499,6 +1693,22 @@ async function handleRequest(request, storage, env, ctx) {
       await storage.set('inbox:notifications', notifs);
     }
     return jsonCors({ ok: true, pending: true });
+  }
+
+  // ---- client error beacon (observability) ----
+  // The PWA reports uncaught JS errors here; they surface in `wrangler tail` and
+  // Workers Logs. Phone-side failures were invisible before this. Rate-limited and
+  // silently dropped on flood — an error loop must never become its own outage.
+  if (path === '/debug/client-error' && request.method === 'POST') {
+    if (!(await rlAllowed('cerr', 20, 60000))) return jsonCors({ ok: true });
+    const b = await request.json().catch(() => ({}));
+    console.error('[client-error]', subdomain, JSON.stringify({
+      msg: String(b.msg || '').slice(0, 300),
+      src: String(b.src || '').slice(0, 200),
+      ctx: String(b.ctx || '').slice(0, 40),
+      ua: (request.headers.get('User-Agent') || '').slice(0, 120),
+    }));
+    return jsonCors({ ok: true });
   }
 
   // ---- public content report (moderation) ----
@@ -1879,58 +2089,44 @@ async function handleRequest(request, storage, env, ctx) {
   // instead of burying native posts. Idempotent per source URL.
   if (path === '/admin/import-url' && request.method === 'POST') {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const b = await request.json().catch(() => ({}));
+    const r = await importOneVideo(env, storage, identity, b);
+    return json(r, r.ok ? 200 : 502);
+  }
+
+  // ---- admin: background import queue (lives in the tenant's LiveRoom DO, drip-fed by
+  // its alarm). The old foreground loop did a full feed read+rewrite per video back to
+  // back, which throttled the feed KV keys and "locked up the whole system" during
+  // Esther's 68-video import. Queueing survives the tab closing; an inbox notification
+  // lands when the run finishes. ----
+  if (path === '/admin/import/queue' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
     if (!env.NODE_MEDIA) return json({ error: 'R2 bucket NODE_MEDIA not configured' }, 503);
     const b = await request.json().catch(() => ({}));
-    const srcUrl = (b.url || '').trim();
-    if (!srcUrl.startsWith('http://') && !srcUrl.startsWith('https://')) return json({ error: 'url required' }, 400);
-    const feed = await getFeed(storage);
-    const dup = feed.find(it => it.importedSrc === srcUrl);
-    if (dup) {
-      // re-running an import can repair metadata (e.g. the 'N/A' titles an earlier parser kept)
-      const newTitle = String(b.title || '').slice(0, 300);
-      if (newTitle !== (dup.title || '')) { dup.title = newTitle; await saveFeed(storage, feed); }
-      return json({ ok: true, dup: true, id: dup.id });
-    }
-
-    let res;
-    try { res = await fetch(srcUrl, { redirect: 'follow' }); }
-    catch (e) { return json({ error: 'fetch failed: ' + e.message }, 502); }
-    if (!res.ok) return json({ error: 'source returned ' + res.status + ' (export links expire — request a fresh export)' }, 502);
-    const ct = (res.headers.get('Content-Type') || '').split(';')[0].trim() || 'video/mp4';
-    if (!ct.startsWith('video/') && ct !== 'application/octet-stream') {
-      return json({ error: 'not a video (' + ct + ') — the link may have expired into an error page' }, 415);
-    }
-    const len = parseInt(res.headers.get('Content-Length') || '0', 10);
-    if (len > 256 * 1024 * 1024) return json({ error: 'file too large' }, 413);
-    const key = crypto.randomUUID() + '.mp4';
-    try {
-      if (len > 0) {
-        await env.NODE_MEDIA.put(key, res.body, { httpMetadata: { contentType: ct } });
-      } else {
-        // unknown length — buffer (capped) so R2 gets a sized body
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength > 256 * 1024 * 1024) return json({ error: 'file too large' }, 413);
-        await env.NODE_MEDIA.put(key, buf, { httpMetadata: { contentType: ct } });
-      }
-    } catch (e) { return json({ error: 'storage failed: ' + e.message }, 502); }
-
-    const when = b.createdAt && !isNaN(Date.parse(b.createdAt)) ? new Date(Date.parse(b.createdAt)).toISOString() : new Date().toISOString();
-    const item = {
-      id: crypto.randomUUID(),
-      type: 'video',
-      title: String(b.title || '').slice(0, 300),
-      body: '',
-      mediaUrl: '/media/' + key,
-      mediaContentType: ct,
-      importedFrom: String(b.source || 'tiktok').slice(0, 30),
-      importedSrc: srcUrl,
-      createdAt: when,
-      authorPublicKey: identity.publicKey,
-    };
-    feed.push(item);
-    feed.sort((a, c) => (c.createdAt || '').localeCompare(a.createdAt || '')); // newest first
-    await saveFeed(storage, feed);
-    return json({ ok: true, published: item });
+    const items = (Array.isArray(b.items) ? b.items : []).slice(0, 500)
+      .filter(it => it && typeof it.url === 'string' && it.url.startsWith('http'))
+      .map(it => ({
+        url: it.url.slice(0, 2000),
+        title: String(it.title || '').slice(0, 300),
+        createdAt: String(it.createdAt || '').slice(0, 40),
+        source: String(it.source || 'tiktok').slice(0, 30),
+      }));
+    if (!items.length) return json({ error: 'items required' }, 400);
+    const r = await liveDO(env, subdomain, '/import-queue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host: subdomain, items }),
+    });
+    return json(await r.json(), r.status);
+  }
+  if (path === '/admin/import/status' && request.method === 'GET') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const r = await liveDO(env, subdomain, '/import-status');
+    return json(await r.json(), r.status);
+  }
+  if (path === '/admin/import/cancel' && request.method === 'POST') {
+    if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
+    const r = await liveDO(env, subdomain, '/import-cancel', { method: 'POST' });
+    return json(await r.json(), r.status);
   }
 
   // ---- admin: publish ----
@@ -2171,9 +2367,20 @@ async function handleRequest(request, storage, env, ctx) {
     return jsonCors(await r.json());
   }
   if (path === '/post/like' && request.method === 'POST') {
-    const body = await request.text();
-    const r = await liveDO(env, subdomain, '/like', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-    return jsonCors(await r.json(), r.status);
+    const b = await request.json().catch(() => ({}));
+    const r = await liveDO(env, subdomain, '/like', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
+    const result = await r.json();
+    // notify the creator on a NEW like (not an un-like, not their own tap on their own post);
+    // unread like-notifs for the same post aggregate into one row instead of flooding the inbox
+    if (r.status === 200 && b.liked && result.liked && !b.self && b.postId) {
+      try {
+        const notifs = (await storage.get('inbox:notifications')) || [];
+        const agg = notifs.find(n => n.type === 'like' && n.postId === b.postId && !n.read);
+        if (agg) { agg.count = (agg.count || 1) + 1; agg.at = new Date().toISOString(); await storage.set('inbox:notifications', notifs); }
+        else await addInboxNotif(storage, { type: 'like', postId: b.postId, count: 1 });
+      } catch (e) {}
+    }
+    return jsonCors(result, r.status);
   }
   if (path === '/post/comments' && request.method === 'GET') {
     const r = await liveDO(env, subdomain, '/comments?postId=' + encodeURIComponent(url.searchParams.get('postId') || ''));
@@ -2183,7 +2390,17 @@ async function handleRequest(request, storage, env, ctx) {
     const b = await request.json().catch(() => ({}));
     const sub = !!(await activeSub(b.subToken || ''));
     const r = await liveDO(env, subdomain, '/comment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: b.postId, text: b.text, name: b.name, sub }) });
-    return jsonCors(await r.json().catch(() => ({})), r.status);
+    const result = await r.json().catch(() => ({}));
+    // notify the creator — skip their own comments (creators comment as their full host)
+    if (r.status === 200 && result.ok && !b.self && b.name !== subdomain) {
+      try {
+        await addInboxNotif(storage, {
+          type: 'comment', postId: String(b.postId || '').slice(0, 80),
+          name: String(b.name || 'viewer').slice(0, 40), text: String(b.text || '').slice(0, 140), sub,
+        });
+      } catch (e) {}
+    }
+    return jsonCors(result, r.status);
   }
 
   // ---- live: viewer subscribe session ----
@@ -2701,39 +2918,8 @@ async function handleRequest(request, storage, env, ctx) {
   // ---- network: this node asks the root to join ----
   if (path === '/admin/request-join' && request.method === 'POST') {
     if (!(await checkAuth(request))) return json({ error: 'unauthorized' }, 401);
-    if (isRoot(identity)) return json({ ok: true, alreadyMember: true });
-    // Same-worker short-circuit: if the network root is a tenant on THIS Worker
-    // (e.g. scotty.tuliptown.ca joining root social.tuliptown.ca), a fetch to the
-    // root host is a Worker self-subrequest and Cloudflare returns 522 (whose body
-    // "error code: 522" then fails r.json() → "token 'e' is not valid JSON"). The
-    // registry:pending list is global (gstore) and the root inbox is just another
-    // tenant's KV, so write the join request directly instead of fetching ourselves.
-    const rootStore = makeStorage(env, NETWORK_ROOT_HOST);
-    const rootIdentity = await rootStore.get('identity');
-    if (rootIdentity && isRoot(rootIdentity)) {
-      const members = await getRegistryMembers(env, rootIdentity);
-      if (members.find(m => m.pubkey === identity.publicKey)) return json({ ok: true, alreadyMember: true });
-      const pending = (await gstore.get('registry:pending')) || [];
-      if (!pending.find(p => p.pubkey === identity.publicKey)) {
-        pending.unshift({ subdomain, pubkey: identity.publicKey, at: new Date().toISOString() });
-        await gstore.set('registry:pending', pending);
-        const notifs = (await rootStore.get('inbox:notifications')) || [];
-        notifs.unshift({ id: crypto.randomUUID(), type: 'join_request', subdomain, publicKey: identity.publicKey, at: new Date().toISOString(), read: false });
-        if (notifs.length > 100) notifs.splice(100);
-        await rootStore.set('inbox:notifications', notifs);
-      }
-      return json({ ok: true, pending: true });
-    }
-    // Cross-worker (e.g. social.bigdumbvan.com → social.tuliptown.ca): normal signed POST.
-    const message = JSON.stringify({ subdomain, pubkey: identity.publicKey, timestamp: new Date().toISOString() });
-    const signature = await sign(identity.privateKey, message);
-    try {
-      const r = await fetch('https://' + NETWORK_ROOT_HOST + '/protocol/join-request', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, signature }),
-      });
-      return json(await r.json());
-    } catch(e) { return json({ error: e.message }, 502); }
+    const r = await fireJoinRequest(env, identity, subdomain);
+    return json(r, r.error ? 502 : 200);
   }
 
   // ---- network registry admin (root only) ----
@@ -2913,7 +3099,12 @@ async function handleRequest(request, storage, env, ctx) {
     auth.pwSalt = salt; auth.pwIter = 100000; auth.pwHash = await pbkdf2(password, salt, 100000);
     auth.claimed = true; delete auth.claimHash; auth.setAt = new Date().toISOString();
     await storage.set('auth', auth);
-    return jsonCors({ ok: true, session: await makeSession(identity, subdomain) });
+    // auto-file the network join request — the Tanis trap: claimers never realized
+    // "Join the network" was a separate required step and stayed invisible. The host
+    // provisioning the handle expressed intent; root Approve remains the human gate.
+    let joinRequested = false;
+    try { const jr = await fireJoinRequest(env, identity, subdomain); joinRequested = !!(jr.ok || jr.pending); } catch (e) {}
+    return jsonCors({ ok: true, session: await makeSession(identity, subdomain), joinRequested });
   }
   if (path === '/auth/login' && request.method === 'POST') {
     if (!(await authAllowed())) return jsonCors({ error: 'too many attempts — try again in a few minutes' }, 429);
@@ -3360,6 +3551,19 @@ input, textarea { font: inherit; }
 .card-photo .c-media { position: absolute; inset: 0; }
 /* contain, not cover — full frame at its real aspect ratio; top-anchored so the letterbox space is always at the bottom */
 .card-video .c-media video { width: 100%; height: 100%; object-fit: contain; object-position: top center; background: #000; display: block; }
+/* While a video buffers the card showed a pure black void (field video 2026-06-11) —
+   give it a soft gradient + spinner, and fade the video in once it has real frames. */
+.card-video .c-media { background: linear-gradient(165deg,#15171c,#0a0a0c 55%,#0f1115); }
+.card-video .c-media::before {
+  content: ''; position: absolute; top: 38%; left: 50%; width: 34px; height: 34px;
+  margin-left: -17px; border-radius: 50%; z-index: 1;
+  border: 3px solid rgba(255,255,255,0.15); border-top-color: rgba(255,255,255,0.6);
+  animation: vspin 0.9s linear infinite;
+}
+.card-video .c-media video { opacity: 0; transition: opacity 0.18s; }
+.card-video .c-media.vready::before { display: none; }
+.card-video .c-media.vready video { opacity: 1; }
+@keyframes vspin { to { transform: rotate(360deg); } }
 .card-photo .c-media img  { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 /* Gradient scrim */
@@ -3709,7 +3913,7 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
   display: grid; grid-template-columns: repeat(3,1fr); gap: 1.5px;
 }
 .profile-grid-item {
-  aspect-ratio: 0.75; background: #1a1a1a; position: relative; overflow: hidden; cursor: pointer;
+  aspect-ratio: 0.75; background: linear-gradient(150deg,#26282e,#16171a); position: relative; overflow: hidden; cursor: pointer;
 }
 .profile-grid-item img, .profile-grid-item video {
   width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;
@@ -3761,6 +3965,15 @@ body.creator .create-btn { background: #fff; color: #000; border-color: #fff; }
   background: #111; display: none; flex-direction: column;
 }
 .inbox-sheet.show { display: flex; }
+/* Comments ride the BOTTOM half so the post keeps playing up top (tap the video to close).
+   The media box shrinks to the visible half; contain + top-anchor keeps the frame in view. */
+#commentsSheet { top: auto; height: 52vh; border-radius: 16px 16px 0 0; border-top: 0.5px solid rgba(255,255,255,0.15); }
+.card-video .c-media, .card-photo .c-media { transition: bottom 0.22s ease; }
+body.comments-open .card-video .c-media,
+body.comments-open .card-photo .c-media { bottom: 52vh; }
+/* invisible catcher over the top half: closes comments AND stops feed swipes bleeding through */
+#commentsBackdrop { display: none; position: fixed; top: 0; left: 0; right: 0; height: 48vh; z-index: 109; }
+body.comments-open #commentsBackdrop { display: block; }
 .inbox-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: max(env(safe-area-inset-top),16px) 16px 12px;
@@ -3850,7 +4063,7 @@ ${s.noscript || ''}
     <span class="bnav-icon">👤</span>
     <span class="bnav-label">Profile</span>
   </button>
-  <button class="bnav-item" id="bnavLive" onclick="onLiveTap()">
+  <button class="bnav-item" id="bnavLive" onclick="onLiveNavTap()">
     <span class="bnav-icon">🔴</span>
     <span class="bnav-label">Live</span>
   </button>
@@ -3875,7 +4088,7 @@ ${s.noscript || ''}
     <div class="modal-title">Search</div>
     <button class="modal-close" onclick="document.getElementById('searchModal').classList.remove('show')">×</button>
   </div>
-  <input id="searchInput" class="field-input" placeholder="Node address or #hashtag" style="margin-bottom:12px" oninput="onSearchInput(this.value)">
+  <input type="search" name="nodeSearch" id="searchInput" class="field-input" placeholder="Node address or #hashtag" autocomplete="off" style="margin-bottom:12px" oninput="onSearchInput(this.value)">
   <div id="searchResults"></div>
 </div>
 
@@ -4032,6 +4245,21 @@ ${s.noscript || ''}
 </div>
 
 <!-- TikTok import — opened from the profile sheet (z 110), so needs a higher z -->
+<!-- First-run welcome card: shown once after a new creator claims + names themselves -->
+<div class="modal" id="welcomeModal" style="z-index:140">
+  <div class="modal-header">
+    <div class="modal-title">🎉 This is your channel</div>
+    <button class="modal-close" onclick="closeWelcome()">×</button>
+  </div>
+  <div style="font-size:14px;line-height:1.7;color:rgba(255,255,255,0.85)">
+    <p style="margin-bottom:12px"><strong id="welcomeHost"></strong> is your own address on the open web — everything you post lives here, under your control. Bookmark it; it is how people find you.</p>
+    <p style="margin-bottom:12px">📲 <strong>Add it to your home screen</strong> so it opens like an app: browser menu → <em>Add to Home Screen</em> (iPhone: Share → Add to Home Screen).</p>
+    <p style="margin-bottom:12px" id="welcomeJoinNote">🌐 Your request to join the network has been sent — once your host approves it, your posts appear in everyone's scroll.</p>
+    <p style="margin-bottom:0;font-size:12px;color:rgba(255,255,255,0.5)">🔑 Keep your password somewhere safe — your host can send a reset link if you lose it.</p>
+  </div>
+  <button class="submit-btn" style="margin-top:14px" onclick="closeWelcome()">Let's go</button>
+</div>
+
 <div class="modal" id="importModal" style="z-index:130">
   <div class="modal-header">
     <div class="modal-title">Import from TikTok</div>
@@ -4060,7 +4288,8 @@ ${s.noscript || ''}
     <div id="importStatus" style="font-size:14px;margin-bottom:8px"></div>
     <div style="height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden"><div id="importBar" style="height:100%;width:0%;background:#20D5EC"></div></div>
     <div id="importErrors" style="font-size:12px;color:#FE2C55;margin-top:10px;max-height:25vh;overflow-y:auto"></div>
-    <button class="btn-secondary" id="importCancelBtn" style="margin-top:12px" onclick="_importCancel=true">Cancel</button>
+    <button class="btn-secondary" id="importHideBtn" style="margin-top:12px" onclick="closeImport()">Hide — import keeps running</button>
+    <button class="btn-secondary" id="importStopBtn" style="margin-top:8px;color:#FE2C55" onclick="stopImport()">Stop import</button>
   </div>
 </div>
 
@@ -4182,7 +4411,7 @@ ${s.noscript || ''}
   </div>
   <div class="field">
     <label>Display Name</label>
-    <input type="text" id="editDisplayName" placeholder="Your name" maxlength="50">
+    <input type="text" id="editDisplayName" placeholder="Your name" maxlength="50" autocomplete="off">
   </div>
   <div class="field">
     <label>Bio</label>
@@ -4321,6 +4550,7 @@ ${s.noscript || ''}
 </div>
 
 <!-- Comments sheet -->
+<div id="commentsBackdrop" onclick="closeComments()"></div>
 <div class="inbox-sheet" id="commentsSheet">
   <div class="inbox-header">
     <button onclick="closeComments()" style="background:none;color:#fff;font-size:22px;width:36px;height:36px;display:flex;align-items:center;justify-content:center">←</button>
@@ -4361,6 +4591,7 @@ ${s.noscript || ''}
     <button data-type="writing" class="active">Text</button>
     <button data-type="photo">Photo</button>
     <button data-type="video">Video</button>
+    <button data-type="live" style="color:#FE2C55;font-weight:700">🔴 LIVE</button>
   </div>
   <div class="field">
     <label id="fileLabel" style="display:none">File</label>
@@ -4378,7 +4609,7 @@ ${s.noscript || ''}
   </div>
   <div class="field">
     <label>Title</label>
-    <input type="text" id="titleInput" placeholder="">
+    <input type="text" id="titleInput" placeholder="" autocomplete="off">
   </div>
   <div class="field">
     <label id="bodyLabel">Caption</label>
@@ -4417,6 +4648,14 @@ ${s.noscript || ''}
 <div class="toast" id="toast"></div>
 
 <script>
+// ── ERROR BEACON (first thing in the script: phone-side errors land in Workers Logs) ──
+window.addEventListener('error', e => {
+  try { navigator.sendBeacon('/debug/client-error', JSON.stringify({ msg: e.message, src: (e.filename || '') + ':' + (e.lineno || 0), ctx: 'onerror' })); } catch (x) {}
+});
+window.addEventListener('unhandledrejection', e => {
+  try { navigator.sendBeacon('/debug/client-error', JSON.stringify({ msg: String((e.reason && (e.reason.message || e.reason)) || 'rejection').slice(0, 300), ctx: 'promise' })); } catch (x) {}
+});
+
 // ── STATE ─────────────────────────────────────────────────────
 const SELF_SUBDOMAIN = '${escapeHtml(subdomain)}';
 const SELF_KEY       = '${escapeHtml(identity.publicKey.slice(0, 8))}';
@@ -4796,9 +5035,13 @@ function resumeFeedVideos() {
   activePanel().querySelectorAll('.card video').forEach(v => v.play().catch(()=>{}));
 }
 
-function onLiveTap() {
-  const node = nodeGraph[nodeIndex];
-  const isBroadcaster = isCreator && node?.subdomain === SELF_SUBDOMAIN;
+// Open the live surface for a specific creator. No arg = the card you're on (the
+// "● LIVE — tap to watch" badge path). Broadcasting is reached via Create → LIVE,
+// which passes SELF_SUBDOMAIN — you no longer have to be standing on your own card.
+function onLiveTap(targetSub) {
+  const sub = targetSub || nodeGraph[nodeIndex]?.subdomain;
+  if (!sub) return;
+  const isBroadcaster = isCreator && sub === SELF_SUBDOMAIN;
   const modal = document.getElementById('liveModal');
   pauseFeedVideos();
   modal.style.display = 'flex';
@@ -4828,20 +5071,28 @@ function onLiveTap() {
     viewVideo.style.display = 'block';
     viewStatus.style.display = 'block';
     bcPanel.style.display   = 'none';
-    runPrerollThenView(node.subdomain);
+    runPrerollThenView(sub);
   }
 
   // Realtime chat + viewer count over WebSocket (replaces polling).
   if (liveSocket) { liveSocket.close(); liveSocket = null; }
-  liveSocket = new LiveSocket(node.subdomain, isBroadcaster ? 'broadcaster' : 'viewer', {
+  liveSocket = new LiveSocket(sub, isBroadcaster ? 'broadcaster' : 'viewer', {
     chatBoxId: 'liveChatBox',
     viewerCountId: 'liveViewerCount',
     canMod: isBroadcaster,
     onEnded: () => { if (!isBroadcaster) { _liveEnded = true; setLiveState('ended'); } },
     // overlay images are origin-relative on the STREAMING node — prefix for remote viewers
-    onOverlay: ov => renderLiveOverlay(ov, node.subdomain === SELF_SUBDOMAIN ? '' : 'https://' + node.subdomain),
+    onOverlay: ov => renderLiveOverlay(ov, sub === SELF_SUBDOMAIN ? '' : 'https://' + sub),
   });
   setOverlayEditable(isBroadcaster); // broadcaster can drag/pinch the overlay in place
+}
+
+// Bottom-nav Live = WATCH: jump to whoever is live right now. Broadcasting moved
+// behind Create → LIVE, so this button has one job and no creator ambiguity.
+function onLiveNavTap() {
+  const live = nodeGraph.find(n => n.liveStatus?.active);
+  if (live) onLiveTap(live.subdomain);
+  else toast('No one is live right now');
 }
 
 // ── LIVE OVERLAY (broadcaster text/image over the stream) ────
@@ -5763,7 +6014,7 @@ function renderCard(node, postIdx) {
 
   if (item.type === 'video' && item.mediaUrl) {
     return \`<div class="card card-video" data-id="\${esc(item.id)}">
-      <div class="c-media"><video disableremoteplayback x-webkit-airplay="deny" src="\${esc(msrc)}" playsinline preload="metadata" loop></video></div>
+      <div class="c-media"><video disableremoteplayback x-webkit-airplay="deny" src="\${esc(msrc)}" playsinline preload="auto" loop onloadeddata="this.parentElement.classList.add('vready')" onplaying="this.parentElement.classList.add('vready')"></video></div>
       \${info}\${sb}
     </div>\`;
   }
@@ -5872,7 +6123,8 @@ async function sendLike(id, liked) {
   try {
     const r = await fetch(base + '/post/like', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ postId: id, vid: getViewerId(), liked }),
+      // self: creator liking their own post — suppresses the inbox notification
+      body: JSON.stringify({ postId: id, vid: getViewerId(), liked, self: isCreator && !base }),
     }).then(r => r.json());
     const el = document.getElementById('lc-' + id);
     if (el && r.count != null) el.textContent = fmtCount(r.count);
@@ -5964,13 +6216,15 @@ function openComments(subdomain, postId) {
   if (!postId) return;
   _commentsCtx = { subdomain, postId };
   document.getElementById('commentsSheet').classList.add('show');
-  pauseFeedVideos();
+  // half-sheet: the post keeps PLAYING in the top half (no pause — that's the point)
+  document.body.classList.add('comments-open');
   document.getElementById('commentsList').innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;padding:50px;color:rgba(255,255,255,0.3)">Loading…</div>';
   loadComments();
 }
 function closeComments() {
   document.getElementById('commentsSheet').classList.remove('show');
+  document.body.classList.remove('comments-open');
   resumeFeedVideos();
 }
 async function loadComments() {
@@ -6027,7 +6281,7 @@ async function submitComment() {
   try {
     await fetch(commentsBase() + '/post/comment', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ postId: _commentsCtx.postId, text, name, subToken: subTokenFor(_commentsCtx.subdomain) }),
+      body: JSON.stringify({ postId: _commentsCtx.postId, text, name, subToken: subTokenFor(_commentsCtx.subdomain), self: isCreator && !commentsBase() }),
     });
     loadComments();
   } catch(e) { showToast('Failed'); }
@@ -6505,8 +6759,10 @@ function onProfileTap() {
   openProfile(SELF_SUBDOMAIN);
 }
 
+let _profileSub = ''; // whose profile the sheet is showing (pull-to-refresh re-fetches it)
 function openProfile(subdomain) {
   const sheet = document.getElementById('profileSheet');
+  _profileSub = subdomain;
   document.getElementById('profileHandle').textContent = '@' + subdomain;
   const isOwn = subdomain === SELF_SUBDOMAIN && isCreator;
   document.getElementById('profileEditBtn').style.display = isOwn ? 'block' : 'none';
@@ -6639,12 +6895,14 @@ function renderProfileBody(data, subdomain) {
 // without this, opening a 100-post profile fires 100 video fetches at once.
 function lazyLoadGridVideos(root) {
   const vids = root.querySelectorAll('video[data-src]');
-  if (!('IntersectionObserver' in window)) { vids.forEach(v => { v.src = v.dataset.src; }); return; }
+  if (!('IntersectionObserver' in window)) { vids.forEach(v => { v.src = v.dataset.src + '#t=0.1'; }); return; }
   const io = new IntersectionObserver(entries => {
     entries.forEach(en => {
       if (en.isIntersecting) {
         const v = en.target;
-        if (!v.src) v.src = v.dataset.src;
+        // #t=0.1 media fragment: browser seeks on load and PAINTS the first frame —
+        // a free thumbnail; without it grid tiles stayed black (field video 2026-06-11)
+        if (!v.src) v.src = v.dataset.src + '#t=0.1';
         io.unobserve(v);
       }
     });
@@ -6794,20 +7052,40 @@ async function saveProfile() {
 
 function closeEditProfile() {
   document.getElementById('editProfileSheet').classList.remove('show');
+  // onboarding: whether they saved or skipped the name, finish with the welcome card
+  if (_onboarding) { _onboarding = false; openWelcome(); }
 }
 
 // ── TIKTOK IMPORT ────────────────────────────────────────────
+// The import runs SERVER-SIDE: the list is queued into the tenant's DO, whose alarm
+// imports one video every ~10s — closing this modal (or the whole app)
+// doesn't stop it, and an inbox notification lands when the run finishes. The old
+// foreground loop hammered the feed KV keys and froze the app for the whole import.
 let _importItems = [];
-let _importCancel = false;
+let _importCancel = false; // legacy flag, kept harmless
+let _importPolling = false;
 function openImport() {
   _importItems = []; _importCancel = false;
   document.getElementById('importIntro').style.display = 'block';
   document.getElementById('importPlan').style.display = 'none';
   document.getElementById('importProgress').style.display = 'none';
   document.getElementById('importFile').value = '';
+  document.getElementById('importBar').style.width = '0%';
+  document.getElementById('importErrors').innerHTML = '';
+  document.getElementById('importStopBtn').style.display = '';
+  document.getElementById('importHideBtn').textContent = 'Hide — import keeps running';
   document.getElementById('importModal').classList.add('show');
+  // a background run may already be going — reattach to it instead of showing the intro
+  fetch('/admin/import/status', { headers: { 'Authorization': 'Bearer ' + token } })
+    .then(r => r.json()).then(d => {
+      if (d && d.remaining > 0) {
+        document.getElementById('importIntro').style.display = 'none';
+        document.getElementById('importProgress').style.display = 'block';
+        pollImport();
+      }
+    }).catch(() => {});
 }
-function closeImport() { _importCancel = true; document.getElementById('importModal').classList.remove('show'); }
+function closeImport() { _importCancel = true; _importPolling = false; document.getElementById('importModal').classList.remove('show'); }
 // TikTok export dates are "YYYY-MM-DD HH:MM:SS" (UTC); tolerate ISO too.
 function tiktokDateToIso(d) {
   if (!d) return null;
@@ -6872,38 +7150,66 @@ function onImportFile(file) {
 }
 async function runImport() {
   if (!_importItems.length) return;
-  _importCancel = false;
   document.getElementById('importPlan').style.display = 'none';
   document.getElementById('importProgress').style.display = 'block';
   document.getElementById('importErrors').innerHTML = '';
-  const total = _importItems.length;
-  let done = 0, failed = 0, dups = 0;
   const status = document.getElementById('importStatus');
-  const bar = document.getElementById('importBar');
-  for (const it of _importItems) {
-    if (_importCancel) break;
-    status.textContent = 'Importing ' + (done + failed + 1) + ' of ' + total + '…';
+  status.textContent = 'Queueing…';
+  try {
+    const r = await fetch('/admin/import/queue', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: _importItems.map(it => ({ url: it.url, title: it.title, createdAt: it.createdAt, source: 'tiktok' })) }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) { status.textContent = d.error || 'Could not start the import'; return; }
+  } catch(e) { status.textContent = 'Could not start the import'; return; }
+  status.textContent = 'Importing in the background — about one video every 10 seconds. You can close this and keep using the app; a note lands in your inbox when it finishes.';
+  pollImport();
+}
+// Progress poll while the modal is open — purely cosmetic, the server runs regardless.
+async function pollImport() {
+  if (_importPolling) return;
+  _importPolling = true;
+  while (_importPolling && document.getElementById('importModal').classList.contains('show')) {
     try {
-      const r = await fetch('/admin/import-url', {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: it.url, title: it.title, createdAt: it.createdAt, source: 'tiktok' }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (r.ok && d.ok) { done++; if (d.dup) dups++; }
-      else {
-        failed++;
-        document.getElementById('importErrors').innerHTML +=
-          '<div>' + esc(it.createdAt.slice(0, 10)) + ': ' + esc(d.error || ('error ' + r.status)) + '</div>';
+      const d = await fetch('/admin/import/status', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+      const stats = d.stats || null;
+      if (stats && stats.errors && stats.errors.length) {
+        document.getElementById('importErrors').innerHTML = stats.errors.map(esc).join('<br>');
       }
-    } catch(e) { failed++; }
-    bar.style.width = Math.round(((done + failed) / total) * 100) + '%';
+      if (!d.remaining) {
+        document.getElementById('importBar').style.width = '100%';
+        document.getElementById('importStatus').textContent = stats
+          ? 'Done — ' + (stats.done || 0) + ' imported' + (stats.dups ? ' (' + stats.dups + ' already there)' : '') + (stats.failed ? ', ' + stats.failed + ' failed' : '') + '.'
+          : 'Import finished — the summary is in your inbox.';
+        document.getElementById('importStopBtn').style.display = 'none';
+        document.getElementById('importHideBtn').textContent = 'Close';
+        refreshOwnFeed();
+        break;
+      }
+      const total = (stats && stats.total) || d.remaining;
+      const processed = Math.max(0, total - d.remaining);
+      document.getElementById('importBar').style.width = Math.round((processed / Math.max(1, total)) * 100) + '%';
+      document.getElementById('importStatus').textContent =
+        'Importing in the background — ' + processed + ' of ' + total + ' done. Safe to close; your inbox gets a note at the end.';
+    } catch(e) {}
+    await new Promise(res => setTimeout(res, 5000));
   }
-  status.textContent = (_importCancel ? 'Cancelled — ' : 'Done — ') + done + ' imported' +
-    (dups ? ' (' + dups + ' already there)' : '') + (failed ? ', ' + failed + ' failed' : '') + '.';
-  document.getElementById('importCancelBtn').textContent = 'Close';
-  document.getElementById('importCancelBtn').onclick = closeImport;
-  // refresh our own feed so the imports show up without a reload
+  _importPolling = false;
+}
+async function stopImport() {
+  try {
+    const d = await fetch('/admin/import/cancel', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.json());
+    document.getElementById('importStatus').textContent = 'Stopped — ' + (d.cancelled || 0) + ' videos were still queued. Already-imported posts stay.';
+  } catch(e) { document.getElementById('importStatus').textContent = 'Could not reach the server to stop it.'; }
+  _importPolling = false;
+  document.getElementById('importStopBtn').style.display = 'none';
+  document.getElementById('importHideBtn').textContent = 'Close';
+  refreshOwnFeed();
+}
+// refresh our own feed so imports/changes show up without a reload
+function refreshOwnFeed() {
   const self = nodeGraph.find(n => n.subdomain === SELF_SUBDOMAIN);
   if (self) { self.loaded = false; self.feed = undefined; loadNode(self).then(() => { if (nodeGraph[nodeIndex] === self) renderCurrent(); }); }
 }
@@ -7287,8 +7593,17 @@ function renderInbox(notifs) {
       const rl = { csam: 'Child sexual abuse material', ncii: 'Non-consensual intimate images', hate: 'Hate speech / incitement', harassment: 'Harassment or threats', copyright: 'Copyright infringement', defamation: 'Defamation', other: 'Other' };
       text = \`<strong style="color:#FE2C55">⚑ Content report</strong> on <strong>@\${esc(handle)}</strong> — \${rl[n.reason] || 'Other'}\`;
     }
+    else if (n.type === 'like') text = \`❤️ <strong>\${(n.count || 1) > 1 ? (n.count + ' people') : 'Someone'}</strong> liked your post\`;
+    else if (n.type === 'comment') text = \`💬 <strong>\${esc(n.name || 'viewer')}</strong>\${n.sub ? ' <span class="sub-badge">SUB</span>' : ''} commented: “\${esc(n.text || '')}”\`;
+    else if (n.type === 'import_done') text = \`📦 <strong>Import finished</strong> — \${n.done || 0} imported\${n.dups ? ' (' + n.dups + ' already there)' : ''}\${n.failed ? ', <strong style="color:#FE2C55">' + n.failed + ' failed</strong>' : ''}\`;
     else text = esc(n.type);
     let actions = '';
+    if ((n.type === 'like' || n.type === 'comment') && n.postId) {
+      actions = \`<a href="/p/\${esc(n.postId)}" onclick="event.stopPropagation()" style="display:inline-block;margin-top:6px;font-size:13px;color:#20D5EC">View post →</a>\`;
+    }
+    if (n.type === 'import_done' && n.errors && n.errors.length) {
+      actions = '<div style="margin-top:4px;font-size:12px;color:rgba(255,255,255,0.55)">' + n.errors.map(esc).join('<br>') + '</div>';
+    }
     if (n.type === 'report') {
       const det = n.details ? \`<div style="margin-top:4px;font-size:12px;color:rgba(255,255,255,0.55)">“\${esc(n.details)}”</div>\` : '';
       const duty = n.reason === 'csam'
@@ -7313,7 +7628,7 @@ function renderInbox(notifs) {
       <button onclick="event.stopPropagation();declineSub('\${esc(n.subId)}')" style="background:rgba(255,255,255,0.12);border:none;color:#fff;border-radius:8px;padding:6px 14px;font-size:13px">Decline</button>
     </div>\`;
     }
-    const letter = (handle || n.name || '?')[0];
+    const letter = n.type === 'like' ? '❤' : n.type === 'import_done' ? '📦' : (handle || n.name || '?')[0];
     // _sw guard: a just-finished swipe must not also fire the tap action
     const click = n.subdomain ? \`if(!this._sw)openProfile('\${esc(n.subdomain)}')\` : '';
     // real avatar when the notif is about a known node; gradient letter otherwise
@@ -7592,7 +7907,10 @@ async function submitLogin() {
     } else { toast(d.error || 'login failed'); }
   } catch(e) { toast('login failed'); }
 }
-// First-time claim: redeem the host's code + set a password → signed session
+// First-time claim: redeem the host's code + set a password → signed session.
+// Success rolls straight into onboarding: pick a name → welcome card. The join
+// request is filed server-side by /auth/claim (the Tanis trap: nobody found the button).
+let _onboarding = false, _joinRequested = false;
 async function submitClaim() {
   const code = document.getElementById('claimCode').value.trim();
   const password = document.getElementById('claimPw').value;
@@ -7602,10 +7920,25 @@ async function submitClaim() {
     const d = await res.json().catch(() => ({}));
     if (res.ok && d.session) {
       token = d.session; localStorage.setItem('adminToken', d.session);
-      enableCreator(); closeUnlock(); toast('account claimed');
+      enableCreator(); closeUnlock();
+      _onboarding = true; _joinRequested = !!d.joinRequested;
+      toast('Account claimed — pick your display name');
+      openEditProfile();
+      setTimeout(() => { const el = document.getElementById('editDisplayName'); if (el) el.focus(); }, 400);
     } else { toast(d.error || 'claim failed'); }
   } catch(e) { toast('claim failed'); }
 }
+
+// First-run welcome card — shown once after the onboarding profile sheet closes.
+function openWelcome() {
+  document.getElementById('welcomeHost').textContent = SELF_SUBDOMAIN;
+  if (!_joinRequested) {
+    document.getElementById('welcomeJoinNote').innerHTML =
+      '🌐 When you are ready, tap <strong>Profile → Join the network</strong> so your posts appear in everyone\\'s scroll.';
+  }
+  document.getElementById('welcomeModal').classList.add('show');
+}
+function closeWelcome() { document.getElementById('welcomeModal').classList.remove('show'); }
 
 async function restoreCreator() {
   if (!token) return;
@@ -7722,6 +8055,12 @@ function closePublish() {
 
 document.querySelectorAll('#typePicker button').forEach(b => {
   b.addEventListener('click', () => {
+    if (b.dataset.type === 'live') {
+      // going live is a broadcast, not a post — hand off to the live surface as self
+      closePublish();
+      onLiveTap(SELF_SUBDOMAIN);
+      return;
+    }
     document.querySelectorAll('#typePicker button').forEach(x => x.classList.remove('active'));
     b.classList.add('active'); selectedType = b.dataset.type; updateModalForType(); refreshXpostChecks();
   });
@@ -8233,6 +8572,31 @@ function cancelGesture() {
   }, 300);
 }
 
+// ── PULL-TO-REFRESH (overlay surfaces only — the feed owns its own gestures) ──
+// Drag down >75px from the top of a scrolled-to-top surface, release → refresh.
+function attachPullRefresh(elId, onRefresh) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  let startY = 0, watching = false, armed = false;
+  el.addEventListener('touchstart', e => {
+    watching = el.scrollTop <= 0;
+    armed = false;
+    startY = e.touches[0].clientY;
+  }, { passive: true });
+  el.addEventListener('touchmove', e => {
+    if (!watching || el.scrollTop > 0) return;
+    if (e.touches[0].clientY - startY > 75) armed = true;
+  }, { passive: true });
+  el.addEventListener('touchend', async () => {
+    if (!armed) return;
+    armed = false; watching = false;
+    el.style.opacity = '0.45';
+    try { await onRefresh(); } catch(e) {}
+    el.style.opacity = '';
+    toast('Refreshed');
+  });
+}
+
 // ── INIT ─────────────────────────────────────────────────────
 // ── BACK-GESTURE NAVIGATION ──────────────────────────────────
 // One history sentinel, re-armed after every pop: back-swipe closes the topmost
@@ -8241,6 +8605,7 @@ function closeTopOverlay() {
   const vis = id => { const el = document.getElementById(id); return el && el.classList.contains('show'); };
   const shut = id => document.getElementById(id).classList.remove('show');
   // modals that stack above everything (z 130+)
+  if (vis('welcomeModal')) { closeWelcome(); return true; }
   if (vis('chatModModal')) { closeChatMod(); return true; }
   if (vis('liveViewersModal')) { closeLiveViewers(); return true; }
   if (vis('streamHistoryModal')) { closeStreamHistory(); return true; }
@@ -8323,6 +8688,19 @@ window.addEventListener('popstate', () => {
     pollInboxBadge();
     setInterval(pollInboxBadge, 60000);
   }
+  // pull-to-refresh on the static overlay surfaces (the feed keeps its own gestures)
+  attachPullRefresh('profileBody', async () => {
+    if (!_profileSub) return;
+    delete _profileCache[_profileSub];
+    const data = await loadProfileData(_profileSub);
+    renderProfileBody(data, _profileSub);
+  });
+  attachPullRefresh('searchModal', async () => {
+    await initNetwork(); // re-pulls the registry — freshly approved members appear without a reload
+    onSearchInput(document.getElementById('searchInput').value);
+  });
+  attachPullRefresh('inboxList', () => onInboxTap());
+
   // Invite deep-link: ?claim=CODE → open the claim form with the code prefilled (one-step onboarding)
   if (!isCreator) {
     const claim = new URLSearchParams(location.search).get('claim');
